@@ -45,6 +45,16 @@ std::vector<std::filesystem::path> expand_dir_glob(const std::filesystem::path& 
 // the full contract.
 std::filesystem::path glob_literal_prefix(std::string_view glob);
 
+// mcpp#228: desugar brace alternation `{a,b}` into a cartesian product of
+// plain globs, e.g. "a/{x,y}/**" -> ["a/x/**", "a/y/**"]. A glob with no `{`
+// returns itself unchanged (the common case). Multiple and nested groups are
+// supported ("a/{x,y}/{1,2}" -> 4 branches; "{a,{b,c}}" resolves the inner
+// group too). Exported so unit tests can assert its behavior directly; also
+// used internally at the entry of expand_glob and at the [build].flags
+// per-glob-flag match point in scan_one_into, so every glob consumer sees
+// alternation transparently.
+std::vector<std::string> expand_braces(std::string_view glob);
+
 // Scan a single source file.
 std::expected<SourceUnit, ScanError> scan_file(const std::filesystem::path& file,
                                                const std::string&           packageName);
@@ -314,8 +324,81 @@ std::filesystem::path glob_literal_prefix(std::string_view glob) {
     return std::filesystem::path(literal.substr(0, slash));
 }
 
-std::vector<std::filesystem::path> expand_glob(const std::filesystem::path& root,
-                                               std::string_view glob)
+// mcpp#228: `{a,b}` alternation, recursively. Finds the first top-level `{`,
+// its MATCHING `}` (brace-depth tracked, so a nested group's inner braces
+// don't prematurely close the outer one), splits the interior on top-level
+// commas (again depth-tracked, so a nested group's own commas don't split
+// the outer one), then cartesian-products: each alternative is itself
+// re-expanded (handles nesting, e.g. "{a,{b,c}}"), and everything AFTER the
+// closing `}` is independently re-expanded and combined with every
+// alternative (handles multiple groups, e.g. "a/{x,y}/{1,2}" -> 4
+// branches). An unbalanced `{` (no matching `}`) is passed through as a
+// literal — never a reason to fail the whole glob.
+std::vector<std::string> expand_braces(std::string_view glob, int depthGuard);
+
+std::vector<std::string> expand_braces(std::string_view glob) {
+    return expand_braces(glob, 0);
+}
+
+std::vector<std::string> expand_braces(std::string_view glob, int depthGuard) {
+    auto open = glob.find('{');
+    if (open == std::string_view::npos) return { std::string(glob) };
+
+    // Bound brace-nesting recursion depth: a pathological manifest with
+    // deeply nested `{` should not stack-overflow. Beyond the cap, treat the
+    // remainder as a literal passthrough rather than throwing — an
+    // unreasonably-nested glob simply won't desugar further, it still
+    // parses.
+    constexpr int kMaxBraceDepth = 32;
+    if (depthGuard >= kMaxBraceDepth) return { std::string(glob) };
+
+    int depth = 0;
+    std::size_t close = std::string_view::npos;
+    for (std::size_t i = open; i < glob.size(); ++i) {
+        if (glob[i] == '{') ++depth;
+        else if (glob[i] == '}') {
+            --depth;
+            if (depth == 0) { close = i; break; }
+        }
+    }
+    if (close == std::string_view::npos) return { std::string(glob) };
+
+    std::string_view prefix = glob.substr(0, open);
+    std::string_view inner  = glob.substr(open + 1, close - open - 1);
+    std::string_view suffix = glob.substr(close + 1);
+
+    std::vector<std::string_view> alts;
+    int d = 0;
+    std::size_t start = 0;
+    for (std::size_t i = 0; i < inner.size(); ++i) {
+        if (inner[i] == '{') ++d;
+        else if (inner[i] == '}') --d;
+        else if (inner[i] == ',' && d == 0) {
+            alts.push_back(inner.substr(start, i - start));
+            start = i + 1;
+        }
+    }
+    alts.push_back(inner.substr(start));
+
+    auto suffixBranches = expand_braces(suffix, depthGuard + 1);
+    std::vector<std::string> out;
+    for (auto alt : alts) {
+        for (auto& altBranch : expand_braces(alt, depthGuard + 1)) {
+            for (auto& sufBranch : suffixBranches) {
+                out.push_back(std::string(prefix) + altBranch + sufBranch);
+            }
+        }
+    }
+    return out;
+}
+
+namespace {
+
+// mcpp#225: the actual bounded recursive-directory walk for a SINGLE plain
+// glob (no `{` — expand_glob below desugars brace alternation via
+// expand_braces and calls this once per branch, unioning the results).
+std::vector<std::filesystem::path> expand_glob_one(const std::filesystem::path& root,
+                                                    std::string_view glob)
 {
     namespace fs = std::filesystem;
     std::vector<fs::path> out;
@@ -375,6 +458,31 @@ std::vector<std::filesystem::path> expand_glob(const std::filesystem::path& root
     return out;
 }
 
+} // namespace
+
+std::vector<std::filesystem::path> expand_glob(const std::filesystem::path& root,
+                                               std::string_view glob)
+{
+    // mcpp#228: desugar `{a,b}` alternation FIRST, then run the existing
+    // bounded walk per branch and union+dedup — each post-desugar branch has
+    // no `{`, so glob_literal_prefix's prefix narrowing still applies (and
+    // gets a LONGER, more specific prefix per branch than the pre-desugar
+    // glob would have yielded).
+    auto branches = expand_braces(glob);
+    if (branches.size() == 1) return expand_glob_one(root, branches.front());
+
+    namespace fs = std::filesystem;
+    std::set<fs::path> seen;
+    std::vector<fs::path> out;
+    for (auto const& b : branches) {
+        for (auto& p : expand_glob_one(root, b)) {
+            if (seen.insert(p).second) out.push_back(std::move(p));
+        }
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
 std::vector<std::filesystem::path> expand_dir_glob(const std::filesystem::path& root,
                                                    std::string_view glob)
 {
@@ -382,7 +490,10 @@ std::vector<std::filesystem::path> expand_dir_glob(const std::filesystem::path& 
     std::error_code ec;
     if (!std::filesystem::exists(root, ec)) return out;
 
-    // Fast path: glob with no wildcards → literal path under root.
+    // Fast path: glob with no wildcards → literal path under root. Brace
+    // alternation `{a,b}` is intentionally NOT desugared here (unlike
+    // expand_glob) — include_dirs entries are meant to name one literal
+    // directory each; a caller wanting alternatives lists multiple entries.
     if (glob.find('*') == std::string_view::npos) {
         auto p = root / std::filesystem::path(glob);
         if (std::filesystem::is_directory(p, ec)) out.push_back(p);
@@ -665,10 +776,23 @@ void scan_one_into(ScanResult& result,
     // a cfg-gated source set can legitimately leave a glob empty on some
     // targets.
     std::vector<int> globFlagHits(manifest.buildConfig.globFlags.size(), 0);
+    // mcpp#228: pre-desugar each flag-entry's glob once (not per-file) —
+    // apply_glob_flags below matches via path_matches_glob directly (it
+    // isn't a filesystem walk like expand_glob, so there's no walk to bound
+    // a start point for), so a brace glob here needs its OR-of-branches
+    // matched explicitly rather than picking up desugaring for free.
+    std::vector<std::vector<std::string>> globFlagBranches;
+    globFlagBranches.reserve(manifest.buildConfig.globFlags.size());
+    for (auto const& gf : manifest.buildConfig.globFlags)
+        globFlagBranches.push_back(expand_braces(gf.glob));
     auto apply_glob_flags = [&](SourceUnit& u) {
         for (std::size_t i = 0; i < manifest.buildConfig.globFlags.size(); ++i) {
             auto const& gf = manifest.buildConfig.globFlags[i];
-            if (!path_matches_glob(u.path, root, gf.glob)) continue;
+            bool matched = false;
+            for (auto const& branch : globFlagBranches[i]) {
+                if (path_matches_glob(u.path, root, branch)) { matched = true; break; }
+            }
+            if (!matched) continue;
             ++globFlagHits[i];
             // defines reach asm units too — via the -D subset the backend
             // filters out of packageCflags (no third copy needed here).

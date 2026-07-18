@@ -34,6 +34,42 @@ ManifestError error(const std::filesystem::path& origin,
     return ManifestError{msg, origin, pos.line, pos.column};
 }
 
+// #227 follow-up: libs/toml.cppm's `[[dotted.path]]` support is intentionally
+// schema-agnostic — it accepts an array-of-tables at ANY dotted path, so a
+// doubled-bracket typo like `[[dependencies]]` (single brackets meant) or
+// `[[toolchain]]` parses cleanly as an Array Value there. Every mcpp consumer
+// reads such sections via get_table(), which returns nullptr for a non-table
+// Value, so the section silently reads as ABSENT (e.g. all dependencies
+// silently dropped) with no parse error and no warning. Close the grammar
+// here, at the manifest layer, instead of hardcoding mcpp section names into
+// the generic TOML layer: the only legitimate array-of-tables in mcpp.toml
+// today is `[[build.flags]]`.
+bool is_array_of_tables(const t::Value& v) {
+    if (!v.is_array()) return false;
+    auto& arr = v.as_array();
+    if (arr.empty()) return false;
+    for (auto& e : arr) if (!e.is_table()) return false;
+    return true;
+}
+
+std::optional<std::string> find_disallowed_array_of_tables(
+    const t::Table& tbl, const std::string& prefix,
+    std::span<const std::string_view> allowlist)
+{
+    for (auto& [k, v] : tbl) {
+        std::string path = prefix.empty() ? k : std::format("{}.{}", prefix, k);
+        if (is_array_of_tables(v)) {
+            bool allowed = false;
+            for (auto a : allowlist) if (a == path) { allowed = true; break; }
+            if (!allowed) return path;
+        } else if (v.is_table()) {
+            if (auto found = find_disallowed_array_of_tables(v.as_table(), path, allowlist))
+                return found;
+        }
+    }
+    return std::nullopt;
+}
+
 } // namespace
 
 std::expected<Manifest, ManifestError> parse_string(std::string_view content,
@@ -41,6 +77,17 @@ std::expected<Manifest, ManifestError> parse_string(std::string_view content,
     auto doc = t::parse(content);
     if (!doc) {
         return std::unexpected(error(origin, doc.error().message, doc.error().where));
+    }
+
+    // Closed-grammar guard: reject any array-of-tables whose dotted path
+    // isn't explicitly allowlisted, BEFORE any section is read. See
+    // find_disallowed_array_of_tables above.
+    static constexpr std::string_view kAllowedArraysOfTables[] = { "build.flags" };
+    if (auto badPath = find_disallowed_array_of_tables(doc->root(), "", kAllowedArraysOfTables)) {
+        return std::unexpected(error(origin, std::format(
+            "[[{}]] (array-of-tables) is not allowed for section '{}'; "
+            "array-of-tables syntax is only supported for [[build.flags]]",
+            *badPath, *badPath)));
     }
 
     Manifest m;
@@ -689,11 +736,20 @@ std::expected<Manifest, ManifestError> parse_string(std::string_view content,
     // are sorted maps, so only the array form can carry declaration order,
     // and order is the override semantics (later entries win via "last flag
     // wins"). Unknown keys are errors: closed grammar.
+    //
+    // #227: `[[build.flags]]` array-of-tables is accepted here too, with no
+    // extra branching needed — libs/toml.cppm's AOT support
+    // (open_array_of_tables) builds the exact same shape at this dotted path
+    // (an Array of Table Values) that the inline form `flags = [{...}, ...]`
+    // does, so `doc->get("build.flags")` and the loop below see one
+    // representation regardless of which spelling was used in the source.
+    // Declaration order is preserved by both (Array is a vector).
     if (auto* fv = doc->get("build.flags")) {
         if (!fv->is_array()) {
             return std::unexpected(error(origin,
-                "[build].flags must be an array of inline tables: "
-                "flags = [{ glob = \"...\", cxxflags = [...] }, ...]"));
+                "[build].flags must be an array of inline tables "
+                "(flags = [{ glob = \"...\", cxxflags = [...] }, ...]) "
+                "or an array of tables ([[build.flags]] glob = \"...\")"));
         }
         for (auto& ev : fv->as_array()) {
             if (!ev.is_table()) {

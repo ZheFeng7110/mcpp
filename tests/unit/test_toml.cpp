@@ -113,3 +113,53 @@ TEST(Toml, EmptyStringStillParses) {
     EXPECT_EQ(d->get_string("e").value_or("?"), "");
     EXPECT_EQ(d->get_int("x").value_or(-1), 2);
 }
+
+// #227: `[[dotted.path]]` array-of-tables — each occurrence appends a fresh
+// table to an array at that dotted path; keys after it fill THAT table until
+// the next `[...]`/`[[...]]` header. Declaration order must be preserved
+// (it's the "later entries win" override order for [build].flags).
+TEST(Toml, ParsesArrayOfTables) {
+    auto d = t::parse(R"(
+[[build.flags]]
+glob = "a/**"
+cxxflags = ["-DX=1"]
+[[build.flags]]
+glob = "b/**"
+)");
+    ASSERT_TRUE(d.has_value()) << d.error().message;
+    auto* v = d->get("build.flags");
+    ASSERT_NE(v, nullptr);
+    ASSERT_TRUE(v->is_array());
+    auto& arr = v->as_array();
+    ASSERT_EQ(arr.size(), 2u);
+    ASSERT_TRUE(arr[0].is_table());
+    EXPECT_EQ(arr[0].as_table().at("glob").as_string(), "a/**");
+    auto cx = arr[0].as_table().at("cxxflags");
+    ASSERT_TRUE(cx.is_array());
+    ASSERT_EQ(cx.as_array().size(), 1u);
+    EXPECT_EQ(cx.as_array()[0].as_string(), "-DX=1");
+    ASSERT_TRUE(arr[1].is_table());
+    EXPECT_EQ(arr[1].as_table().at("glob").as_string(), "b/**");
+    EXPECT_EQ(arr[1].as_table().count("cxxflags"), 0u);
+}
+
+// Regular `[table]` and inline-array-of-tables parsing must be unaffected by
+// AOT support — array-of-tables is an ADDITIONAL grammar form, not a
+// replacement.
+TEST(Toml, RegularTablesStillWorkAlongsideArrayOfTables) {
+    auto d = t::parse(R"(
+[package]
+name = "x"
+[[build.flags]]
+glob = "a/**"
+[dependencies]
+foo = "1.0"
+)");
+    ASSERT_TRUE(d.has_value()) << d.error().message;
+    EXPECT_EQ(d->get_string("package.name").value_or(""), "x");
+    EXPECT_EQ(d->get_string("dependencies.foo").value_or(""), "1.0");
+    auto* v = d->get("build.flags");
+    ASSERT_NE(v, nullptr);
+    ASSERT_TRUE(v->is_array());
+    EXPECT_EQ(v->as_array().size(), 1u);
+}

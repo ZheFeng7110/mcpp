@@ -399,6 +399,43 @@ inline std::string join_path(const std::vector<std::string>& path) {
         });
 }
 
+// `[[dotted.path]]` — array-of-tables. Navigate to the parent of the last
+// path segment (creating intermediate tables as needed, same as a regular
+// `[table]` header), then get-or-create an Array at the last segment and
+// append a fresh Table to it. Returns a pointer to the newly-appended table
+// so the caller can point current_table at it; every subsequent `key =
+// value` line lands in THAT table until the next `[...]`/`[[...]]` header.
+// Note: nested AOT (e.g. `[[a.b]]` followed by `[[a.b.c]]`, appending inside
+// the *last* `a.b` entry) is NOT supported — every `[[dotted.path]]` dives
+// from the document root, not from the currently-open AOT entry. Acceptable
+// today since mcpp only uses one flat array-of-tables, `[[build.flags]]`.
+inline std::expected<Table*, ParseError> open_array_of_tables(
+    Table& root, const std::vector<std::string>& path, Position pos)
+{
+    std::vector<std::string> parents(path.begin(), path.end() - 1);
+    Table* parent = dive(root, parents);
+    if (!parent) {
+        return std::unexpected(ParseError{
+            std::format("table path '{}' conflicts with non-table value",
+                        join_path(path)),
+            pos});
+    }
+    const std::string& last = path.back();
+    auto it = parent->find(last);
+    if (it == parent->end()) {
+        (*parent)[last] = Value{Array{}};
+        it = parent->find(last);
+    } else if (!it->second.is_array()) {
+        return std::unexpected(ParseError{
+            std::format("table path '{}' conflicts with non-array value",
+                        join_path(path)),
+            pos});
+    }
+    Array& arr = it->second.as_array();
+    arr.push_back(Value{Table{}});
+    return &arr.back().as_table();
+}
+
 } // namespace detail
 
 const Value* Document::get(std::string_view dotted_path) const {
@@ -470,9 +507,25 @@ std::expected<Document, ParseError> parse(std::string_view src) {
 
         if (L.peek() == '[') {
             L.advance();
-            // Note: we don't currently distinguish [[array of tables]]; mcpp doesn't use them.
             if (L.peek() == '[') {
-                return std::unexpected(ParseError{"array-of-tables not supported", L.position()});
+                // [[dotted.path]] — array-of-tables (#227). Every occurrence
+                // appends a fresh table to the array at `path`; current_table
+                // then points at that new table for subsequent key = value
+                // lines.
+                L.advance();
+                auto path = read_dotted_key(L);
+                if (!path) return std::unexpected(path.error());
+                L.skip_inline_whitespace();
+                if (L.peek() != ']' || L.peek(1) != ']') {
+                    return std::unexpected(ParseError{"expected ']]'", L.position()});
+                }
+                L.advance();
+                L.advance();
+                auto t = open_array_of_tables(root, *path, L.position());
+                if (!t) return std::unexpected(t.error());
+                explicitTables.insert(join_path(*path));
+                current_table = *t;
+                continue;
             }
             auto path = read_dotted_key(L);
             if (!path) return std::unexpected(path.error());

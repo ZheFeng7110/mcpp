@@ -608,6 +608,86 @@ TEST(Scanner, PerGlobFlagsAttachToMatchedUnits) {
     std::filesystem::remove_all(dir);
 }
 
+// #228: expand_braces desugars `{a,b}` into a cartesian product of plain
+// globs. No braces -> passthrough; multiple/nested groups combine.
+TEST(Scanner, ExpandBracesDesugarsCartesianProduct) {
+    EXPECT_EQ(expand_braces("a/**"), (std::vector<std::string>{"a/**"}));
+    EXPECT_EQ(expand_braces("a/{x,y}/**"),
+              (std::vector<std::string>{"a/x/**", "a/y/**"}));
+    EXPECT_EQ(expand_braces("a/{x,y}/{1,2}"),
+              (std::vector<std::string>{"a/x/1", "a/x/2", "a/y/1", "a/y/2"}));
+    // Nested group.
+    EXPECT_EQ(expand_braces("a/{x,{y,z}}/**"),
+              (std::vector<std::string>{"a/x/**", "a/y/**", "a/z/**"}));
+}
+
+// Review fix on #228: brace-nesting recursion depth is bounded (cap: 32
+// levels), so a pathological manifest with deeply nested `{` cannot
+// stack-overflow. Beyond the cap the remainder is passed through as a
+// literal instead of throwing — this must simply return, not crash.
+TEST(Scanner, ExpandBracesBoundsDeeplyNestedRecursion) {
+    std::string glob = "a/";
+    constexpr int kDepth = 500;  // far beyond the 32-level cap
+    for (int i = 0; i < kDepth; ++i) glob += "{";
+    glob += "x";
+    for (int i = 0; i < kDepth; ++i) glob += "}";
+
+    std::vector<std::string> out;
+    ASSERT_NO_THROW(out = expand_braces(glob));
+    EXPECT_FALSE(out.empty());
+}
+
+// #228: expand_glob applies brace desugaring at its entry, so a glob like
+// "p/{aac,bsf}/**" matches files under EITHER alternative directory and
+// nothing else (a sibling directory outside the brace group, "opus", must
+// not appear).
+TEST(Scanner, ExpandGlobBraceAlternation) {
+    auto dir = make_tempdir("mcpp-scanner-brace");
+    write(dir / "p" / "aac" / "x.c", "int x;\n");
+    write(dir / "p" / "bsf" / "y.c", "int y;\n");
+    write(dir / "p" / "opus" / "z.c", "int z;\n");
+
+    auto files = expand_glob(dir, "p/{aac,bsf}/**");
+
+    ASSERT_EQ(files.size(), 2u);
+    std::set<std::string> names;
+    for (auto& f : files) names.insert(f.filename().string());
+    EXPECT_TRUE(names.contains("x.c"));
+    EXPECT_TRUE(names.contains("y.c"));
+    EXPECT_FALSE(names.contains("z.c"));
+
+    std::filesystem::remove_all(dir);
+}
+
+// #228: brace alternation in a [build].flags glob must also match — the
+// per-glob-flags match point (scan_one_into's apply_glob_flags) uses
+// path_matches_glob directly rather than expand_glob's walk, so it needs its
+// own desugaring wire-up.
+TEST(Scanner, PerGlobFlagsMatchBraceAlternation) {
+    auto dir = make_tempdir("mcpp-scanner-globflags-brace");
+    write(dir / "p" / "aac" / "x.cpp", "int x() { return 1; }\n");
+    write(dir / "p" / "bsf" / "y.cpp", "int y() { return 2; }\n");
+    write(dir / "p" / "opus" / "z.cpp", "int z() { return 3; }\n");
+
+    mcpp::manifest::Manifest m;
+    m.package.name = "bracepkg";
+    m.modules.sources = { "p/**/*.cpp" };
+    m.buildConfig.globFlags.push_back(
+        { .glob = "p/{aac,bsf}/**", .defines = {"CODEC"} });
+
+    auto res = scan_package(dir, m);
+    ASSERT_TRUE(res.errors.empty());
+    ASSERT_EQ(res.graph.units.size(), 3u);
+    for (auto& u : res.graph.units) {
+        bool wantsDefine = u.path.filename() != "z.cpp";
+        bool hasDefine = std::find(u.packageCxxflags.begin(), u.packageCxxflags.end(),
+                                    "-DCODEC") != u.packageCxxflags.end();
+        EXPECT_EQ(hasDefine, wantsDefine) << u.path.string();
+    }
+
+    std::filesystem::remove_all(dir);
+}
+
 // G8b: relative -I flags are root-relative in the manifest but ninja runs
 // with cwd = output dir — the scanner absolutizes them on every unit.
 TEST(Scanner, RelativeIncludeFlagsAbsolutized) {

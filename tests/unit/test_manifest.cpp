@@ -1731,3 +1731,68 @@ mcpp = {
     EXPECT_EQ(mx->buildConfig.globFlags[1].defines,
               (std::vector<std::string>{"HAVE_AVX2"}));
 }
+
+TEST(Manifest, AllowsBuildFlagsArrayOfTablesSyntax) {
+    // `[[build.flags]]` header form must still parse at the manifest layer
+    // (not just the lower libs/toml layer) — the closed-grammar guard must
+    // allowlist exactly this path.
+    constexpr auto src = R"(
+[package]
+name = "globf"
+version = "1.0.0"
+
+[[build.flags]]
+glob = "third_party/**"
+cxxflags = ["-w"]
+
+[[build.flags]]
+glob = "src/x86/**/*.asm"
+asmflags = ["-DPIC"]
+)";
+    auto m = mcpp::manifest::parse_string(src);
+    ASSERT_TRUE(m.has_value()) << m.error().format();
+    auto& gfs = m->buildConfig.globFlags;
+    ASSERT_EQ(gfs.size(), 2u);
+    EXPECT_EQ(gfs[0].glob, "third_party/**");
+    EXPECT_EQ(gfs[0].cxxflags, (std::vector<std::string>{"-w"}));
+    EXPECT_EQ(gfs[1].glob, "src/x86/**/*.asm");
+    EXPECT_EQ(gfs[1].asmflags, (std::vector<std::string>{"-DPIC"}));
+}
+
+// Closed-grammar guard (review fix on #227/#228): `[[dependencies]]` is a
+// doubled-bracket typo for `[dependencies]`. Before this guard it parsed
+// silently as an array-of-tables at that path; every consumer reads
+// [dependencies] via get_table(), which returns nullptr for a non-table
+// Value, so the whole section (all dependencies) silently vanished with no
+// error and no warning. It must now be a loud parse error.
+TEST(Manifest, RejectsArrayOfTablesTypoOnDependencies) {
+    auto m = mcpp::manifest::parse_string(R"(
+[package]
+name = "x"
+version = "0.1.0"
+
+[[dependencies]]
+gtest = "1.15.2"
+)");
+    ASSERT_FALSE(m.has_value());
+    EXPECT_NE(m.error().message.find("array-of-tables"), std::string::npos)
+        << m.error().message;
+    EXPECT_NE(m.error().message.find("dependencies"), std::string::npos)
+        << m.error().message;
+}
+
+// Same guard, a different non-allowlisted path — confirms the check isn't
+// hardcoded to just "dependencies".
+TEST(Manifest, RejectsArrayOfTablesTypoOnToolchain) {
+    auto m = mcpp::manifest::parse_string(R"(
+[package]
+name = "x"
+version = "0.1.0"
+
+[[toolchain]]
+linux = "gcc@15.1.0"
+)");
+    ASSERT_FALSE(m.has_value());
+    EXPECT_NE(m.error().message.find("array-of-tables"), std::string::npos)
+        << m.error().message;
+}
