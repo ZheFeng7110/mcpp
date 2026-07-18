@@ -96,27 +96,34 @@ std::string local_include_flags(const CompileUnit& cu) {
     return flags;
 }
 
-std::string join_flags(const std::vector<std::string>& flags,
-                        bool shellQuote = true) {
-    // mcpp#234: each vector element is already one argv token (e.g. a
-    // manifest define `T=long long` arrives here as the single element
-    // `-DT=long long`, pushed whole by apply_glob_flags) — but joining with
-    // a bare space and no quoting let the embedded space split it into two
-    // words once ninja handed the resolved command line to the shell.
-    // shell_quote_arg is a no-op for tokens with nothing shell-significant
-    // (`-std=c++23`, `-O2`, ...), so plain flags are untouched.
+std::string join_flags(const std::vector<std::string>& flags) {
+    // mcpp#234: a manifest `defines = ["T=long long"]` arrives as the single
+    // element `-DT=long long` (pushed whole by apply_glob_flags) — a space
+    // that is genuinely PART of one argv token. Joining with a bare space let
+    // the shell split it into two words (`-DT=long` + `long`) once ninja
+    // handed the command line to the shell, so a define value with a space
+    // must be shell-quoted.
     //
-    // shellQuote=false for mcpp-GENERATED link flags (lu.linkFlags): those
-    // are already correctly shell-quoted + ninja-escaped at construction
-    // (e.g. the rpath token `-Wl,-rpath,'$$ORIGIN'` from plan.cppm — single
-    // quotes protect it from shell $-expansion, `$$` is ninja's literal `$`).
-    // Re-running shell_quote_arg over such a token DOUBLE-quotes it, baking a
-    // literal `'$ORIGIN'` (quotes included) into the binary's RUNPATH so the
-    // dynamic linker can't resolve dependency .so's placed next to the exe.
+    // But quote ONLY that case. Every OTHER flag element is passed through
+    // verbatim, because two other kinds of element legitimately contain a
+    // space that MUST stay a token boundary, and quoting them breaks the build:
+    //   • raw descriptor flags pack multiple argv tokens into one string
+    //     (compat.lua's `-include mcpp_lua_platform_config.h` — the space
+    //     separates `-include` from its argument; quoting made gcc see one
+    //     malformed arg → "No such file"; broke aarch64/macos/windows builds);
+    //   • mcpp-generated link flags are already shell-quoted + ninja-escaped
+    //     (`-Wl,-rpath,'$$ORIGIN'` — single quotes stop shell $-expansion,
+    //     `$$` is ninja's literal `$`); re-quoting baked a literal `'$ORIGIN'`
+    //     into RUNPATH so dependency .so's next to the exe couldn't resolve.
+    // The `defines` channel is the ONLY producer of a `-D`/`/D`-prefixed token
+    // whose space is intra-value, so gate the quoting on exactly that shape.
     std::string out;
     for (auto const& flag : flags) {
         out += ' ';
-        out += shellQuote ? shell_quote_arg(flag) : flag;
+        const bool defineWithSpace =
+            (flag.starts_with("-D") || flag.starts_with("/D"))
+            && flag.find(' ') != std::string::npos;
+        out += defineWithSpace ? shell_quote_arg(flag) : flag;
     }
     return out;
 }
@@ -898,7 +905,7 @@ std::string emit_ninja_string(const BuildPlan& plan) {
             // binaries run on the build host and use the system -lc++,
             // distributable targets get the static LLVM libc++. See
             // CompileFlags::ldStdlibDefault/ldStdlibTest.
-            std::string unit = join_flags(lu.linkFlags, /*shellQuote=*/false);
+            std::string unit = join_flags(lu.linkFlags);
             unit += (lu.kind == mcpp::build::LinkUnit::TestBinary)
                 ? flags.ldStdlibTest : flags.ldStdlibDefault;
             if (!unit.empty())

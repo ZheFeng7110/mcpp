@@ -356,6 +356,32 @@ TEST(NinjaBackend, LinkFlagsAreNotReQuoted) {
     EXPECT_EQ(ninja.find("'\\''"), std::string::npos) << ninja;
 }
 
+// Regression (#234 follow-up): a raw descriptor flag that packs two argv
+// tokens into one string — e.g. compat.lua's `-include <header>` — must pass
+// through VERBATIM so the shell splits it back into `-include` + the header.
+// Blanket shell-quoting wrapped it into one malformed arg, so gcc looked for a
+// file literally named "<space>header" → "No such file" → aarch64/macos/windows
+// cross-builds failed. Only `-D`/`/D` define tokens with an intra-value space
+// get quoted; `-include foo.h` does not.
+TEST(NinjaBackend, RawMultiTokenFlagIsNotQuoted) {
+    auto plan = minimal_plan();
+    plan.compileUnits.push_back({
+        .source = "src/main.c",
+        .object = "obj/main.o",
+        .packageName = "include_flag_test",
+        .packageCflags = {"-include mcpp_lua_platform_config.h"},
+    });
+
+    auto ninja = emit_ninja_string(plan);
+
+    // Verbatim, so the shell re-splits into two args.
+    EXPECT_NE(ninja.find("unit_cflags = -include mcpp_lua_platform_config.h"),
+              std::string::npos) << ninja;
+    // Must NOT be wrapped in quotes (which would make it one malformed arg).
+    EXPECT_EQ(ninja.find("'-include mcpp_lua_platform_config.h'"),
+              std::string::npos) << ninja;
+}
+
 TEST(NinjaBackend, RootPackageCxxflagsAreEmittedOncePerUnit) {
     auto plan = minimal_plan();
     plan.manifest.buildConfig.cxxflags = {"-DROOT_FLAG=1"};
