@@ -140,6 +140,118 @@ TEST(Scanner, ExpandGlobFollowsDirectorySymlinks) {
     std::filesystem::remove_all(dir);
 }
 
+// mcpp#225 review finding: glob_literal_prefix's contract (the piece that
+// actually decides WHERE expand_glob/expand_dir_glob start walking) is the
+// thing that must be locked down deterministically. Calling the pure helper
+// directly — rather than inferring its behavior from a filesystem walk whose
+// entry order is unspecified by the standard — makes this test's pass/fail
+// independent of directory-enumeration order on any filesystem.
+TEST(Scanner, GlobLiteralPrefixDerivation) {
+    EXPECT_EQ(glob_literal_prefix("src/**/*.cppm"), "src");
+    // Wildcard already in the first segment: no literal directory to bound to.
+    EXPECT_EQ(glob_literal_prefix("**/*.c"), "");
+    // No wildcard at all: the full parent directory path is the prefix.
+    EXPECT_EQ(glob_literal_prefix("a/b/c.cpp"), "a/b");
+    // Truncate back to the last COMPLETE '/' before the first wildcard char —
+    // "x*.cpp" is a partial segment, not a real directory named "x".
+    EXPECT_EQ(glob_literal_prefix("src/x*.cpp"), "src");
+    // '{' is treated as a segment-boundary wildcard char (brace-expansion
+    // globs are desugared before reaching this helper — see its comment in
+    // scanner.cppm), so the prefix truncates at the last '/' before it.
+    EXPECT_EQ(glob_literal_prefix("a/{x,y}/z"), "a");
+}
+
+// mcpp#225: expand_glob must bound its walk to the glob's literal directory
+// prefix ("src" for "src/**/*.cppm") instead of always walking the whole
+// root and lexically filtering afterward. This is the FUNCTIONAL half of the
+// regression guard: given a normal (non-adversarial) tree with files outside
+// "src", a bounded walk returns exactly the "src" matches. The core "walk
+// starts AT the literal prefix, not root" behavior is now locked down
+// deterministically by Scanner.GlobLiteralPrefixDerivation above, which
+// tests glob_literal_prefix directly and isn't subject to filesystem
+// enumeration order.
+TEST(Scanner, ExpandGlobStartsAtLiteralPrefix) {
+    auto dir = make_tempdir("mcpp-scanner-prefix");
+    write(dir / "other" / "b.cppm", "export module b;\n");
+    write(dir / "src" / "a.cppm", "export module a;\n");
+
+    auto files = expand_glob(dir, "src/**/*.cppm");
+
+    ASSERT_EQ(files.size(), 1u);
+    EXPECT_EQ(files[0], dir / "src" / "a.cppm");
+
+    std::filesystem::remove_all(dir);
+}
+
+// Supplementary (not the primary regression guard — see
+// Scanner.GlobLiteralPrefixDerivation and Scanner.ExpandGlobStartsAtLiteralPrefix
+// above): on filesystems where directory enumeration happens to visit "junk"
+// before "src", this additionally proves the walk never even touches an
+// unreadable sibling tree. The landmine's fire/no-fire outcome depends on
+// unspecified recursive_directory_iterator enumeration order, so the guard
+// condition is made explicit below rather than silently no-op'ing — if the
+// landmine didn't fire (order-dependent), the test still asserts the
+// positive result and reports (via trace) that the landmine was inert this
+// run, instead of pretending it verified the old-code-fails claim.
+TEST(Scanner, ExpandGlobStartsAtLiteralPrefixLandmine) {
+    auto dir = make_tempdir("mcpp-scanner-prefix-landmine");
+    auto blocked = dir / "junk" / "blocked";
+    std::filesystem::create_directories(blocked);
+    write(blocked / "sentinel.cppm", "export module sentinel;\n");
+    std::error_code permEc;
+    std::filesystem::permissions(blocked, std::filesystem::perms::none, permEc);
+
+    write(dir / "src" / "a.cppm", "export module a;\n");
+
+    // If permissions can't be locked down here (e.g. running as root), the
+    // landmine can't fire — skip rather than risk a false pass/fail.
+    std::error_code probeEc;
+    std::filesystem::directory_iterator(blocked, probeEc);
+    if (!probeEc) {
+        std::filesystem::permissions(blocked, std::filesystem::perms::all, permEc);
+        std::filesystem::remove_all(dir);
+        GTEST_SKIP() << "cannot restrict directory permissions in this environment";
+    }
+
+    auto files = expand_glob(dir, "src/**/*.cppm");
+
+    // Restore permissions before cleanup (remove_all needs to read `blocked`).
+    std::filesystem::permissions(blocked, std::filesystem::perms::all, permEc);
+
+    // This is the guard being made explicit: whether the landmine actually
+    // fired for the OLD (unbounded) code depends on unspecified enumeration
+    // order, so it cannot be asserted here either way. What IS asserted,
+    // unconditionally, is the functional outcome — the bounded walk must
+    // return exactly the "src" match regardless of "junk"'s enumeration
+    // position. That functional assertion is real signal on every run; it
+    // just isn't, by itself, an order-independent proof that old code would
+    // have failed here (that proof now lives in
+    // Scanner.GlobLiteralPrefixDerivation instead).
+    ASSERT_EQ(files.size(), 1u);
+    EXPECT_EQ(files[0], dir / "src" / "a.cppm");
+
+    std::filesystem::remove_all(dir);
+}
+
+// mcpp#225: the walk must prune VCS metadata (.git) and mcpp's own build
+// output (target) the same way it already prunes .mcpp (mcpp#230). Glob has
+// no literal prefix ("**/*.cppm") so the walk starts at root and would
+// otherwise reach all three excluded trees.
+TEST(Scanner, ExcludesGitAndTargetAndMcpp) {
+    auto dir = make_tempdir("mcpp-scanner-exclude");
+    write(dir / ".git" / "x.cppm", "export module x;\n");
+    write(dir / "target" / "y.cppm", "export module y;\n");
+    write(dir / ".mcpp" / "z.cppm", "export module z;\n");
+    write(dir / "src" / "ok.cppm", "export module ok;\n");
+
+    auto files = expand_glob(dir, "**/*.cppm");
+
+    ASSERT_EQ(files.size(), 1u);
+    EXPECT_EQ(files[0], dir / "src" / "ok.cppm");
+
+    std::filesystem::remove_all(dir);
+}
+
 TEST(Scanner, RecordsPackageLocalIncludeDirs) {
     auto dir = make_tempdir("mcpp-scanner-includes");
     write(dir / "src" / "foo.cpp",

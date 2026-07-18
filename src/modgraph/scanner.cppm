@@ -38,6 +38,13 @@ std::vector<std::filesystem::path> expand_glob(const std::filesystem::path& root
 std::vector<std::filesystem::path> expand_dir_glob(const std::filesystem::path& root,
                                                    std::string_view glob);
 
+// mcpp#225 (test-exposed): pure literal (non-wildcard) directory-prefix
+// derivation used to bound expand_glob/expand_dir_glob's walk start point.
+// Exported (rather than kept file-local) solely so unit tests can assert its
+// behavior directly and deterministically — see its definition below for
+// the full contract.
+std::filesystem::path glob_literal_prefix(std::string_view glob);
+
 // Scan a single source file.
 std::expected<SourceUnit, ScanError> scan_file(const std::filesystem::path& file,
                                                const std::string&           packageName);
@@ -228,7 +235,84 @@ bool is_module_name_char(char c) {
     return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '.' || c == ':';
 }
 
+// mcpp#225: submodule paths registered in `<root>/.gitmodules` ("path = ..."
+// entries), resolved to canonical absolute paths. is_excluded_walk_dir is
+// called once per directory ENTRY seen during a walk, so this is parsed
+// once per root and cached for the life of the process rather than
+// re-reading .gitmodules on every call (that would defeat the point of
+// bounding the walk).
+const std::set<std::filesystem::path>&
+submodule_paths(const std::filesystem::path& root) {
+    static std::map<std::filesystem::path, std::set<std::filesystem::path>> cache;
+    std::error_code kec;
+    auto key = std::filesystem::canonical(root, kec);
+    if (kec) key = root;
+    if (auto it = cache.find(key); it != cache.end()) return it->second;
+
+    std::set<std::filesystem::path> paths;
+    std::ifstream f(root / ".gitmodules");
+    std::string line;
+    while (f && std::getline(f, line)) {
+        auto eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string_view k = trim(std::string_view(line).substr(0, eq));
+        if (k != "path") continue;
+        std::string_view v = trim(std::string_view(line).substr(eq + 1));
+        if (v.empty()) continue;
+        std::error_code pec;
+        auto abs = std::filesystem::canonical(root / std::filesystem::path(std::string(v)), pec);
+        paths.insert(pec ? (root / std::filesystem::path(std::string(v))) : abs);
+    }
+    return cache.emplace(key, std::move(paths)).first->second;
+}
+
+// mcpp#225: directory names that never hold project sources — VCS metadata,
+// mcpp's own build output, and mcpp's own project-metadata dir (mcpp#230:
+// `.mcpp`'s xlings data tree holds a symlink back to each path-dep index
+// root, so following it walks that entire checkout). A directory whose path
+// matches a `.gitmodules`-registered submodule path under `root` is pruned
+// too — submodules are foreign trees, often huge, and not part of this
+// package's source glob.
+bool is_excluded_walk_dir(const std::filesystem::path& dir,
+                          const std::filesystem::path& root) {
+    auto name = dir.filename().string();
+    if (name == ".mcpp" || name == ".git" || name == "target") return true;
+    auto const& submodules = submodule_paths(root);
+    if (submodules.empty()) return false;
+    std::error_code ec;
+    auto c = std::filesystem::canonical(dir, ec);
+    return submodules.contains(ec ? dir : c);
+}
+
 } // namespace
+
+// mcpp#225: the literal (non-wildcard) directory prefix of a glob, e.g.
+// "src/**/*.cppm" -> "src", "tests/**/*.cpp" -> "tests", "*/include" -> ""
+// (wildcard already in the first segment). Used to bound the walk's START
+// point in expand_glob/expand_dir_glob instead of always walking from root
+// and filtering lexically afterward — path_matches_glob still does the full
+// lexical match, so this only narrows WHERE the iterator begins, never
+// which files can match. Truncates back to the last complete '/' so a
+// partial segment (e.g. "src/pre*fix" -> "src/pre") is never mistaken for a
+// real directory name. Conservative about '{' (and '?'/'['): brace-expansion
+// globs are desugared into multiple plain globs before ever reaching here
+// (mcpp#225 cluster E follow-up), so any of those chars seen here is just a
+// segment boundary, never something to interpret. Declared in the exported
+// namespace above (not kept file-local) purely so unit tests can assert its
+// behavior directly, deterministically, and independently of filesystem
+// enumeration order — see Scanner.GlobLiteralPrefixDerivation.
+std::filesystem::path glob_literal_prefix(std::string_view glob) {
+    // Every current caller already strips a leading `!` (exclusion globs)
+    // before calling expand_glob/expand_dir_glob, but strip it here too —
+    // defense in depth, and a literal '!' is never a real path component.
+    if (!glob.empty() && glob.front() == '!') glob.remove_prefix(1);
+    auto wildcard = glob.find_first_of("*?{[");
+    std::string_view literal = wildcard == std::string_view::npos
+        ? glob : glob.substr(0, wildcard);
+    auto slash = literal.find_last_of('/');
+    if (slash == std::string_view::npos) return {};
+    return std::filesystem::path(literal.substr(0, slash));
+}
 
 std::vector<std::filesystem::path> expand_glob(const std::filesystem::path& root,
                                                std::string_view glob)
@@ -236,6 +320,16 @@ std::vector<std::filesystem::path> expand_glob(const std::filesystem::path& root
     namespace fs = std::filesystem;
     std::vector<fs::path> out;
     if (!fs::exists(root)) return out;
+
+    // mcpp#225: bound the walk's start point to the glob's literal
+    // directory prefix instead of always walking the whole root. A prefix
+    // that doesn't exist means the glob can never match anything — return
+    // empty WITHOUT walking (not a full-tree fallback).
+    fs::path prefix = glob_literal_prefix(glob);
+    fs::path start  = prefix.empty() ? root : root / prefix;
+    std::error_code startEc;
+    if (!fs::exists(start, startEc)) return out;
+
     // Follow directory symlinks (vendored trees are often symlink farms).
     // Cycle guard: a directory whose canonical path is already on the
     // CURRENT recursion chain is a link loop — only that is pruned; the same
@@ -245,20 +339,15 @@ std::vector<std::filesystem::path> expand_glob(const std::filesystem::path& root
     std::vector<fs::path> chain;   // canonical dirs of the recursion stack
     std::error_code ec, eec;       // ec: iteration; eec: per-entry probes
     {
-        auto c = fs::canonical(root, eec);
-        chain.push_back(eec ? root : c);
+        auto c = fs::canonical(start, eec);
+        chain.push_back(eec ? start : c);
     }
     fs::recursive_directory_iterator it(
-        root, fs::directory_options::follow_directory_symlink, ec);
+        start, fs::directory_options::follow_directory_symlink, ec);
     for (fs::recursive_directory_iterator end; !ec && it != end; it.increment(ec)) {
         auto& e = *it;
         if (e.is_directory(eec) && !eec) {
-            // `.mcpp` is mcpp's own project metadata dir. Its xlings data
-            // tree holds a SYMLINK back to each path-dep index root, so
-            // following it walks that entire checkout (mcpp#230: the CI
-            // workspace walked into a vendored xim-pkgindex and died on a
-            // CJK filename). Never a source dir — prune by name.
-            if (e.path().filename() == ".mcpp") {
+            if (is_excluded_walk_dir(e.path(), root)) {
                 it.disable_recursion_pending();
                 continue;
             }
@@ -299,23 +388,31 @@ std::vector<std::filesystem::path> expand_dir_glob(const std::filesystem::path& 
         if (std::filesystem::is_directory(p, ec)) out.push_back(p);
         return out;
     }
-    // Walk all directories under root, match each against the glob. Same
+
+    // mcpp#225: bound the walk's start point the same way expand_glob does
+    // (see the comment there) — a prefix that doesn't exist means the glob
+    // can never match, so return empty without walking.
+    std::filesystem::path prefix = glob_literal_prefix(glob);
+    std::filesystem::path start  = prefix.empty() ? root : root / prefix;
+    std::error_code startEc;
+    if (!std::filesystem::exists(start, startEc)) return out;
+
+    // Walk all directories under start, match each against the glob. Same
     // follow-symlinks + recursion-chain cycle guard as expand_glob above.
-    out.push_back(root);   // root itself eligible if glob is "" (rare)
+    out.push_back(root);   // sentinel, always dropped below regardless of value
     std::vector<std::filesystem::path> chain;
     std::error_code eec;   // per-entry probes; ec drives iteration
     {
-        auto c = std::filesystem::canonical(root, eec);
-        chain.push_back(eec ? root : c);
+        auto c = std::filesystem::canonical(start, eec);
+        chain.push_back(eec ? start : c);
     }
     std::filesystem::recursive_directory_iterator it(
-        root, std::filesystem::directory_options::follow_directory_symlink, ec);
+        start, std::filesystem::directory_options::follow_directory_symlink, ec);
     for (std::filesystem::recursive_directory_iterator end;
          !ec && it != end; it.increment(ec)) {
         auto& e = *it;
         if (!e.is_directory(eec) || eec) continue;
-        // Same `.mcpp` prune as expand_glob (see comment there / mcpp#230).
-        if (e.path().filename() == ".mcpp") {
+        if (is_excluded_walk_dir(e.path(), root)) {
             it.disable_recursion_pending();
             continue;
         }

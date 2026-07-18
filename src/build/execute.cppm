@@ -38,6 +38,22 @@ struct BuildCacheEntry {
     std::string fingerprint;     // outputDir basename
     std::string runtimeEnvKey;   // "-" means intentionally empty; "" means old cache
     std::string runtimeEnvValue;
+    // mcpp#225 (E2): resolved binary run-targets, cached alongside the
+    // fingerprint so `mcpp run` can skip prepare_build (toolchain
+    // resolution + modgraph scan) on a cache hit — see build_run_target's
+    // fast path. name -> exe path relative to outputDir. Caches written
+    // before this field existed leave it empty, which the run fast-path
+    // treats as a miss (falls back to prepare_build once, never crashes).
+    std::vector<std::pair<std::string, std::string>> runTargets;
+    // The process environment needed to exec those targets (e.g.
+    // LD_LIBRARY_PATH for dep .so's not covered by the exe's own RUNPATH),
+    // cached the same way as runtimeEnvKey/Value above but for RUNNING the
+    // binary rather than invoking the toolchain. "" (default-constructed)
+    // means old cache / not yet resolved — the run fast-path exec's with no
+    // extra env in that case, matching prepare_build's behavior when
+    // plan.runtimeLibraryDirs is empty.
+    std::string runEnvKey;
+    std::string runEnvValue;
 };
 
 std::vector<BuildCacheEntry> read_build_cache(const std::filesystem::path& projectRoot) {
@@ -75,9 +91,32 @@ std::vector<BuildCacheEntry> read_build_cache(const std::filesystem::path& proje
         if (!std::getline(f, e.ninjaProgram) || e.ninjaProgram.empty()) break;
         std::getline(f, e.fingerprint);
         bool haveNextLine = static_cast<bool>(std::getline(f, line));
-        if (haveNextLine && !line.starts_with("[target=")) {
+        if (haveNextLine && !line.starts_with("[target=")
+                         && !line.starts_with("runTargets=")) {
             e.runtimeEnvKey = line;
             std::getline(f, e.runtimeEnvValue);
+            haveNextLine = static_cast<bool>(std::getline(f, line));
+        }
+        // mcpp#225 (E2): optional runTargets block. Absent on caches written
+        // before this field existed (or truncated/corrupt mid-block) — in
+        // either case e.runTargets stays empty, which the run fast-path
+        // treats as a miss, never a crash.
+        if (haveNextLine && line.starts_with("runTargets=")) {
+            std::size_t n = 0;
+            try { n = std::stoul(line.substr(11)); } catch (...) { n = 0; }
+            for (std::size_t i = 0; i < n && std::getline(f, line); ++i) {
+                auto tab = line.find('\t');
+                if (tab == std::string::npos) continue;
+                e.runTargets.emplace_back(line.substr(0, tab), line.substr(tab + 1));
+            }
+            haveNextLine = static_cast<bool>(std::getline(f, line));
+        }
+        // mcpp#225 (E2): optional run-env block (the process env needed to
+        // exec a cached run-target, e.g. LD_LIBRARY_PATH). Same back-compat
+        // contract as runTargets above.
+        if (haveNextLine && line.starts_with("runEnv=")) {
+            e.runEnvKey = line.substr(7);
+            std::getline(f, e.runEnvValue);
             haveNextLine = static_cast<bool>(std::getline(f, line));
         }
         entries.push_back(std::move(e));
@@ -92,7 +131,10 @@ void write_build_cache(const std::filesystem::path& projectRoot,
                        const std::string& targetTriple,
                        const std::string& fingerprintHex = "",
                        const std::string& runtimeEnvKey = "-",
-                       const std::string& runtimeEnvValue = "") {
+                       const std::string& runtimeEnvValue = "",
+                       std::vector<std::pair<std::string, std::string>> runTargets = {},
+                       const std::string& runEnvKey = "",
+                       const std::string& runEnvValue = "") {
     auto path = projectRoot / kBuildCacheFile;
     auto entries = read_build_cache(projectRoot);
 
@@ -103,7 +145,8 @@ void write_build_cache(const std::filesystem::path& projectRoot,
 
     // Insert at front (MRU).
     BuildCacheEntry newEntry{targetTriple, outputDir.string(), ninjaProgram, fingerprintHex,
-                             runtimeEnvKey, runtimeEnvValue};
+                             runtimeEnvKey, runtimeEnvValue, std::move(runTargets),
+                             runEnvKey, runEnvValue};
     entries.insert(entries.begin(), std::move(newEntry));
 
     // Trim to LRU capacity.
@@ -122,6 +165,15 @@ void write_build_cache(const std::filesystem::path& projectRoot,
         f << e.fingerprint << '\n';
         f << (e.runtimeEnvKey.empty() ? "-" : e.runtimeEnvKey) << '\n';
         f << e.runtimeEnvValue << '\n';
+        // mcpp#225 (E2): run-targets + their exec env, always written (even
+        // when empty) so a reader never has to guess whether a missing
+        // block means "no targets" vs "cache predates this field" — the
+        // count-prefixed block is unambiguous either way, and back-compat
+        // for OLD caches (no such block at all) is handled on the read side.
+        f << "runTargets=" << e.runTargets.size() << '\n';
+        for (auto& [name, exe] : e.runTargets) f << name << '\t' << exe << '\n';
+        f << "runEnv=" << e.runEnvKey << '\n';
+        f << e.runEnvValue << '\n';
     }
 }
 
@@ -163,6 +215,34 @@ bool is_stale_ninja_failure(std::string_view output) {
         // with this signature. Treat it as stale → drop to a full regen
         // instead of hard-failing and forcing the user to `mcpp clean`.
         || output.find("missing and no known rule to make") != std::string_view::npos;
+}
+
+// mcpp#225 (E2): the (name, exe-path-relative-to-outputDir) pairs for every
+// binary link unit in a resolved plan, cached alongside the build
+// fingerprint so `mcpp run` can locate an executable without re-running
+// prepare_build (see BuildCacheEntry::runTargets / try_fast_run below).
+// TestBinary/library link units never run via `mcpp run`, so only Binary
+// link units are collected.
+std::vector<std::pair<std::string, std::string>>
+compute_run_targets(const mcpp::build::BuildPlan& plan) {
+    std::vector<std::pair<std::string, std::string>> out;
+    for (auto& lu : plan.linkUnits) {
+        if (lu.kind != mcpp::build::LinkUnit::Binary) continue;
+        out.emplace_back(lu.targetName, lu.output.generic_string());
+    }
+    return out;
+}
+
+// mcpp#225 (E2): the process env needed to exec a run-target (e.g.
+// LD_LIBRARY_PATH for dep .so's not covered by the exe's own RUNPATH).
+// Shared between build_run_target's normal (prepare_build) path and its
+// cached fast path so both derive the same env from the same source.
+std::pair<std::string, std::string>
+compute_run_env(const mcpp::build::BuildPlan& plan) {
+    auto key = mcpp::platform::env::runtime_library_path_key();
+    auto value = mcpp::platform::env::prepend_path_list(key, plan.runtimeLibraryDirs);
+    if (key.empty() || value.empty()) return {"", ""};
+    return {key, value};
 }
 
 // Compile a prepared BuildContext. Shared between `mcpp build` and `mcpp run`
@@ -245,10 +325,13 @@ export int run_build_plan(BuildContext& ctx, bool verbose, bool no_cache,
     // P0: save build cache for fast-path on next invocation.
     if (!no_cache && !r->ninjaProgram.empty()) {
         auto fpHex = ctx.outputDir.filename().string();
+        auto runTargets = compute_run_targets(ctx.plan);
+        auto [runEnvKey, runEnvValue] = compute_run_env(ctx.plan);
         write_build_cache(ctx.projectRoot, ctx.outputDir, r->ninjaProgram,
                           std::string(targetOverride), fpHex,
                           r->runtimeEnvKey.empty() ? "-" : r->runtimeEnvKey,
-                          r->runtimeEnvValue);
+                          r->runtimeEnvValue,
+                          std::move(runTargets), runEnvKey, runEnvValue);
     }
 
     mcpp::ui::finished("release", r->elapsed);
@@ -263,6 +346,97 @@ export int run_build_plan(BuildContext& ctx, bool verbose, bool no_cache,
 // without re-running the scanner, make_plan, or emit phases.
 //
 // This reduces no-change builds from ~10s to <0.5s.
+
+// mcpp#225: is any tracked source file under `projectRoot` newer than
+// `ninjaTime`? Shared by try_fast_build's and try_fast_run's freshness
+// gates. Uses expand_glob's bounded ("src" prefix) + vcs/build-dir-excluded
+// walk instead of a hand-rolled recursive_directory_iterator — the OLD
+// staleness check here walked ALL of src/ unfiltered (harmless when src/ is
+// the whole tree, but wasteful/wrong the moment a huge unrelated directory
+// lives elsewhere under the project root and gets swept in by some other
+// caller's broader glob; and it's the same choke-point fix as expand_glob
+// itself, see scanner.cppm).
+bool sources_newer_than(const std::filesystem::path& projectRoot,
+                        std::filesystem::file_time_type ninjaTime) {
+    std::error_code ec;
+    for (auto& f : mcpp::modgraph::expand_glob(projectRoot, "src/**/*")) {
+        auto ext = f.extension().string();
+        if (ext != ".cppm" && ext != ".cpp" && ext != ".cc" &&
+            ext != ".cxx" && ext != ".c" && ext != ".h" && ext != ".hpp")
+            continue;
+        auto ft = std::filesystem::last_write_time(f, ec);
+        if (ec || ft > ninjaTime) return true;
+    }
+    return false;
+}
+
+// mcpp#225: run ninja quietly against an already-verified-fresh build.ninja.
+// Shared by try_fast_build (which just reports "Finished" on success) and
+// try_fast_run (which goes on to locate + exec a binary). Returns nullopt
+// when ninja's failure looks like a stale-graph signature — the caller
+// should abandon the fast path and fall back to a full prepare_build — or
+// an exit code otherwise (0 success; 1 hard failure, diagnostics already
+// printed to stderr).
+std::optional<int> run_ninja_fast(const std::string& ninjaProgram,
+                                  const std::filesystem::path& outputDir,
+                                  const std::filesystem::path& ninjaPath,
+                                  bool verbose,
+                                  const std::string& runtimeEnvKey,
+                                  const std::string& runtimeEnvValue,
+                                  std::chrono::milliseconds* elapsedOut = nullptr) {
+    std::vector<std::string> argv{ninjaProgram};
+    if (!verbose) argv.push_back("--quiet");
+    argv.push_back("-C");
+    argv.push_back(outputDir.string());
+    if (verbose) argv.push_back("-v");
+
+    std::vector<std::pair<std::string, std::string>> childEnv;
+    if (runtimeEnvKey == "@env") {
+        // Multi-var encoding (MSVC INCLUDE/LIB/PATH/VSLANG + optional runtime
+        // pair): \x1f-separated k=v records in the single value slot.
+        std::string_view rest = runtimeEnvValue;
+        while (!rest.empty()) {
+            auto sep = rest.find('\x1f');
+            auto rec = rest.substr(0, sep);
+            if (auto eq = rec.find('='); eq != std::string_view::npos && eq > 0)
+                childEnv.emplace_back(std::string(rec.substr(0, eq)),
+                                      std::string(rec.substr(eq + 1)));
+            if (sep == std::string_view::npos) break;
+            rest.remove_prefix(sep + 1);
+        }
+    } else if (runtimeEnvKey != "-" && !runtimeEnvValue.empty()) {
+        childEnv.emplace_back(runtimeEnvKey, runtimeEnvValue);
+    }
+
+    auto t0 = std::chrono::steady_clock::now();
+    // capture_exec merges stderr into the captured output (replacing `2>&1`),
+    // so is_stale_ninja_failure / filter_ninja_output still see ninja errors.
+    auto r = mcpp::platform::process::capture_exec(argv, childEnv);
+    std::string out = r.output;
+    int status = r.exit_code;
+    if (status != 0) {
+        if (is_stale_ninja_failure(out))
+            return std::nullopt;
+        std::fflush(stdout);
+        mcpp::ui::error("build failed");
+        auto prefixes = read_ninja_command_prefixes(ninjaPath);
+        auto diagnostics = verbose ? out : mcpp::build::filter_ninja_output(out, prefixes);
+        if (!diagnostics.empty()) {
+            std::fputs(diagnostics.c_str(), stderr);
+            if (diagnostics.back() != '\n')
+                std::fputc('\n', stderr);
+        }
+        return 1;
+    }
+    if (verbose && !out.empty())
+        std::fputs(out.c_str(), stdout);
+
+    if (elapsedOut) {
+        *elapsedOut = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0);
+    }
+    return 0;
+}
 
 // Try to fast-path: if build.ninja is newer than all inputs, just run ninja.
 // Returns exit code on fast-path, or nullopt if full rebuild needed.
@@ -313,79 +487,115 @@ export std::optional<int> try_fast_build(const std::filesystem::path& projectRoo
     auto tomlTime = std::filesystem::last_write_time(tomlPath, ec);
     if (ec || tomlTime > ninjaTime) return std::nullopt;
 
-    // Check all source files under src/
-    auto srcDir = projectRoot / "src";
-    if (std::filesystem::exists(srcDir, ec)) {
-        for (auto& entry : std::filesystem::recursive_directory_iterator(srcDir, ec)) {
-            if (!entry.is_regular_file()) continue;
-            auto ext = entry.path().extension().string();
-            if (ext != ".cppm" && ext != ".cpp" && ext != ".cc" &&
-                ext != ".cxx" && ext != ".c" && ext != ".h" && ext != ".hpp")
-                continue;
-            auto ft = std::filesystem::last_write_time(entry.path(), ec);
-            if (ec || ft > ninjaTime) return std::nullopt;
-        }
-    }
+    // mcpp#225: bounded + vcs/build-dir-excluded walk (see sources_newer_than)
+    // instead of a hand-rolled recursive_directory_iterator over src/.
+    if (sources_newer_than(projectRoot, ninjaTime)) return std::nullopt;
 
     // All inputs are older than build.ninja → fast-path: just run ninja.
-    std::vector<std::string> argv{ninjaProgram};
-    if (!verbose) argv.push_back("--quiet");
-    argv.push_back("-C");
-    argv.push_back(outputDir.string());
-    if (verbose) argv.push_back("-v");
+    std::chrono::milliseconds elapsed{};
+    auto rc = run_ninja_fast(ninjaProgram, outputDir, ninjaPath, verbose,
+                             runtimeEnvKey, runtimeEnvValue, &elapsed);
+    if (!rc) return std::nullopt;
+    if (*rc != 0) return rc;
 
-    std::vector<std::pair<std::string, std::string>> childEnv;
-    if (runtimeEnvKey == "@env") {
-        // Multi-var encoding (MSVC INCLUDE/LIB/PATH/VSLANG + optional runtime
-        // pair): \x1f-separated k=v records in the single value slot.
-        std::string_view rest = runtimeEnvValue;
-        while (!rest.empty()) {
-            auto sep = rest.find('\x1f');
-            auto rec = rest.substr(0, sep);
-            if (auto eq = rec.find('='); eq != std::string_view::npos && eq > 0)
-                childEnv.emplace_back(std::string(rec.substr(0, eq)),
-                                      std::string(rec.substr(eq + 1)));
-            if (sep == std::string_view::npos) break;
-            rest.remove_prefix(sep + 1);
-        }
-    } else if (runtimeEnvKey != "-" && !runtimeEnvValue.empty()) {
-        childEnv.emplace_back(runtimeEnvKey, runtimeEnvValue);
-    }
-
-    auto t0 = std::chrono::steady_clock::now();
-    // capture_exec merges stderr into the captured output (replacing `2>&1`),
-    // so is_stale_ninja_failure / filter_ninja_output still see ninja errors.
-    auto r = mcpp::platform::process::capture_exec(argv, childEnv);
-    std::string out = r.output;
-    int status = r.exit_code;
-    bool ok = (status == 0);
-    if (!ok) {
-        if (is_stale_ninja_failure(out))
-            return std::nullopt;
-        std::fflush(stdout);
-        mcpp::ui::error("build failed");
-        auto prefixes = read_ninja_command_prefixes(ninjaPath);
-        auto diagnostics = verbose ? out : mcpp::build::filter_ninja_output(out, prefixes);
-        if (!diagnostics.empty()) {
-            std::fputs(diagnostics.c_str(), stderr);
-            if (diagnostics.back() != '\n')
-                std::fputc('\n', stderr);
-        }
-        return 1;
-    }
-    if (verbose && !out.empty())
-        std::fputs(out.c_str(), stdout);
-
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - t0);
     mcpp::ui::finished("release", elapsed);
     return 0;
+}
+
+// mcpp#225 (E2): `mcpp run`'s fast path. Mirrors try_fast_build's
+// fingerprint/freshness gate against the SAME cache entry `mcpp build`
+// wrote (targetTriple == "" — `mcpp run` never takes a --target flag), then
+// on a hit runs ninja and execs the cached run-target directly — skipping
+// prepare_build (toolchain resolution + full modgraph scan) entirely.
+// Returns nullopt when there's no usable cache entry (build_run_target
+// falls back to the full prepare_build path, which also refreshes the
+// cache for next time), an exit code otherwise.
+std::optional<int> try_fast_run(const std::filesystem::path& projectRoot,
+                                const std::optional<std::string>& targetName,
+                                std::span<const std::string> passthrough) {
+    auto entries = read_build_cache(projectRoot);
+    const BuildCacheEntry* match = nullptr;
+    for (auto& e : entries) {
+        if (e.targetTriple.empty()) { match = &e; break; }
+    }
+    if (!match || match->runTargets.empty()) return std::nullopt;
+
+    auto outputDirStr = match->outputDir;
+    auto ninjaProgram = match->ninjaProgram;
+    // Legacy caches stored a shell-quoted path; execvp needs the raw path.
+    if (ninjaProgram.size() >= 2 && ninjaProgram.front() == '\''
+                                 && ninjaProgram.back() == '\'')
+        ninjaProgram = ninjaProgram.substr(1, ninjaProgram.size() - 2);
+    if (match->runtimeEnvKey.empty())
+        return std::nullopt; // old cache entry; go through prepare_build once
+
+    // P1: verify fingerprint matches the outputDir basename.
+    if (!match->fingerprint.empty()) {
+        auto dirBasename = std::filesystem::path(outputDirStr).filename().string();
+        if (dirBasename != match->fingerprint) return std::nullopt;
+    }
+
+    // Locate the requested run-target before doing any filesystem freshness
+    // work — an unrecognized name falls back to prepare_build, which gives
+    // a proper "no binary target 'x' found" error instead of a silent miss.
+    const std::pair<std::string, std::string>* chosen = nullptr;
+    for (auto& rt : match->runTargets) {
+        if (targetName && rt.first != *targetName) continue;
+        chosen = &rt;
+        if (targetName) break;
+    }
+    if (!chosen) return std::nullopt;
+
+    std::error_code ec;
+    std::filesystem::path outputDir(outputDirStr);
+    auto ninjaPath = outputDir / "build.ninja";
+    if (!std::filesystem::exists(ninjaPath, ec)) return std::nullopt;
+    auto ninjaTime = std::filesystem::last_write_time(ninjaPath, ec);
+    if (ec) return std::nullopt;
+
+    auto tomlPath = projectRoot / "mcpp.toml";
+    auto tomlTime = std::filesystem::last_write_time(tomlPath, ec);
+    if (ec || tomlTime > ninjaTime) return std::nullopt;
+
+    if (sources_newer_than(projectRoot, ninjaTime)) return std::nullopt;
+
+    // Fresh → run ninja (picks up any incremental object/link work) then
+    // exec the cached exe path directly.
+    auto rc = run_ninja_fast(ninjaProgram, outputDir, ninjaPath, /*verbose=*/false,
+                             match->runtimeEnvKey, match->runtimeEnvValue);
+    if (!rc) return std::nullopt;
+    if (*rc != 0) return rc;
+
+    auto exe = outputDir / chosen->second;
+    auto pathCtx = mcpp::fetcher::make_path_ctx(/*cfg=*/nullptr, projectRoot);
+    mcpp::ui::status("Running",
+        std::format("`{}`", mcpp::ui::shorten_path(exe, pathCtx)));
+    std::println("");
+    std::fflush(stdout);
+    std::vector<std::string> argv;
+    argv.push_back(exe.string());
+    for (auto& a : passthrough) argv.push_back(a);
+
+    std::vector<std::pair<std::string, std::string>> childEnv;
+    if (!match->runEnvKey.empty() && !match->runEnvValue.empty())
+        childEnv.emplace_back(match->runEnvKey, match->runEnvValue);
+
+    return mcpp::platform::process::run_exec(argv, childEnv) == 0 ? 0 : 1;
 }
 
 // `mcpp run` driver: build, locate the binary target, exec it with the
 // resolved runtime environment.
 export int build_run_target(const std::optional<std::string>& targetName,
                             std::span<const std::string> passthrough) {
+    // mcpp#225 (E2): reuse the resolved build cache when it's still fresh,
+    // skipping prepare_build's toolchain resolution + modgraph scan
+    // entirely — mirrors cmd_build's try_fast_build fast path.
+    if (auto root = mcpp::project::find_manifest_root(std::filesystem::current_path())) {
+        if (auto rc = try_fast_run(*root, targetName, passthrough)) {
+            return *rc;
+        }
+    }
+
     // Build first. Single prepare_build → drive build → reuse ctx to locate
     // the binary, so we don't re-resolve the toolchain or re-scan modgraph.
     auto ctx = prepare_build(/*print_fp=*/false);
@@ -418,11 +628,9 @@ export int build_run_target(const std::optional<std::string>& targetName,
     for (auto& a : passthrough) argv.push_back(a);
 
     std::vector<std::pair<std::string, std::string>> childEnv;
-    auto runtimeEnvKey = mcpp::platform::env::runtime_library_path_key();
-    auto runtimeEnvValue = mcpp::platform::env::prepend_path_list(
-        runtimeEnvKey, ctx->plan.runtimeLibraryDirs);
-    if (!runtimeEnvKey.empty() && !runtimeEnvValue.empty())
-        childEnv.emplace_back(runtimeEnvKey, runtimeEnvValue);
+    auto [runEnvKey, runEnvValue] = compute_run_env(ctx->plan);
+    if (!runEnvKey.empty() && !runEnvValue.empty())
+        childEnv.emplace_back(runEnvKey, runEnvValue);
 
     // Direct exec (no /bin/sh): the loader env reaches ONLY the target child,
     // never mcpp or a host shell. Fixes the bundled-glibc-vs-host-libtinfo

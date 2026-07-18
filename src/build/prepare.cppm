@@ -11,6 +11,7 @@ export module mcpp.build.prepare;
 
 import std;
 import mcpp.libs.json;
+import mcpp.log;
 import mcpp.manifest;
 import mcpp.modgraph.graph;
 import mcpp.modgraph.scanner;
@@ -2873,6 +2874,13 @@ prepare_build(bool print_fingerprint,
         stdFlagAndDialect += ' ';
         stdFlagAndDialect += f;
     }
+
+    // mcpp#225 (E2): observability marker for the source-discovery phase —
+    // `mcpp run`'s fast path (build_run_target/try_fast_run in execute.cppm)
+    // skips prepare_build ENTIRELY on a cache hit, so this line's absence
+    // under MCPP_VERBOSE=1 on a second `mcpp run` is the "did we re-scan"
+    // signal the e2e test asserts on (tests/e2e/114_run_scan_scope.sh).
+    mcpp::log::verbose("scan", "scanning module sources");
 
     // Modgraph: regex scanner by default; opt-in to compiler-driven P1689
     // scanner via env var MCPP_SCANNER=p1689 (see docs/27).
