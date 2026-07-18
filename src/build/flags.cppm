@@ -13,6 +13,7 @@ export module mcpp.build.flags;
 
 import std;
 import mcpp.build.plan;
+import mcpp.modgraph.scanner;
 import mcpp.platform;
 import mcpp.toolchain.clang;
 import mcpp.toolchain.detect;
@@ -65,6 +66,21 @@ CompileFlags compute_flags(const BuildPlan& plan);
 // link also accepts `libatomic.so`.
 std::string atomic_link_flag(const std::vector<std::filesystem::path>& linkDirs,
                              bool staticLink);
+
+// mcpp#234: quote a single flag-vector token for safe embedding in a shell
+// command line. Every element of a flags `vector<string>` is already one
+// argv token (e.g. `apply_glob_flags` pushes `"-D" + d`, so a define like
+// `T=long long` arrives as the single element `-DT=long long`) — but the
+// emission choke points (`join_flags` in ninja_backend.cppm, and the global
+// blob assembly below) historically joined tokens with a bare space and no
+// quoting, so a token containing a space silently split into two shell
+// words once ninja handed the resolved command line to the shell. Only
+// tokens that actually contain whitespace or a shell-significant character
+// are quoted — plain framework flags (`-std=c++23`, `-O2`, `-I/abs/path`)
+// come back unchanged, byte-for-byte. POSIX: wrap in single quotes (embedded
+// `'` escaped as `'\''`). Windows: wrap in double quotes (embedded `"`
+// escaped as `\"`) — cmd.exe/CreateProcess argv convention.
+std::string shell_quote_arg(std::string_view arg);
 
 }  // namespace mcpp::build
 
@@ -123,6 +139,39 @@ std::string atomic_link_flag(const std::vector<std::filesystem::path>& linkDirs,
     return {};
 }
 
+std::string shell_quote_arg(std::string_view arg) {
+    // Characters that split/alter a word when unquoted in POSIX sh or
+    // cmd.exe: whitespace plus the common shell metacharacters. Anything
+    // NOT in this set (e.g. `-std=c++23`, `-O2`, `-I/abs/path`, `-DFOO=1`)
+    // returns untouched — no quoting where none is needed.
+    constexpr std::string_view kNeedsQuote = " \t\n\"'\\$`;&|<>()*?[]#~!{}";
+    if (arg.find_first_of(kNeedsQuote) == std::string_view::npos)
+        return std::string(arg);
+
+    if constexpr (mcpp::platform::is_windows) {
+        // cmd.exe / CreateProcess argv convention: wrap in double quotes,
+        // escape embedded `"` as `\"`.
+        std::string out = "\"";
+        for (char c : arg) {
+            if (c == '"') out += "\\\"";
+            else out.push_back(c);
+        }
+        out += "\"";
+        return out;
+    } else {
+        // POSIX sh: wrap in single quotes (nothing is special inside single
+        // quotes except `'` itself), escaping an embedded `'` as `'\''`
+        // (close quote, literal quote, reopen quote).
+        std::string out = "'";
+        for (char c : arg) {
+            if (c == '\'') out += "'\\''";
+            else out.push_back(c);
+        }
+        out += "'";
+        return out;
+    }
+}
+
 CompileFlags compute_flags(const BuildPlan& plan) {
     CompileFlags f;
 
@@ -157,11 +206,28 @@ CompileFlags compute_flags(const BuildPlan& plan) {
     }
     std::string pic_flag = (need_pic && !isMsvcDialect) ? " -fPIC" : "";
 
-    // Include dirs
-    std::string include_flags;
+    // Include dirs — this is the TYPED PATH channel (bare paths from the
+    // manifest; the dialect prefix is applied here at emission), not the
+    // FLAG-STRING channel that `normalize_include_flags` serves (cflags/
+    // cxxflags, where the -I/-iquote/... prefix is already embedded in the
+    // string by the scanner). `normalize_include_flags`'s prefix table only
+    // knows GNU spellings, so routing dialect-prefixed tokens through it
+    // silently no-ops under MSVC (`/Iinclude` matches nothing and is never
+    // rewritten against plan.projectRoot — but ninja runs with cwd = output
+    // dir, so a relative include dir stops resolving). Absolutize the path
+    // directly instead (dialect-agnostic), then prepend the prefix, then
+    // ninja-$-escape and shell-quote per token (#234) so an include dir
+    // whose name contains a space can't silently split into two shell words
+    // once ninja hands the resolved command line to the shell.
+    std::vector<std::string> includeTokens;
     for (auto& inc : plan.manifest.buildConfig.includeDirs) {
-        auto abs = inc.is_absolute() ? inc : (plan.projectRoot / inc);
-        include_flags += std::format(" {}{}", d.includePrefix, escape_path(abs));
+        std::filesystem::path p = inc.has_root_path() ? inc : (plan.projectRoot / inc);
+        includeTokens.push_back(std::string(d.includePrefix) + p.string());
+    }
+    std::string include_flags;
+    for (auto& t : includeTokens) {
+        include_flags += ' ';
+        include_flags += shell_quote_arg(escape_path(std::filesystem::path(t)));
     }
 
     // Sysroot / payload paths — resolved ONCE by the toolchain link model

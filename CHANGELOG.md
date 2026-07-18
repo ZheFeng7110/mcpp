@@ -3,6 +3,31 @@
 > 本文件追踪 `mcpp-community/mcpp` 公开仓的版本演进。
 > 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [0.0.97] — 2026-07-18
+
+> 架构级修复批次(单 PR,逐簇 commit):ffmpeg-m/opencv-m 全源码直编暴露的第二层缺口 + workspace 测试基建语法空洞。
+
+### 新增
+
+- **`[[build.flags]]` 数组表写法**(#227):`[build].flags` 现同时接受 TOML 标准数组表 `[[build.flags]]` 与内联表数组两种等价写法(声明顺序=应用顺序不变),长 per-glob flags 条目不再挤单行。纯解析层扩展(自研 TOML parser 补全 array-of-tables);并加清单层 closed-grammar 守卫——非白名单段落误写 `[[x]]`(如 `[[dependencies]]` 手滑)现**硬报错**而非静默丢数据。
+- **glob 花括号交替 `{a,b}`**(#228):sources/flags glob 支持 `libavcodec/{aac,bsf,hevc}/**` 笛卡尔展开(嵌套/多组均可),vendored 大库 per-glob 声明不再重复。
+- **默认命名空间索引重定向**(R6):`[indices] default = { path = "..." }`(亦接受空引号键 `""`)可把默认命名空间(`namespace = ""` 的模块包)指向本地 checkout,补上此前只能重定向具名命名空间的语法空洞——使 index 仓能以 `mcpp test --workspace` 声明式验证 imgui/ffmpeg/opencv 等模块包,替代逐包 smoke shell。(`url` 形式的默认命名空间重定向暂不支持,解析期显式报错而非静默失效。)
+- **`mcpp run -p <member>`**:run 命令支持选择 workspace 成员并运行其二进制(与 `build`/`test` 的 `-p` 对齐)。
+
+### 修复
+
+- **源发现全树遍历致 `mcpp run` 前慢 + 缓存复用**(#225):glob 遍历改从字面前缀起(`src/**` 从 `src/` 起走,不再从项目根扫全树),并排除 `.git`/`target`/git 子模块边界;`mcpp run` 复用 `mcpp build` 已解析的缓存,不再每次重扫大子模块(此前含大 `compat/` 子模块时每次 ~9.5s)。
+- **相对 include 族 flag 未按项目根重写 + 含空格值未转义**(#226 #234):`-iquote`/`-isystem`/`-idirafter`/`-iprefix`/`-L` 现与 `-I` 一样按项目根绝对化(joined 与 separated 两拼写);`defines = ["T=long long"]` 等含空格值发射时 shell 引号保护,不再被拆成孤立参数。含 `[build] include_dirs` 在 MSVC 方言下的相对路径绝对化亦一并修正。
+- **对象路径按父目录名折叠致同名源冲突**(#233):不同目录同名源(`a/src/util.cpp` vs `b/src/util.cpp`,OpenCV/LLVM 式 `modules/<mod>/src/*` 布局)对象路径改按碰撞时镜像源**相对路径**消歧 + 构建后唯一性断言;非碰撞项路径字节不变。
+- **模块 purview 内文本 `#include` 改动不触发重编**(#235):编译边补 depfile 追踪(过滤 GCC `-fmodules` 注入的反向规则以规避 ninja `inputs may not also have inputs`),purview/GMF/普通头改动均正确触发重编——顺带根治此前非 MSVC 下普通头改动也不重编的潜伏问题。
+- **依赖包 cfg 条件 sources 被消费时不展开**(#229):path/git 依赖的 `[target.'cfg(...)'.build].sources` 现与 root/version-dep 同样按已解析 target 求值(`mcpp build` 与 `mcpp test` 双路径),不再 undefined reference(与 #218 同类,收敛为统一 per-package 求值)。
+- **nasm 冷环境惰性自举时序**(#232):nasm 供给改走工具链同款同步门 `Fetcher::resolve_xpkg_path("xim:nasm@3.02", autoInstall=true)`(索引刷新前置 + 硬报错 + payload 校验),不再先判死后台补装;config 自举错误不再被 `if(cfg)` 门吞成误导性的 "no usable nasm"。
+- **workspace 根配置无法一次声明全员可用**(#224):`[workspace.dependencies]` 的 path 依赖可被成员经 `.workspace = true` 继承;根 `[indices]` 的相对 `path` 按 **workspace 根**解析(而非消费成员目录),成员不再需重复声明各自 `../` 相对路径。
+
+### 备注
+
+- #230(windows workspace 崩溃)已于 0.0.96 修复。#215(cppfly Clang 反射行)待上游 Clang 落地 P2996,不排期。
+
 ## [0.0.96] — 2026-07-18
 
 ### 修复

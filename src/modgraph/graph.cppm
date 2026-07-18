@@ -14,6 +14,16 @@ struct ModuleId {
 
 struct SourceUnit {
     std::filesystem::path           path;
+    // mcpp#233: path relative to this unit's PACKAGE ROOT (not the primary
+    // project root — a path dependency has its own root), set by the
+    // scanner where the root is known. Used by plan.cppm to mirror the
+    // source's directory layout into its object path so that two
+    // same-named files under different subdirectories (e.g. a/src/util.cpp
+    // and b/src/util.cpp) never fold onto the same object output. Left
+    // default-constructed (empty) for units synthesized outside the
+    // scanner (e.g. plan.cppm's ad-hoc main.cpp CompileUnit, which never
+    // reads this field).
+    std::filesystem::path           relPath;
     std::string                     packageName;
     std::vector<std::filesystem::path> localIncludeDirs;
     std::vector<std::string>        packageCflags;

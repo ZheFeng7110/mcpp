@@ -11,6 +11,7 @@ export module mcpp.build.prepare;
 
 import std;
 import mcpp.libs.json;
+import mcpp.log;
 import mcpp.manifest;
 import mcpp.modgraph.graph;
 import mcpp.modgraph.scanner;
@@ -336,13 +337,28 @@ materialize_generated_files(const std::filesystem::path& root,
     return {};
 }
 
-// L1 cfg merge for ONE manifest (root or dependency): append the matching
-// conditional cflags/cxxflags/ldflags and sources (G1b) to its buildConfig.
-// Sources also update the legacy modules.sources mirror — the scanner walks
-// that. Conditional dependency maps are root-only and handled at the root
-// call site; a dependency's conditional configs otherwise evaluate the same
-// way (descriptor `target_cfg` must not be silently inert).
-void merge_conditional_build(mcpp::manifest::Manifest& m,
+// L1 cfg merge for ONE package's manifest (root or ANY dependency — path,
+// git, or version/registry): append the matching conditional
+// cflags/cxxflags/ldflags and sources (G1b) to its buildConfig. Sources also
+// update the legacy modules.sources mirror — the scanner walks that.
+//
+// #229: this is the SINGLE funnel for cfg-conditional sources/flags — every
+// package's manifest passes through exactly one call to this function,
+// always immediately BEFORE that manifest is captured into `packages[]` via
+// makePackageRoot()/propagateLinkFlags() (which snapshot buildConfig into
+// privateBuild/linkUsage and into the root's propagated ldflags — merging
+// any later than that point is silently lost for flags, though not for
+// sources, which the modgraph scan re-reads live). Three call sites, one per
+// loading branch, together cover every package exactly once: the root
+// (before its own makePackageRoot), the path/git-dep branch, and
+// loadVersionDep() (shared by the main per-dependency loop, the
+// multi-version mangling secondary, and the SemVer-merge re-fetch — all three
+// of ITS callers get the merge for free from the one call inside it).
+// (Conditional *dependencies* are a separate, root-only concern: they must be
+// merged into the dependency map BEFORE resolution even starts, so a
+// dependency's own conditional deps are out of scope — see the root cfg
+// block that merges `cc.dependencies` etc.)
+void merge_conditional_sources_flags(mcpp::manifest::Manifest& m,
                              const cfgpred::Ctx& ctx,
                              std::string_view targetTriple)
 {
@@ -561,8 +577,11 @@ prepare_build(bool print_fingerprint,
             if (!m) return std::unexpected(std::format(
                 "workspace member '{}': {}", targetMember, m.error().format()));
 
-            // Merge workspace dependency versions
-            mcpp::project::merge_workspace_deps(*m, *wsManifest);
+            // Merge workspace dependency versions/paths. `*root` is still the
+            // WORKSPACE root here (the `root = memberDir` reassignment below
+            // hasn't happened yet), so it anchors any relative `path` in
+            // `[workspace.dependencies]` (#224).
+            mcpp::project::merge_workspace_deps(*m, *wsManifest, *root);
 
             // Inherit workspace toolchain if member doesn't define one
             if (m->toolchain.byPlatform.empty()) {
@@ -574,9 +593,19 @@ prepare_build(bool print_fingerprint,
                     m->targetOverrides[triple] = entry;
                 }
             }
-            // Inherit workspace indices if member doesn't define any
+            // Inherit workspace indices if member doesn't define any. A
+            // relative `[indices].path` was declared at the WORKSPACE root,
+            // so it must resolve against `*root` (still the workspace root
+            // here), not the member directory — otherwise every member
+            // needs its own `../`-prefixed copy of the same declaration
+            // (#224).
             if (m->indices.empty() && !wsManifest->indices.empty()) {
                 m->indices = wsManifest->indices;
+                for (auto& [_, idx] : m->indices) {
+                    if (idx.is_local() && idx.path.is_relative()) {
+                        idx.path = std::filesystem::weakly_canonical(*root / idx.path);
+                    }
+                }
             }
 
             mcpp::ui::status("Workspace", std::format("building member '{}'", targetMember));
@@ -588,7 +617,9 @@ prepare_build(bool print_fingerprint,
         if (!wsRoot.empty()) {
             auto wsm = mcpp::manifest::load(wsRoot / "mcpp.toml");
             if (wsm && wsm->workspace.present) {
-                mcpp::project::merge_workspace_deps(*m, *wsm);
+                // #224: anchor relative `path`/`[indices].path` to the
+                // workspace root, not this member's own directory.
+                mcpp::project::merge_workspace_deps(*m, *wsm, wsRoot);
                 if (m->toolchain.byPlatform.empty()) {
                     m->toolchain = wsm->toolchain;
                 }
@@ -600,6 +631,11 @@ prepare_build(bool print_fingerprint,
                 // Inherit workspace indices if member doesn't define any
                 if (m->indices.empty() && !wsm->indices.empty()) {
                     m->indices = wsm->indices;
+                    for (auto& [_, idx] : m->indices) {
+                        if (idx.is_local() && idx.path.is_relative()) {
+                            idx.path = std::filesystem::weakly_canonical(wsRoot / idx.path);
+                        }
+                    }
                 }
             }
         }
@@ -783,13 +819,24 @@ prepare_build(bool print_fingerprint,
     }
     if (overrides.force_static) m->buildConfig.linkage = "static";
 
-    // ── L1: merge platform-conditional [target.'cfg(...)'.build] flags ──────
+    // ── L1: merge conditional [target.'cfg(...)'.build] sources/flags AND
+    // root-only [target.'cfg(...)'.dependencies] ─────────────────────────────
     // Evaluated now (target resolved) against the resolved target — the
-    // --target triple for a cross build, else the host. Matching predicates'
-    // flags append to buildConfig, mirroring the [profile] merge above.
+    // --target triple for a cross build, else the host.
+    //
+    // #229: merge_conditional_sources_flags MUST run here — before
+    // `packages[0] = makePackageRoot(*root, *m)` snapshots `m->buildConfig`
+    // into `packages[0].privateBuild`/`.manifest` — because that snapshot,
+    // not `*m`, is what the modgraph scan and per-TU compile-flag assembly
+    // actually read afterward. Every dependency (path/git/version alike) gets
+    // the SAME treatment, at the mirror-image point in its own load path
+    // (right before ITS `makePackageRoot`/`propagateLinkFlags`) — see the
+    // dependency-manifest-acquisition block below. That makes this the root
+    // package's half of the one funnel, not a special case: every package is
+    // merged exactly once, immediately before it is captured into `packages[]`.
     if (!m->conditionalConfigs.empty()) {
         auto cc_ctx = cfgpred::context_for(overrides.target_triple);
-        merge_conditional_build(*m, cc_ctx, overrides.target_triple);
+        merge_conditional_sources_flags(*m, cc_ctx, overrides.target_triple);
         for (auto const& cc : m->conditionalConfigs) {
             if (!cfgpred::matches(cc.predicate, cc_ctx, overrides.target_triple))
                 continue;
@@ -1137,7 +1184,14 @@ prepare_build(bool print_fingerprint,
             auto ns = spec.namespace_.empty()
                 ? std::string(mcpp::pm::kDefaultNamespace)
                 : spec.namespace_;
-            if (ns == mcpp::pm::kDefaultNamespace) return true;
+            if (ns == mcpp::pm::kDefaultNamespace) {
+                // R6: `[indices] default = {...}` (normalized to
+                // kDefaultNamespace by toml.cppm) redirects the default
+                // namespace away from the builtin registry — consult it
+                // before assuming builtin, same as any named namespace.
+                auto it = m->indices.find(std::string(mcpp::pm::kDefaultNamespace));
+                return it == m->indices.end() || it->second.is_builtin();
+            }
 
             auto it = m->indices.find(ns);
             if (it == m->indices.end()) return true;
@@ -1297,7 +1351,14 @@ prepare_build(bool print_fingerprint,
     auto findIndexForNs = [&](const std::string& ns)
         -> const mcpp::pm::IndexSpec*
     {
-        if (ns.empty() || ns == std::string(mcpp::pm::kDefaultNamespace)) return nullptr;
+        if (ns.empty() || ns == std::string(mcpp::pm::kDefaultNamespace)) {
+            // R6: `[indices] default = {...}` (normalized to
+            // kDefaultNamespace by toml.cppm) redirects the default
+            // namespace — return it when present instead of unconditionally
+            // falling back to the builtin index.
+            auto it = m->indices.find(std::string(mcpp::pm::kDefaultNamespace));
+            return it == m->indices.end() ? nullptr : &it->second;
+        }
         if (auto it = m->indices.find(ns); it != m->indices.end()) {
             return &it->second;
         }
@@ -1709,9 +1770,18 @@ prepare_build(bool print_fingerprint,
 
         // Dependency-side L1 cfg merge (flags + sources): a descriptor's
         // `target_cfg` / a dep mcpp.toml's [target.'cfg(...)'.build] must
-        // evaluate here too — before its globs expand.
+        // evaluate here too — before its globs expand. This is the version/
+        // registry-dep half of the #229 funnel: every loadVersionDep() caller
+        // (the main per-dependency loop, the multi-version mangling
+        // secondary, and the SemVer-merge re-fetch) shares this one call site,
+        // so a version dep is merged exactly once regardless of which of the
+        // three paths loaded it. The path/git-dep half is the mirror-image
+        // call right after ITS manifest load (dependency-manifest-acquisition
+        // block below) — same function, same one-merge-per-package guarantee,
+        // just keyed off a different loading branch since path/git deps never
+        // pass through loadVersionDep.
         if (!manifest->conditionalConfigs.empty()) {
-            merge_conditional_build(*manifest,
+            merge_conditional_sources_flags(*manifest,
                                     cfgpred::context_for(overrides.target_triple),
                                     overrides.target_triple);
         }
@@ -2457,6 +2527,20 @@ prepare_build(bool print_fingerprint,
                     name, dep_root.string(), dm.error().format()));
             }
             dep_manifest = std::move(*dm);
+            // #229: path/git-dep half of the L1 cfg funnel — mirrors the
+            // loadVersionDep call site above (loadFrom's L1 cfg merge, ~1740
+            // lines up). Before this fix, path/git deps never ran this merge
+            // at all: their `[target.'cfg(...)'.build] sources` were parsed
+            // into `conditionalConfigs` but never folded into
+            // `buildConfig.sources` / `modules.sources`, so the modgraph scan
+            // never saw the file — link-time `undefined reference`. Must run
+            // BEFORE `propagateLinkFlags`/`makePackageRoot` below, which
+            // snapshot this manifest's flags/sources into `packages[]`.
+            if (!dep_manifest->conditionalConfigs.empty()) {
+                merge_conditional_sources_flags(*dep_manifest,
+                    cfgpred::context_for(overrides.target_triple),
+                    overrides.target_triple);
+            }
         } else {
             auto loaded = loadVersionDep(name, key.ns, key.shortName, spec.version);
             if (!loaded) return std::unexpected(loaded.error());
@@ -2874,6 +2958,13 @@ prepare_build(bool print_fingerprint,
         stdFlagAndDialect += f;
     }
 
+    // mcpp#225 (E2): observability marker for the source-discovery phase —
+    // `mcpp run`'s fast path (build_run_target/try_fast_run in execute.cppm)
+    // skips prepare_build ENTIRELY on a cache hit, so this line's absence
+    // under MCPP_VERBOSE=1 on a second `mcpp run` is the "did we re-scan"
+    // signal the e2e test asserts on (tests/e2e/114_run_scan_scope.sh).
+    mcpp::log::verbose("scan", "scanning module sources");
+
     // Modgraph: regex scanner by default; opt-in to compiler-driven P1689
     // scanner via env var MCPP_SCANNER=p1689 (see docs/27).
     auto scan = [&] {
@@ -2973,9 +3064,11 @@ prepare_build(bool print_fingerprint,
     ctx.outputDir  = target_dir(*tc, fp, *root);
     ctx.stdBmi     = stdBmiPath;
     ctx.stdObject  = stdObjectPath;
-    ctx.plan        = mcpp::build::make_plan(*m, *tc, fp, scan.graph, report.topoOrder,
+    auto planResult = mcpp::build::make_plan(*m, *tc, fp, scan.graph, report.topoOrder,
                                              packages, *root, ctx.outputDir,
                                              stdBmiPath, stdObjectPath);
+    if (!planResult) return std::unexpected(planResult.error());
+    ctx.plan        = std::move(*planResult);
     ctx.plan.stdCompatBmiPath = stdCompatBmiPath;
     ctx.plan.stdCompatObjectPath = stdCompatObjectPath;
 
@@ -3016,11 +3109,35 @@ prepare_build(bool print_fingerprint,
                     "`!`-exclude glob in [build].sources)", trip.str()));
             }
             ctx.plan.nasmFormat = *fmt;
+
+            // #232: nasm used to go through a bespoke `ensure_nasm` path
+            // whose `if (cfgNasm)` guard silently swallowed a `get_cfg()`
+            // bootstrap failure (misreporting it as "no nasm"), and whose
+            // install fallback never refreshed the package index and
+            // downgraded a failed install to a warning. Surface the real
+            // config error, then provision through the SAME synchronous
+            // gate the compiler toolchain uses (index refresh before
+            // install, blocking install, hard error on failure) — see the
+            // toolchain resolution block above (~line 872-899).
             auto cfgNasm = get_cfg();
-            std::optional<std::filesystem::path> nasmBin;
-            if (cfgNasm) {
-                nasmBin = mcpp::xlings::ensure_nasm(
-                    mcpp::config::make_xlings_env(**cfgNasm), /*quiet=*/false, {});
+            if (!cfgNasm) return std::unexpected(cfgNasm.error());
+
+            std::optional<std::filesystem::path> nasmBin =
+                mcpp::xlings::find_usable_nasm(mcpp::config::make_xlings_env(**cfgNasm));
+            if (!nasmBin) {
+                mcpp::fetcher::Fetcher nasmFetcher(**cfgNasm);
+                mcpp::fetcher::InstallProgressHandler nasmProgress;
+                auto nasmTarget = std::format("xim:nasm@{}",
+                    mcpp::xlings::pinned::kNasmVersion);
+                auto payload = nasmFetcher.resolve_xpkg_path(
+                    nasmTarget, /*autoInstall=*/true, &nasmProgress);
+                if (!payload) {
+                    return std::unexpected(std::format(
+                        "NASM sources (.asm) present but nasm provisioning "
+                        "failed: {}", payload.error().message));
+                }
+                nasmBin = mcpp::xlings::find_sandbox_nasm(
+                    mcpp::config::make_xlings_env(**cfgNasm));
             }
             if (!nasmBin) {
                 return std::unexpected(std::string(

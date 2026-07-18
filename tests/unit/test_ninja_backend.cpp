@@ -7,6 +7,7 @@ import mcpp.build.ninja;
 import mcpp.build.plan;
 import mcpp.manifest;
 import mcpp.toolchain.model;
+import mcpp.platform;
 
 using namespace mcpp::build;
 
@@ -71,6 +72,46 @@ TEST(NinjaBackend, ObjectiveCSourceUsesCObjectRuleAndCFlags) {
         << ninja;
 }
 
+// mcpp#235: cxx_module/cxx_object must track header/purview/GMF includes via
+// a GNU-style depfile on non-MSVC toolchains (this test's plan uses GCC on a
+// non-Windows host, so posixDepfile is true). Before the fix, neither rule
+// had ANY depfile outside the msvcDeps branch, so editing a file #include'd
+// inside a module's purview (or a header pulled in by a .cpp) never
+// invalidated the compile edge. The depfile is routed through a scratch
+// `$out.d.raw` + `awk` filter (not written directly to `$out.d`) because
+// GCC's `-fmodules` bolts non-standard "reversed" module rules onto the raw
+// -MMD output that ninja's depfile loader rejects — see the long comment at
+// the definition site for the empirically-confirmed failure mode.
+TEST(NinjaBackend, CxxModuleAndCxxObjectRulesTrackHeaderDepsViaGccDepfile) {
+    // The filtered gcc depfile (#235) is POSIX-only: `posixDepfile =
+    // !msvcDeps && !is_windows` (awk isn't available on native Windows, and
+    // MSVC uses `deps = msvc` instead). This asserts the POSIX emission.
+    if constexpr (mcpp::platform::is_windows)
+        GTEST_SKIP() << "gcc depfile filter is POSIX-only (Windows uses deps=msvc)";
+
+    auto plan = minimal_plan();
+
+    auto ninja = emit_ninja_string(plan);
+
+    auto module_rule_start = ninja.find("rule cxx_module");
+    auto object_rule_start = ninja.find("rule cxx_object");
+    ASSERT_NE(module_rule_start, std::string::npos) << ninja;
+    ASSERT_NE(object_rule_start, std::string::npos) << ninja;
+    ASSERT_LT(module_rule_start, object_rule_start) << ninja;
+
+    auto module_rule = ninja.substr(module_rule_start, object_rule_start - module_rule_start);
+    auto object_rule = ninja.substr(object_rule_start);
+
+    for (auto const& rule : {module_rule, object_rule}) {
+        EXPECT_NE(rule.find("-MMD -MF $out.d.raw"), std::string::npos) << ninja;
+        EXPECT_NE(rule.find("deps = gcc"), std::string::npos) << ninja;
+        EXPECT_NE(rule.find("depfile = $out.d\n"), std::string::npos) << ninja;
+        // The raw compiler depfile (with GCC's module-specific reversed
+        // rules) must never be bound directly as ninja's depfile.
+        EXPECT_EQ(rule.find("depfile = $out.d.raw"), std::string::npos) << ninja;
+    }
+}
+
 TEST(NinjaBackend, UsesPackageCppStandardForCxxFlags) {
     auto plan = minimal_plan();
     plan.manifest.package.standard = "c++26";
@@ -125,6 +166,41 @@ TEST(NinjaBackend, CxxFlagsIncludeBuildIncludeDirs) {
                   plan.projectRoot / std::filesystem::path{"third_party/imgui"})),
               std::string::npos)
         << flags.cxx;
+}
+
+// Cluster A review fix (#226/#234 follow-up): `[build] include_dirs` is a
+// TYPED PATH channel — bare paths from the manifest, dialect prefix applied
+// at emission (-I under GNU, /I under MSVC) — not the FLAG-STRING channel
+// that normalize_include_flags serves (cflags/cxxflags, where the prefix is
+// already embedded in the string by the scanner). Routing dialect-prefixed
+// include tokens through normalize_include_flags (whose prefix table only
+// knows GNU spellings: -I/-iquote/-isystem/-idirafter/-iprefix/-L) silently
+// no-ops under MSVC: "/Iinclude" matches no table entry and is never
+// rewritten against plan.projectRoot, so it survives as a *relative* path —
+// but ninja runs with cwd = the output dir, so the include stops resolving.
+// The fix absolutizes the path directly (dialect-agnostic) before
+// prepending the dialect prefix. This test would FAIL before the fix
+// (emitting the literal, unrewritten "/Iinclude") and passes after.
+TEST(NinjaBackend, MsvcIncludeDirsAreAbsolutizedNotGnuNormalized) {
+    // The MSVC-dialect logic under test is host-independent; run it on POSIX
+    // where the test's temp projectRoot has no drive letter. On Windows the
+    // runner's `C:\...` temp path gets its `:` ninja-escaped (`C$:`), which
+    // would need escape-aware matching unrelated to what this test verifies.
+    if constexpr (mcpp::platform::is_windows)
+        GTEST_SKIP() << "MSVC-dialect path check runs on POSIX (avoids Windows drive-colon ninja escaping)";
+
+    auto plan = minimal_plan();
+    plan.toolchain.compiler = mcpp::toolchain::CompilerId::MSVC;
+    plan.toolchain.binaryPath = "cl.exe";
+    plan.toolchain.targetTriple = "x86_64-pc-windows-msvc";
+    plan.manifest.buildConfig.includeDirs = {"include"};
+
+    auto flags = compute_flags(plan);
+
+    auto expected = "/I" + (plan.projectRoot / "include").string();
+    EXPECT_NE(flags.cxx.find(expected), std::string::npos) << flags.cxx;
+    // The un-rewritten, still-relative token must never appear.
+    EXPECT_EQ(flags.cxx.find("/Iinclude"), std::string::npos) << flags.cxx;
 }
 
 // ── assembly sources (.S/.s → asm_object via $cc, .asm → nasm_object) ────────
@@ -218,6 +294,110 @@ TEST(NinjaBackend, CompileCommandsSkipNasmAndCoverGas) {
     // GAS units ride the C driver and stay in the CDB.
     EXPECT_NE(cdb.find("copy.S"), std::string::npos) << cdb;
     EXPECT_EQ(cdb.find("\"-std=c11\""), std::string::npos) << cdb;   // asm-safe flags, no C std
+}
+
+// mcpp#234: each packageCflags/packageCxxflags element is already one argv
+// token — apply_glob_flags pushes a define like `T=long long` as the single
+// element `-DT=long long`. join_flags previously joined tokens with a bare
+// space and zero quoting, so once ninja resolved the command line and handed
+// it to the shell, the embedded space split `-DT=long long` into TWO words
+// (`-DT=long` and a bare `long`). The emitted unit_cflags line must carry the
+// define as a single shell-quoted token.
+TEST(NinjaBackend, QuotesFlagValueWithSpace) {
+    auto plan = minimal_plan();
+    plan.compileUnits.push_back({
+        .source = "src/main.c",
+        .object = "obj/main.o",
+        .packageName = "quote_test",
+        .packageCflags = {"-DT=long long"},
+    });
+
+    auto ninja = emit_ninja_string(plan);
+
+    // shell_quote_arg wraps in single quotes on POSIX, double quotes on
+    // Windows — assert the platform-appropriate spelling.
+    const std::string quoted = mcpp::platform::is_windows
+        ? "unit_cflags = \"-DT=long long\""
+        : "unit_cflags = '-DT=long long'";
+    EXPECT_NE(ninja.find(quoted), std::string::npos) << ninja;
+    // Must NOT appear as two bare, unquoted words split on the space.
+    EXPECT_EQ(ninja.find("unit_cflags = -DT=long long"), std::string::npos)
+        << ninja;
+}
+
+// Plain framework-shaped flags with nothing shell-significant must pass
+// through byte-for-byte unquoted (no over-quoting regression).
+TEST(NinjaBackend, PlainFlagsPassThroughUnquoted) {
+    auto plan = minimal_plan();
+    plan.compileUnits.push_back({
+        .source = "src/main.cpp",
+        .object = "obj/main.o",
+        .packageName = "plain_flag_test",
+        .packageCxxflags = {"-DFOO=1", "-O2"},
+    });
+
+    auto ninja = emit_ninja_string(plan);
+
+    EXPECT_NE(ninja.find("unit_cxxflags = -DFOO=1 -O2"), std::string::npos)
+        << ninja;
+}
+
+// Regression: mcpp-GENERATED per-unit LINK flags are already correctly
+// shell-quoted + ninja-escaped at construction — e.g. the shared-dep rpath
+// token `-Wl,-rpath,'$$ORIGIN'` (single quotes stop shell $-expansion, `$$`
+// is ninja's literal `$`). join_flags for link flags must NOT re-run
+// shell_quote_arg over them: doing so double-quotes the token, baking a
+// literal `'$ORIGIN'` (quotes included) into the binary's RUNPATH so the
+// dynamic linker can't find dependency .so's next to the exe (e2e 55-57/64).
+TEST(NinjaBackend, LinkFlagsAreNotReQuoted) {
+    auto plan = minimal_plan();
+    plan.compileUnits.push_back({
+        .source = "src/main.cpp",
+        .object = "obj/main.o",
+        .packageName = "rpath_test",
+    });
+    plan.linkUnits.push_back({
+        .targetName = "app",
+        .kind = mcpp::build::LinkUnit::Binary,
+        .objects = {"obj/main.o"},
+        .linkFlags = {"-Wl,-rpath,'$$ORIGIN'"},
+        .output = "bin/app",
+        .entryMain = "src/main.cpp",
+    });
+
+    auto ninja = emit_ninja_string(plan);
+
+    // The rpath token passes through verbatim (ninja `$$` = literal `$`).
+    EXPECT_NE(ninja.find("-Wl,-rpath,'$$ORIGIN'"), std::string::npos) << ninja;
+    // Must NOT be double-quoted: shell_quote_arg escaping an embedded `'`
+    // produces the `'\''` sequence, which only appears if it re-quoted.
+    EXPECT_EQ(ninja.find("'\\''"), std::string::npos) << ninja;
+}
+
+// Regression (#234 follow-up): a raw descriptor flag that packs two argv
+// tokens into one string — e.g. compat.lua's `-include <header>` — must pass
+// through VERBATIM so the shell splits it back into `-include` + the header.
+// Blanket shell-quoting wrapped it into one malformed arg, so gcc looked for a
+// file literally named "<space>header" → "No such file" → aarch64/macos/windows
+// cross-builds failed. Only `-D`/`/D` define tokens with an intra-value space
+// get quoted; `-include foo.h` does not.
+TEST(NinjaBackend, RawMultiTokenFlagIsNotQuoted) {
+    auto plan = minimal_plan();
+    plan.compileUnits.push_back({
+        .source = "src/main.c",
+        .object = "obj/main.o",
+        .packageName = "include_flag_test",
+        .packageCflags = {"-include mcpp_lua_platform_config.h"},
+    });
+
+    auto ninja = emit_ninja_string(plan);
+
+    // Verbatim, so the shell re-splits into two args.
+    EXPECT_NE(ninja.find("unit_cflags = -include mcpp_lua_platform_config.h"),
+              std::string::npos) << ninja;
+    // Must NOT be wrapped in quotes (which would make it one malformed arg).
+    EXPECT_EQ(ninja.find("'-include mcpp_lua_platform_config.h'"),
+              std::string::npos) << ninja;
 }
 
 TEST(NinjaBackend, RootPackageCxxflagsAreEmittedOncePerUnit) {

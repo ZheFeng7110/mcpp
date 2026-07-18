@@ -2,6 +2,7 @@
 
 import std;
 import mcpp.build.flags;
+import mcpp.modgraph.scanner;
 
 namespace {
 
@@ -89,6 +90,43 @@ TEST(BuildFlagsAtomic, StaticLinkEmittedWhenArchivePresent) {
     touch(dir.path / "libatomic.a");
     auto flag = mcpp::build::atomic_link_flag({dir.path}, kStatic);
     EXPECT_NE(flag.find("-latomic"), std::string::npos);
+}
+
+// mcpp#226: normalize_include_flags generalizes the old -I-only
+// absolutize_include_flags to the whole include/lib-search-path family, in
+// BOTH the joined spelling (`-iquotehdr`) and the separated spelling
+// (`-isystem` followed by a standalone next element). All four of these
+// project-relative paths must resolve to the same "/proj/hdr" target.
+TEST(BuildFlags, NormalizeIncludeFlagsRewritesFullIncludeFamily) {
+    std::filesystem::path root = "/proj";
+    std::vector<std::string> flags = {
+        "-Ihdr", "-iquotehdr", "-isystem", "hdr", "-idirafterhdr",
+    };
+
+    mcpp::modgraph::normalize_include_flags(root, flags);
+
+    ASSERT_EQ(flags.size(), 5u);
+    EXPECT_EQ(flags[0], "-I" + (root / "hdr").string());
+    EXPECT_EQ(flags[1], "-iquote" + (root / "hdr").string());
+    EXPECT_EQ(flags[2], "-isystem");                       // prefix itself untouched
+    EXPECT_EQ(flags[3], (root / "hdr").string());          // separated element rewritten
+    EXPECT_EQ(flags[4], "-idirafter" + (root / "hdr").string());
+}
+
+// Absolute paths and root-relative spellings are left alone (matches the
+// pre-#226 -I behavior), for both the joined and separated forms.
+TEST(BuildFlags, NormalizeIncludeFlagsLeavesAbsolutePathsAlone) {
+    std::filesystem::path root = "/proj";
+    std::vector<std::string> flags = {
+        "-I/abs/hdr", "-isystem", "/abs/hdr", "-DKEEP",
+    };
+
+    mcpp::modgraph::normalize_include_flags(root, flags);
+
+    EXPECT_EQ(flags[0], "-I/abs/hdr");
+    EXPECT_EQ(flags[1], "-isystem");
+    EXPECT_EQ(flags[2], "/abs/hdr");
+    EXPECT_EQ(flags[3], "-DKEEP");
 }
 
 }  // namespace

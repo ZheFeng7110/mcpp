@@ -109,17 +109,21 @@ struct BuildPlan {
 // choice for kind="lib" dependencies (see plan.cppm).
 bool source_defines_main(const std::filesystem::path& src);
 
-// Build a BuildPlan from already-validated inputs.
-BuildPlan make_plan(const mcpp::manifest::Manifest&         manifest,
-                    const mcpp::toolchain::Toolchain&       tc,
-                    const mcpp::toolchain::Fingerprint&     fp,
-                    const mcpp::modgraph::Graph&            graph,
-                    const std::vector<std::size_t>&         topoOrder,
-                    const std::vector<mcpp::modgraph::PackageRoot>& packages,
-                    const std::filesystem::path&            projectRoot,
-                    const std::filesystem::path&            outputDir,
-                    const std::filesystem::path&            stdBmiPath,
-                    const std::filesystem::path&            stdObjectPath);
+// Build a BuildPlan from already-validated inputs. Fails (mcpp#233) only
+// when the object-path uniqueness assertion below finds a residual
+// collision after the relPath-mirroring scheme — a would-be ninja
+// "multiple rules generate X" turned into a diagnosable mcpp error.
+std::expected<BuildPlan, std::string>
+make_plan(const mcpp::manifest::Manifest&         manifest,
+         const mcpp::toolchain::Toolchain&       tc,
+         const mcpp::toolchain::Fingerprint&     fp,
+         const mcpp::modgraph::Graph&            graph,
+         const std::vector<std::size_t>&         topoOrder,
+         const std::vector<mcpp::modgraph::PackageRoot>& packages,
+         const std::filesystem::path&            projectRoot,
+         const std::filesystem::path&            outputDir,
+         const std::filesystem::path&            stdBmiPath,
+         const std::filesystem::path&            stdObjectPath);
 
 } // namespace mcpp::build
 
@@ -320,16 +324,17 @@ bool source_defines_main(const std::filesystem::path& src) {
     return false;
 }
 
-BuildPlan make_plan(const mcpp::manifest::Manifest&         manifest,
-                    const mcpp::toolchain::Toolchain&       tc,
-                    const mcpp::toolchain::Fingerprint&     fp,
-                    const mcpp::modgraph::Graph&            graph,
-                    const std::vector<std::size_t>&         topoOrder,
-                    const std::vector<mcpp::modgraph::PackageRoot>& packages,
-                    const std::filesystem::path&            projectRoot,
-                    const std::filesystem::path&            outputDir,
-                    const std::filesystem::path&            stdBmiPath,
-                    const std::filesystem::path&            stdObjectPath)
+std::expected<BuildPlan, std::string>
+make_plan(const mcpp::manifest::Manifest&         manifest,
+         const mcpp::toolchain::Toolchain&       tc,
+         const mcpp::toolchain::Fingerprint&     fp,
+         const mcpp::modgraph::Graph&            graph,
+         const std::vector<std::size_t>&         topoOrder,
+         const std::vector<mcpp::modgraph::PackageRoot>& packages,
+         const std::filesystem::path&            projectRoot,
+         const std::filesystem::path&            outputDir,
+         const std::filesystem::path&            stdBmiPath,
+         const std::filesystem::path&            stdObjectPath)
 {
     BuildPlan plan;
     plan.manifest         = manifest;
@@ -425,8 +430,21 @@ BuildPlan make_plan(const mcpp::manifest::Manifest&         manifest,
 
     // 1a. Detect basename collisions (both cross-package AND intra-package:
     //     ftxui ships dom/color.cpp + screen/color.cpp, for instance).
-    //     For colliding files the object path gets a per-unit prefix
-    //     derived from `<pkg>/<parent-dir>` so collisions are impossible.
+    //     For colliding files the object path gets a per-unit prefix.
+    //
+    //     mcpp#233: the prefix used to be derived from just the file's
+    //     IMMEDIATE parent directory name (`<pkg>_<parent-dir>`), which
+    //     itself collides whenever two files share a parent dir NAME at
+    //     different depths — e.g. a/src/util.cpp and b/src/util.cpp both
+    //     fold to `<pkg>_src/util.o`, and ninja rejects the plan with
+    //     "multiple rules generate obj/...". The prefix now mirrors the
+    //     unit's FULL relative directory instead (SourceUnit::relPath, set
+    //     by the scanner against the unit's own package root), which is
+    //     unique by construction: two distinct files under one package
+    //     root can never share both relPath and basename. Non-colliding
+    //     files keep the pre-existing flat `obj/<name>` layout untouched
+    //     (back-compat for the overwhelmingly common single-file-per-
+    //     basename project).
     std::map<std::string, int> basenameCount;
     for (auto idx : topoOrder) {
         basenameCount[object_filename_for(graph.units[idx].path, objExt)]++;
@@ -449,13 +467,10 @@ BuildPlan make_plan(const mcpp::manifest::Manifest&         manifest,
         cu.packageAsmflags = u.packageAsmflags;
         const auto fname = object_filename_for(u.path, objExt);
         if (basenameCount[fname] > 1) {
-            // Use <sanitized-pkg>/<parent-dir-name> as prefix to handle
-            // both cross-package (multi-version mangling) and intra-package
-            // (e.g. ftxui dom/color.cpp vs screen/color.cpp) collisions.
-            auto parentDir = u.path.parent_path().filename().string();
+            auto relDir = u.relPath.parent_path();
             auto prefix = u.packageName.empty()
-                ? parentDir
-                : sanitize(u.packageName) + "_" + parentDir;
+                ? relDir
+                : std::filesystem::path(sanitize(u.packageName)) / relDir;
             cu.object = std::filesystem::path("obj") / prefix / fname;
         } else {
             cu.object = std::filesystem::path("obj") / fname;
@@ -466,6 +481,34 @@ BuildPlan make_plan(const mcpp::manifest::Manifest&         manifest,
         for (auto& req : u.requires_) cu.imports.push_back(req.logicalName);
         cu.scanOverridden = u.scanOverridden;
         plan.compileUnits.push_back(std::move(cu));
+    }
+
+    // 1b. mcpp#233: uniqueness assertion. The relDir-mirroring prefix above
+    // is unique by construction for any two distinct source files (see the
+    // reasoning in 1a), so this should never fire — it is a defensive
+    // backstop turning a would-be ninja "multiple rules generate X" hard
+    // stop into a diagnosable mcpp error that names the colliding sources,
+    // for any input the reasoning above didn't anticipate.
+    {
+        std::map<std::string, std::vector<std::filesystem::path>> byObject;
+        for (auto& cu : plan.compileUnits) {
+            byObject[cu.object.generic_string()].push_back(cu.source);
+        }
+        std::string collisions;
+        for (auto& [obj, srcs] : byObject) {
+            if (srcs.size() < 2) continue;
+            if (!collisions.empty()) collisions += "; ";
+            collisions += obj + " <- ";
+            for (std::size_t i = 0; i < srcs.size(); ++i) {
+                if (i) collisions += ", ";
+                collisions += srcs[i].string();
+            }
+        }
+        if (!collisions.empty()) {
+            return std::unexpected(std::format(
+                "internal error: object path collision after uniqueness "
+                "pass (please report): {}", collisions));
+        }
     }
 
     // 2. Build map of module-name → compile unit (for inter-unit dep resolution)
@@ -704,8 +747,8 @@ BuildPlan make_plan(const mcpp::manifest::Manifest&         manifest,
             }
             // Root-relative -I flags → absolute (G8b), mirroring the scanner's
             // treatment of every scanned unit.
-            mcpp::modgraph::absolutize_include_flags(projectRoot, main_cu.packageCflags);
-            mcpp::modgraph::absolutize_include_flags(projectRoot, main_cu.packageCxxflags);
+            mcpp::modgraph::normalize_include_flags(projectRoot, main_cu.packageCflags);
+            mcpp::modgraph::normalize_include_flags(projectRoot, main_cu.packageCxxflags);
 
             // We didn't scan main.cpp earlier (it's not in scanner output unless globbed in).
             // Best-effort: scan its imports here.

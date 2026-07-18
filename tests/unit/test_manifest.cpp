@@ -1041,6 +1041,158 @@ mbedtls = { workspace = true }
     EXPECT_EQ(s.shortName, "mbedtls");
 }
 
+TEST(Manifest, IndicesDefaultKeyNormalizesToDefaultNamespace) {
+    // R6: `[indices] default = {...}` (the canonical spelling) is a
+    // redirect for the DEFAULT namespace (bare `gtest = "1.15.2"` deps),
+    // not a literal index named "default". It must be stored under
+    // kDefaultNamespace so the two short-circuits in prepare.cppm
+    // (usesBuiltinIndex / findIndexForNs) can find it.
+    constexpr auto src = R"(
+[package]
+name = "hello"
+version = "0.1.0"
+[language]
+standard = "c++23"
+[modules]
+sources = ["src/**/*.cppm"]
+[indices]
+default = { path = "../local-pkgs" }
+)";
+    auto m = mcpp::manifest::parse_string(src);
+    ASSERT_TRUE(m.has_value()) << m.error().format();
+    auto it = m->indices.find(std::string(mcpp::manifest::kDefaultNamespace));
+    ASSERT_NE(it, m->indices.end())
+        << "[indices] default = {...} must normalize to kDefaultNamespace";
+    EXPECT_EQ(it->second.path.string(), "../local-pkgs");
+    EXPECT_FALSE(it->second.is_builtin());
+    EXPECT_EQ(m->indices.find("default"), m->indices.end())
+        << "the literal key \"default\" must not survive normalization";
+}
+
+TEST(Manifest, IndicesEmptyStringKeyNormalizesToDefaultNamespace) {
+    // The empty-quoted key `""` is also accepted as a spelling of the
+    // default-namespace redirect.
+    constexpr auto src = R"(
+[package]
+name = "hello"
+version = "0.1.0"
+[language]
+standard = "c++23"
+[modules]
+sources = ["src/**/*.cppm"]
+[indices]
+"" = { path = "../local-pkgs" }
+)";
+    auto m = mcpp::manifest::parse_string(src);
+    ASSERT_TRUE(m.has_value()) << m.error().format();
+    auto it = m->indices.find(std::string(mcpp::manifest::kDefaultNamespace));
+    ASSERT_NE(it, m->indices.end())
+        << "[indices] \"\" = {...} must normalize to kDefaultNamespace";
+    EXPECT_EQ(it->second.path.string(), "../local-pkgs");
+}
+
+TEST(Manifest, IndicesDefaultKeyWithUrlIsRejected) {
+    // R6's design goal is redirecting the default namespace to a LOCAL
+    // index checkout (`path = ...`), so the index repo can test module
+    // packages. The `url` form is not a design requirement, and silently
+    // accepting it is worse than rejecting it: is_builtin() (index_spec
+    // .cppm) treats any "mcpplibs"-named entry with an empty `path` as
+    // builtin, so a `default = { url = ... }` redirect would silently
+    // no-op — every consumer falls through to the real builtin registry
+    // and the configured url is just ignored, with no error surfaced.
+    // Reject it loudly at parse time instead.
+    constexpr auto src = R"(
+[package]
+name = "hello"
+version = "0.1.0"
+[language]
+standard = "c++23"
+[modules]
+sources = ["src/**/*.cppm"]
+[indices]
+default = { url = "https://example.com/mcpp-index.git" }
+)";
+    auto m = mcpp::manifest::parse_string(src);
+    ASSERT_FALSE(m.has_value())
+        << "[indices] default = { url = ... } must be rejected, not silently "
+           "accepted as a no-op redirect";
+    EXPECT_NE(m.error().format().find("path"), std::string::npos)
+        << "error should mention that only 'path' is supported for the "
+           "default-namespace redirect; got: " << m.error().format();
+}
+
+TEST(Manifest, IndicesMcpplibsUrlPinStillAccepted) {
+    // A literal `[indices] mcpplibs = { url = ..., rev = ... }` is a
+    // DIFFERENT key spelling from the `default`/`""` alias — it pins the
+    // real builtin registry to a commit, not a default-namespace redirect
+    // — and must keep working even though it also normalizes to the
+    // kDefaultNamespace map slot and also carries a `url`.
+    constexpr auto src = R"(
+[package]
+name = "hello"
+version = "0.1.0"
+[language]
+standard = "c++23"
+[modules]
+sources = ["src/**/*.cppm"]
+[indices]
+mcpplibs = { url = "https://example.com/mcpp-index.git", rev = "abc123" }
+)";
+    auto m = mcpp::manifest::parse_string(src);
+    ASSERT_TRUE(m.has_value()) << m.error().format();
+    auto it = m->indices.find(std::string(mcpp::manifest::kDefaultNamespace));
+    ASSERT_NE(it, m->indices.end());
+    EXPECT_EQ(it->second.url, "https://example.com/mcpp-index.git");
+    EXPECT_EQ(it->second.rev, "abc123");
+    EXPECT_TRUE(it->second.is_builtin());
+}
+
+TEST(Manifest, IndicesDefaultAndMcpplibsCollisionRejected) {
+    // `default`, `""`, and a literal `mcpplibs` key all normalize to the
+    // same map slot (kDefaultNamespace). Declaring more than one must be a
+    // parse error, not a silent last-writer-wins clobber.
+    constexpr auto src = R"(
+[package]
+name = "hello"
+version = "0.1.0"
+[language]
+standard = "c++23"
+[modules]
+sources = ["src/**/*.cppm"]
+[indices]
+mcpplibs = { path = "../local-pkgs-a" }
+default = { path = "../local-pkgs-b" }
+)";
+    auto m = mcpp::manifest::parse_string(src);
+    ASSERT_FALSE(m.has_value())
+        << "[indices] mcpplibs + default together must be rejected as a "
+           "collision on the same default-namespace slot";
+    EXPECT_NE(m.error().format().find("collide"), std::string::npos)
+        << "error should mention the collision; got: " << m.error().format();
+}
+
+TEST(Manifest, WorkspaceDependenciesPathFormFlatKey) {
+    // #224: `[workspace.dependencies] ylib = { path = "ylib" }` — a plain
+    // (non-namespaced, non-dotted) top-level key with an inline path table
+    // — must parse to a path-form DependencySpec, not get misrouted into
+    // the namespace/selector-table parsers (which would treat "path" as a
+    // nested selector key).
+    constexpr auto src = R"(
+[workspace]
+members = ["a"]
+
+[workspace.dependencies]
+ylib = { path = "ylib" }
+)";
+    auto m = mcpp::manifest::parse_string(src);
+    ASSERT_TRUE(m.has_value()) << m.error().format();
+    ASSERT_TRUE(m->workspace.dependencies.contains("ylib"))
+        << "workspace.dependencies must contain a flat 'ylib' key";
+    auto& s = m->workspace.dependencies.at("ylib");
+    EXPECT_EQ(s.path, "ylib");
+    EXPECT_TRUE(s.version.empty());
+}
+
 TEST(Manifest, NoWorkspaceSectionMeansNotPresent) {
     constexpr auto src = R"(
 [package]
@@ -1730,4 +1882,69 @@ mcpp = {
               (std::vector<std::string>{"-mavx2"}));
     EXPECT_EQ(mx->buildConfig.globFlags[1].defines,
               (std::vector<std::string>{"HAVE_AVX2"}));
+}
+
+TEST(Manifest, AllowsBuildFlagsArrayOfTablesSyntax) {
+    // `[[build.flags]]` header form must still parse at the manifest layer
+    // (not just the lower libs/toml layer) — the closed-grammar guard must
+    // allowlist exactly this path.
+    constexpr auto src = R"(
+[package]
+name = "globf"
+version = "1.0.0"
+
+[[build.flags]]
+glob = "third_party/**"
+cxxflags = ["-w"]
+
+[[build.flags]]
+glob = "src/x86/**/*.asm"
+asmflags = ["-DPIC"]
+)";
+    auto m = mcpp::manifest::parse_string(src);
+    ASSERT_TRUE(m.has_value()) << m.error().format();
+    auto& gfs = m->buildConfig.globFlags;
+    ASSERT_EQ(gfs.size(), 2u);
+    EXPECT_EQ(gfs[0].glob, "third_party/**");
+    EXPECT_EQ(gfs[0].cxxflags, (std::vector<std::string>{"-w"}));
+    EXPECT_EQ(gfs[1].glob, "src/x86/**/*.asm");
+    EXPECT_EQ(gfs[1].asmflags, (std::vector<std::string>{"-DPIC"}));
+}
+
+// Closed-grammar guard (review fix on #227/#228): `[[dependencies]]` is a
+// doubled-bracket typo for `[dependencies]`. Before this guard it parsed
+// silently as an array-of-tables at that path; every consumer reads
+// [dependencies] via get_table(), which returns nullptr for a non-table
+// Value, so the whole section (all dependencies) silently vanished with no
+// error and no warning. It must now be a loud parse error.
+TEST(Manifest, RejectsArrayOfTablesTypoOnDependencies) {
+    auto m = mcpp::manifest::parse_string(R"(
+[package]
+name = "x"
+version = "0.1.0"
+
+[[dependencies]]
+gtest = "1.15.2"
+)");
+    ASSERT_FALSE(m.has_value());
+    EXPECT_NE(m.error().message.find("array-of-tables"), std::string::npos)
+        << m.error().message;
+    EXPECT_NE(m.error().message.find("dependencies"), std::string::npos)
+        << m.error().message;
+}
+
+// Same guard, a different non-allowlisted path — confirms the check isn't
+// hardcoded to just "dependencies".
+TEST(Manifest, RejectsArrayOfTablesTypoOnToolchain) {
+    auto m = mcpp::manifest::parse_string(R"(
+[package]
+name = "x"
+version = "0.1.0"
+
+[[toolchain]]
+linux = "gcc@15.1.0"
+)");
+    ASSERT_FALSE(m.has_value());
+    EXPECT_NE(m.error().message.find("array-of-tables"), std::string::npos)
+        << m.error().message;
 }
