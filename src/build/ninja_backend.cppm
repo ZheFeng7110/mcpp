@@ -403,6 +403,57 @@ std::string emit_ninja_string(const BuildPlan& plan) {
     auto append_deps = [&] {
         if (msvcDeps) append("  deps = msvc\n");
     };
+    // mcpp#235: cxx_module/cxx_object had NO depfile at all on non-MSVC —
+    // only the msvcDeps branch tracked header deps (via /showIncludes). So
+    // editing a file #include'd inside a module's purview (or a plain
+    // header pulled in by a .cpp) never invalidated the compile edge: the
+    // P1689 scan already emits a `.dep`/`.d`-shaped list of textual
+    // includes, but it was generated and discarded.
+    //
+    // Naively mirroring the nasm rule below (`-MD $out.d` + `deps = gcc` +
+    // `depfile = $out.d`) does NOT work here: GCC's `-fmodules` bolts extra
+    // "reversed" rules onto ANY -M*/-MF depfile for a TU that imports or
+    // provides a module — e.g. for a module interface unit:
+    //   obj/m.m.o gcm.cache/m.gcm: src/m.cppm src/vals.inc
+    //   m.c++-module: gcm.cache/m.gcm
+    //   .PHONY: m.c++-module
+    //   gcm.cache/m.gcm:| obj/m.m.o
+    // and for an importing TU:
+    //   obj/main.o: src/main.cpp gcm.cache/std.gcm gcm.cache/m.gcm
+    //   obj/main.o: m.c++-module std.c++-module
+    //   CXX_IMPORTS += m.c++-module std.c++-module
+    // Those extra records describe a Make-style dependency graph WITHIN the
+    // depfile itself (e.g. gcm.cache/m.gcm "having its own inputs"), which
+    // collides with gcm.cache/m.gcm already being a declared ninja-graph
+    // OUTPUT of this same edge (`| gcm.cache/m.gcm`) — ninja's depfile
+    // loader rejects that outright ("inputs may not also have inputs"),
+    // confirmed empirically (e2e 118 failed the fresh build this way before
+    // the filter below was added). GCC has no flag to suppress this.
+    //
+    // Fix: compile to a scratch `$out.d.raw`, then keep only the FIRST
+    // record (target + its indented continuation lines — the plain textual
+    // #include graph, which is all #235 needs) as `$out.d`; module BMI
+    // deps stay tracked independently via the existing per-edge `dyndep`
+    // binding, so dropping the reversed/module lines here loses nothing.
+    // POSIX-only (`awk`): native Windows has no POSIX shell/toolset here
+    // (see the existing "Windows: skip BMI restat optimization" branch
+    // below), so a non-MSVC Windows toolchain keeps the pre-#235
+    // behavior (no depfile) rather than depend on an unavailable filter —
+    // msvcDeps (cl.exe) is unaffected either way (deps=msvc, no -MMD).
+    const bool posixDepfile = !msvcDeps && !mcpp::platform::is_windows;
+    const std::string mmd_flag = posixDepfile ? "-MMD -MF $out.d.raw " : "";
+    const std::string mmd_filter = posixDepfile
+        ? " && awk 'NR==1{print;next} /^[^ ]/{exit} {print}' "
+          "\"$out.d.raw\" > \"$out.d\" && rm -f \"$out.d.raw\""
+        : "";
+    auto append_cxx_deps = [&] {
+        if (posixDepfile) {
+            append("  deps = gcc\n");
+            append("  depfile = $out.d\n");
+        } else {
+            append_deps();
+        }
+    };
     // cl.exe needs /TP (our module interfaces are .cppm, unknown to cl) and
     // /interface to treat the TU as a module interface unit.
     const std::string module_src_flags = msvcDeps ? " /interface /TP" : "";
@@ -412,19 +463,20 @@ std::string emit_ninja_string(const BuildPlan& plan) {
         append(std::format("  command = "
                "$cxx $local_includes $cxxflags $unit_cxxflags{}{} {}\n",
                module_output_flag, module_src_flags, compile_tail));
-        append_deps();
+        append_cxx_deps();
     } else {
         append(std::format("  command = "
                "if [ -n \"$bmi_out\" ] && [ -f \"$bmi_out\" ]; then "
                  "cp -p \"$bmi_out\" \"$bmi_out.bak\"; "
                "fi && "
-               "$cxx $local_includes $cxxflags $unit_cxxflags{} {} && "
+               "$cxx $local_includes $cxxflags $unit_cxxflags{} {}{}{} && "
                "if [ -n \"$bmi_out\" ] && [ -f \"$bmi_out.bak\" ] && "
                   "cmp -s \"$bmi_out\" \"$bmi_out.bak\"; then "
                  "mv \"$bmi_out.bak\" \"$bmi_out\"; "
                "else "
                  "rm -f \"$bmi_out.bak\"; "
-               "fi\n", module_output_flag, compile_tail));
+               "fi\n", module_output_flag, mmd_flag, compile_tail, mmd_filter));
+        append_cxx_deps();
     }
     append("  description = MOD $out\n");
     if (dyndep)
@@ -432,11 +484,17 @@ std::string emit_ninja_string(const BuildPlan& plan) {
     append("\n");
 
     append("rule cxx_object\n");
-    append(std::format(
-        "  command = $cxx $local_includes $cxxflags $unit_cxxflags {}\n",
-        compile_tail));
+    if constexpr (mcpp::platform::is_windows) {
+        append(std::format(
+            "  command = $cxx $local_includes $cxxflags $unit_cxxflags {}\n",
+            compile_tail));
+    } else {
+        append(std::format(
+            "  command = $cxx $local_includes $cxxflags $unit_cxxflags {}{}{}\n",
+            mmd_flag, compile_tail, mmd_filter));
+    }
     append("  description = OBJ $out\n");
-    append_deps();
+    append_cxx_deps();
     if (dyndep)
         append("  restat = 1\n");
     append("\n");
@@ -613,9 +671,10 @@ std::string emit_ninja_string(const BuildPlan& plan) {
         // ── Phase 1: scan edges (one .ddi per TU). ──────────────────────
         // .ddi is placed beside the object so multi-version mangling can
         // namespace by package without producing two `build` rules with
-        // the same `.ddi` output (plan.cppm switches `cu.object` from
-        // `obj/<file>.o` to `obj/<pkg>/<file>.o` whenever a basename
-        // collides across packages — `.ddi` follows that placement).
+        // the same `.ddi` output (mcpp#233: plan.cppm switches `cu.object`
+        // from the flat `obj/<file>.o` to a path mirroring the source's
+        // relative directory under a sanitized-package prefix whenever a
+        // basename collides — `.ddi` follows that placement).
         // Skip .c files: they have no `import`s and don't need P1689 scan;
         // running them through cxx_scan would route them through g++ /
         // -fmodules which is exactly what C support is here to avoid.

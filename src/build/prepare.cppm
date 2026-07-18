@@ -2981,9 +2981,11 @@ prepare_build(bool print_fingerprint,
     ctx.outputDir  = target_dir(*tc, fp, *root);
     ctx.stdBmi     = stdBmiPath;
     ctx.stdObject  = stdObjectPath;
-    ctx.plan        = mcpp::build::make_plan(*m, *tc, fp, scan.graph, report.topoOrder,
+    auto planResult = mcpp::build::make_plan(*m, *tc, fp, scan.graph, report.topoOrder,
                                              packages, *root, ctx.outputDir,
                                              stdBmiPath, stdObjectPath);
+    if (!planResult) return std::unexpected(planResult.error());
+    ctx.plan        = std::move(*planResult);
     ctx.plan.stdCompatBmiPath = stdCompatBmiPath;
     ctx.plan.stdCompatObjectPath = stdCompatObjectPath;
 

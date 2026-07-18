@@ -71,6 +71,40 @@ TEST(NinjaBackend, ObjectiveCSourceUsesCObjectRuleAndCFlags) {
         << ninja;
 }
 
+// mcpp#235: cxx_module/cxx_object must track header/purview/GMF includes via
+// a GNU-style depfile on non-MSVC toolchains (this test's plan uses GCC on a
+// non-Windows host, so posixDepfile is true). Before the fix, neither rule
+// had ANY depfile outside the msvcDeps branch, so editing a file #include'd
+// inside a module's purview (or a header pulled in by a .cpp) never
+// invalidated the compile edge. The depfile is routed through a scratch
+// `$out.d.raw` + `awk` filter (not written directly to `$out.d`) because
+// GCC's `-fmodules` bolts non-standard "reversed" module rules onto the raw
+// -MMD output that ninja's depfile loader rejects — see the long comment at
+// the definition site for the empirically-confirmed failure mode.
+TEST(NinjaBackend, CxxModuleAndCxxObjectRulesTrackHeaderDepsViaGccDepfile) {
+    auto plan = minimal_plan();
+
+    auto ninja = emit_ninja_string(plan);
+
+    auto module_rule_start = ninja.find("rule cxx_module");
+    auto object_rule_start = ninja.find("rule cxx_object");
+    ASSERT_NE(module_rule_start, std::string::npos) << ninja;
+    ASSERT_NE(object_rule_start, std::string::npos) << ninja;
+    ASSERT_LT(module_rule_start, object_rule_start) << ninja;
+
+    auto module_rule = ninja.substr(module_rule_start, object_rule_start - module_rule_start);
+    auto object_rule = ninja.substr(object_rule_start);
+
+    for (auto const& rule : {module_rule, object_rule}) {
+        EXPECT_NE(rule.find("-MMD -MF $out.d.raw"), std::string::npos) << ninja;
+        EXPECT_NE(rule.find("deps = gcc"), std::string::npos) << ninja;
+        EXPECT_NE(rule.find("depfile = $out.d\n"), std::string::npos) << ninja;
+        // The raw compiler depfile (with GCC's module-specific reversed
+        // rules) must never be bound directly as ninja's depfile.
+        EXPECT_EQ(rule.find("depfile = $out.d.raw"), std::string::npos) << ninja;
+    }
+}
+
 TEST(NinjaBackend, UsesPackageCppStandardForCxxFlags) {
     auto plan = minimal_plan();
     plan.manifest.package.standard = "c++26";

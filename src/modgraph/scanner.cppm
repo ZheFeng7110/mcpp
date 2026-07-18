@@ -852,6 +852,10 @@ void scan_one_into(ScanResult& result,
         if (ov) {
             SourceUnit u;
             u.path           = f;
+            // mcpp#233: relative to the PACKAGE root (`root`), not the
+            // primary project root — a path dependency scans with its own
+            // root here.
+            u.relPath        = std::filesystem::relative(f, root);
             u.packageName    = qualifiedName;
             u.scanOverridden = true;
             if (!ov->provides.empty()) {
@@ -881,6 +885,9 @@ void scan_one_into(ScanResult& result,
             result.errors.push_back(r.error());
             continue;
         }
+        // mcpp#233: relative to the PACKAGE root (`root`), matching the
+        // scan_overrides branch above.
+        r->relPath = std::filesystem::relative(f, root);
         r->localIncludeDirs = localIncludeDirs;
         r->packageCflags = packageCflags;
         r->packageCxxflags = packageCxxflags;
@@ -994,6 +1001,8 @@ ScanResult scan_packages_p1689(const std::vector<PackageRoot>&     packages,
                 result.errors.push_back(ScanError{ f, 0, r.error() });
                 continue;
             }
+            // mcpp#233: same relPath contract as scan_one_into above.
+            r->relPath = std::filesystem::relative(f, p.root);
             r->localIncludeDirs = localIncludeDirs;
             r->packageCflags = p.usageResolved
                 ? p.privateBuild.cflags
