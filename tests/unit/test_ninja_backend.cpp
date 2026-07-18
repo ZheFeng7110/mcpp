@@ -7,6 +7,7 @@ import mcpp.build.ninja;
 import mcpp.build.plan;
 import mcpp.manifest;
 import mcpp.toolchain.model;
+import mcpp.platform;
 
 using namespace mcpp::build;
 
@@ -82,6 +83,12 @@ TEST(NinjaBackend, ObjectiveCSourceUsesCObjectRuleAndCFlags) {
 // -MMD output that ninja's depfile loader rejects — see the long comment at
 // the definition site for the empirically-confirmed failure mode.
 TEST(NinjaBackend, CxxModuleAndCxxObjectRulesTrackHeaderDepsViaGccDepfile) {
+    // The filtered gcc depfile (#235) is POSIX-only: `posixDepfile =
+    // !msvcDeps && !is_windows` (awk isn't available on native Windows, and
+    // MSVC uses `deps = msvc` instead). This asserts the POSIX emission.
+    if constexpr (mcpp::platform::is_windows)
+        GTEST_SKIP() << "gcc depfile filter is POSIX-only (Windows uses deps=msvc)";
+
     auto plan = minimal_plan();
 
     auto ninja = emit_ninja_string(plan);
@@ -175,6 +182,13 @@ TEST(NinjaBackend, CxxFlagsIncludeBuildIncludeDirs) {
 // prepending the dialect prefix. This test would FAIL before the fix
 // (emitting the literal, unrewritten "/Iinclude") and passes after.
 TEST(NinjaBackend, MsvcIncludeDirsAreAbsolutizedNotGnuNormalized) {
+    // The MSVC-dialect logic under test is host-independent; run it on POSIX
+    // where the test's temp projectRoot has no drive letter. On Windows the
+    // runner's `C:\...` temp path gets its `:` ninja-escaped (`C$:`), which
+    // would need escape-aware matching unrelated to what this test verifies.
+    if constexpr (mcpp::platform::is_windows)
+        GTEST_SKIP() << "MSVC-dialect path check runs on POSIX (avoids Windows drive-colon ninja escaping)";
+
     auto plan = minimal_plan();
     plan.toolchain.compiler = mcpp::toolchain::CompilerId::MSVC;
     plan.toolchain.binaryPath = "cl.exe";
@@ -300,8 +314,12 @@ TEST(NinjaBackend, QuotesFlagValueWithSpace) {
 
     auto ninja = emit_ninja_string(plan);
 
-    EXPECT_NE(ninja.find("unit_cflags = '-DT=long long'"), std::string::npos)
-        << ninja;
+    // shell_quote_arg wraps in single quotes on POSIX, double quotes on
+    // Windows — assert the platform-appropriate spelling.
+    const std::string quoted = mcpp::platform::is_windows
+        ? "unit_cflags = \"-DT=long long\""
+        : "unit_cflags = '-DT=long long'";
+    EXPECT_NE(ninja.find(quoted), std::string::npos) << ninja;
     // Must NOT appear as two bare, unquoted words split on the space.
     EXPECT_EQ(ninja.find("unit_cflags = -DT=long long"), std::string::npos)
         << ninja;
