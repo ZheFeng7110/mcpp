@@ -337,13 +337,28 @@ materialize_generated_files(const std::filesystem::path& root,
     return {};
 }
 
-// L1 cfg merge for ONE manifest (root or dependency): append the matching
-// conditional cflags/cxxflags/ldflags and sources (G1b) to its buildConfig.
-// Sources also update the legacy modules.sources mirror — the scanner walks
-// that. Conditional dependency maps are root-only and handled at the root
-// call site; a dependency's conditional configs otherwise evaluate the same
-// way (descriptor `target_cfg` must not be silently inert).
-void merge_conditional_build(mcpp::manifest::Manifest& m,
+// L1 cfg merge for ONE package's manifest (root or ANY dependency — path,
+// git, or version/registry): append the matching conditional
+// cflags/cxxflags/ldflags and sources (G1b) to its buildConfig. Sources also
+// update the legacy modules.sources mirror — the scanner walks that.
+//
+// #229: this is the SINGLE funnel for cfg-conditional sources/flags — every
+// package's manifest passes through exactly one call to this function,
+// always immediately BEFORE that manifest is captured into `packages[]` via
+// makePackageRoot()/propagateLinkFlags() (which snapshot buildConfig into
+// privateBuild/linkUsage and into the root's propagated ldflags — merging
+// any later than that point is silently lost for flags, though not for
+// sources, which the modgraph scan re-reads live). Three call sites, one per
+// loading branch, together cover every package exactly once: the root
+// (before its own makePackageRoot), the path/git-dep branch, and
+// loadVersionDep() (shared by the main per-dependency loop, the
+// multi-version mangling secondary, and the SemVer-merge re-fetch — all three
+// of ITS callers get the merge for free from the one call inside it).
+// (Conditional *dependencies* are a separate, root-only concern: they must be
+// merged into the dependency map BEFORE resolution even starts, so a
+// dependency's own conditional deps are out of scope — see the root cfg
+// block that merges `cc.dependencies` etc.)
+void merge_conditional_sources_flags(mcpp::manifest::Manifest& m,
                              const cfgpred::Ctx& ctx,
                              std::string_view targetTriple)
 {
@@ -784,13 +799,24 @@ prepare_build(bool print_fingerprint,
     }
     if (overrides.force_static) m->buildConfig.linkage = "static";
 
-    // ── L1: merge platform-conditional [target.'cfg(...)'.build] flags ──────
+    // ── L1: merge conditional [target.'cfg(...)'.build] sources/flags AND
+    // root-only [target.'cfg(...)'.dependencies] ─────────────────────────────
     // Evaluated now (target resolved) against the resolved target — the
-    // --target triple for a cross build, else the host. Matching predicates'
-    // flags append to buildConfig, mirroring the [profile] merge above.
+    // --target triple for a cross build, else the host.
+    //
+    // #229: merge_conditional_sources_flags MUST run here — before
+    // `packages[0] = makePackageRoot(*root, *m)` snapshots `m->buildConfig`
+    // into `packages[0].privateBuild`/`.manifest` — because that snapshot,
+    // not `*m`, is what the modgraph scan and per-TU compile-flag assembly
+    // actually read afterward. Every dependency (path/git/version alike) gets
+    // the SAME treatment, at the mirror-image point in its own load path
+    // (right before ITS `makePackageRoot`/`propagateLinkFlags`) — see the
+    // dependency-manifest-acquisition block below. That makes this the root
+    // package's half of the one funnel, not a special case: every package is
+    // merged exactly once, immediately before it is captured into `packages[]`.
     if (!m->conditionalConfigs.empty()) {
         auto cc_ctx = cfgpred::context_for(overrides.target_triple);
-        merge_conditional_build(*m, cc_ctx, overrides.target_triple);
+        merge_conditional_sources_flags(*m, cc_ctx, overrides.target_triple);
         for (auto const& cc : m->conditionalConfigs) {
             if (!cfgpred::matches(cc.predicate, cc_ctx, overrides.target_triple))
                 continue;
@@ -1710,9 +1736,18 @@ prepare_build(bool print_fingerprint,
 
         // Dependency-side L1 cfg merge (flags + sources): a descriptor's
         // `target_cfg` / a dep mcpp.toml's [target.'cfg(...)'.build] must
-        // evaluate here too — before its globs expand.
+        // evaluate here too — before its globs expand. This is the version/
+        // registry-dep half of the #229 funnel: every loadVersionDep() caller
+        // (the main per-dependency loop, the multi-version mangling
+        // secondary, and the SemVer-merge re-fetch) shares this one call site,
+        // so a version dep is merged exactly once regardless of which of the
+        // three paths loaded it. The path/git-dep half is the mirror-image
+        // call right after ITS manifest load (dependency-manifest-acquisition
+        // block below) — same function, same one-merge-per-package guarantee,
+        // just keyed off a different loading branch since path/git deps never
+        // pass through loadVersionDep.
         if (!manifest->conditionalConfigs.empty()) {
-            merge_conditional_build(*manifest,
+            merge_conditional_sources_flags(*manifest,
                                     cfgpred::context_for(overrides.target_triple),
                                     overrides.target_triple);
         }
@@ -2458,6 +2493,20 @@ prepare_build(bool print_fingerprint,
                     name, dep_root.string(), dm.error().format()));
             }
             dep_manifest = std::move(*dm);
+            // #229: path/git-dep half of the L1 cfg funnel — mirrors the
+            // loadVersionDep call site above (loadFrom's L1 cfg merge, ~1740
+            // lines up). Before this fix, path/git deps never ran this merge
+            // at all: their `[target.'cfg(...)'.build] sources` were parsed
+            // into `conditionalConfigs` but never folded into
+            // `buildConfig.sources` / `modules.sources`, so the modgraph scan
+            // never saw the file — link-time `undefined reference`. Must run
+            // BEFORE `propagateLinkFlags`/`makePackageRoot` below, which
+            // snapshot this manifest's flags/sources into `packages[]`.
+            if (!dep_manifest->conditionalConfigs.empty()) {
+                merge_conditional_sources_flags(*dep_manifest,
+                    cfgpred::context_for(overrides.target_triple),
+                    overrides.target_triple);
+            }
         } else {
             auto loaded = loadVersionDep(name, key.ns, key.shortName, spec.version);
             if (!loaded) return std::unexpected(loaded.error());
