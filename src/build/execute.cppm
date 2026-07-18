@@ -584,21 +584,36 @@ std::optional<int> try_fast_run(const std::filesystem::path& projectRoot,
 }
 
 // `mcpp run` driver: build, locate the binary target, exec it with the
-// resolved runtime environment.
+// resolved runtime environment. `package_filter` (`-p`/`--package`) scopes
+// a workspace invocation to one member — single-member only, no
+// `--workspace` fan-out (running N binaries in one invocation isn't a
+// coherent "run"). Threaded straight to prepare_build's BuildOverrides,
+// which already does the member switch (basename OR member path — the same
+// rule mcpp::project::resolve_member_dir documents for build/test).
 export int build_run_target(const std::optional<std::string>& targetName,
-                            std::span<const std::string> passthrough) {
+                            std::span<const std::string> passthrough,
+                            const std::string& package_filter = {}) {
     // mcpp#225 (E2): reuse the resolved build cache when it's still fresh,
     // skipping prepare_build's toolchain resolution + modgraph scan
-    // entirely — mirrors cmd_build's try_fast_build fast path.
-    if (auto root = mcpp::project::find_manifest_root(std::filesystem::current_path())) {
-        if (auto rc = try_fast_run(*root, targetName, passthrough)) {
-            return *rc;
+    // entirely — mirrors cmd_build's try_fast_build fast path. The cached
+    // entry was written for whichever package occupied the project root
+    // last time; a `-p` filter always needs prepare_build's member switch,
+    // so skip the fast path in that case (mirrors cmd_build's fast-path
+    // bypass whenever ov.package_filter is set).
+    if (package_filter.empty()) {
+        if (auto root = mcpp::project::find_manifest_root(std::filesystem::current_path())) {
+            if (auto rc = try_fast_run(*root, targetName, passthrough)) {
+                return *rc;
+            }
         }
     }
 
     // Build first. Single prepare_build → drive build → reuse ctx to locate
     // the binary, so we don't re-resolve the toolchain or re-scan modgraph.
-    auto ctx = prepare_build(/*print_fp=*/false);
+    mcpp::build::BuildOverrides ov;
+    ov.package_filter = package_filter;
+    auto ctx = prepare_build(/*print_fp=*/false, /*includeDevDeps=*/false,
+                             /*extraTargets=*/{}, ov);
     if (!ctx) { std::println(stderr, "error: {}", ctx.error()); return 2; }
     if (auto rc = run_build_plan(*ctx, /*verbose=*/false, /*no_cache=*/false); rc != 0)
         return rc;

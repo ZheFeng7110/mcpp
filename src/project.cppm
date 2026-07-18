@@ -48,24 +48,51 @@ export std::filesystem::path find_workspace_root(const std::filesystem::path& me
     return {};
 }
 
-// Merge workspace.dependencies versions into a member's deps.
+// Merge workspace.dependencies into a member's deps (`x.workspace = true`).
+//
+// #224: this used to propagate only `version`, so a workspace-level
+// `[workspace.dependencies] x = { path = "..." }` inherited by a member was
+// silently treated as a version/index dep (empty version) and failed to
+// resolve. Now the location fields (path/git/*) travel too — a dep spec is
+// one of {version, path, git} so copying whichever the workspace declared
+// is correct.
+//
+// `wsRoot` anchors a relative `path`: the workspace author wrote it
+// relative to the WORKSPACE ROOT (where `[workspace.dependencies]` lives),
+// not the inheriting member's own directory, so it is resolved to an
+// absolute path here — downstream path-dep resolution (relative to the
+// member root) then sees an already-absolute path and leaves it alone.
 export void merge_workspace_deps(mcpp::manifest::Manifest& member,
-                          const mcpp::manifest::Manifest& workspace) {
+                          const mcpp::manifest::Manifest& workspace,
+                          const std::filesystem::path& wsRoot = {}) {
+    auto copy_from = [&](mcpp::manifest::DependencySpec& spec,
+                         const mcpp::manifest::DependencySpec& wsSpec) {
+        spec.version    = wsSpec.version;
+        spec.path       = wsSpec.path;
+        spec.git        = wsSpec.git;
+        spec.gitRev     = wsSpec.gitRev;
+        spec.gitRefKind = wsSpec.gitRefKind;
+        if (!spec.path.empty() && !wsRoot.empty()) {
+            std::filesystem::path p(spec.path);
+            if (p.is_relative()) {
+                spec.path = std::filesystem::weakly_canonical(wsRoot / p).string();
+            }
+        }
+        spec.inheritWorkspace = false;
+    };
     auto merge_map = [&](std::map<std::string, mcpp::manifest::DependencySpec>& deps) {
         for (auto& [name, spec] : deps) {
             if (!spec.inheritWorkspace) continue;
             // Try exact key match first
             auto it = workspace.workspace.dependencies.find(name);
             if (it != workspace.workspace.dependencies.end()) {
-                spec.version = it->second.version;
-                spec.inheritWorkspace = false;
+                copy_from(spec, it->second);
                 continue;
             }
             // Try short name for default-ns deps
             auto shortIt = workspace.workspace.dependencies.find(spec.shortName);
             if (shortIt != workspace.workspace.dependencies.end()) {
-                spec.version = shortIt->second.version;
-                spec.inheritWorkspace = false;
+                copy_from(spec, shortIt->second);
             }
         }
     };

@@ -577,8 +577,11 @@ prepare_build(bool print_fingerprint,
             if (!m) return std::unexpected(std::format(
                 "workspace member '{}': {}", targetMember, m.error().format()));
 
-            // Merge workspace dependency versions
-            mcpp::project::merge_workspace_deps(*m, *wsManifest);
+            // Merge workspace dependency versions/paths. `*root` is still the
+            // WORKSPACE root here (the `root = memberDir` reassignment below
+            // hasn't happened yet), so it anchors any relative `path` in
+            // `[workspace.dependencies]` (#224).
+            mcpp::project::merge_workspace_deps(*m, *wsManifest, *root);
 
             // Inherit workspace toolchain if member doesn't define one
             if (m->toolchain.byPlatform.empty()) {
@@ -590,9 +593,19 @@ prepare_build(bool print_fingerprint,
                     m->targetOverrides[triple] = entry;
                 }
             }
-            // Inherit workspace indices if member doesn't define any
+            // Inherit workspace indices if member doesn't define any. A
+            // relative `[indices].path` was declared at the WORKSPACE root,
+            // so it must resolve against `*root` (still the workspace root
+            // here), not the member directory — otherwise every member
+            // needs its own `../`-prefixed copy of the same declaration
+            // (#224).
             if (m->indices.empty() && !wsManifest->indices.empty()) {
                 m->indices = wsManifest->indices;
+                for (auto& [_, idx] : m->indices) {
+                    if (idx.is_local() && idx.path.is_relative()) {
+                        idx.path = std::filesystem::weakly_canonical(*root / idx.path);
+                    }
+                }
             }
 
             mcpp::ui::status("Workspace", std::format("building member '{}'", targetMember));
@@ -604,7 +617,9 @@ prepare_build(bool print_fingerprint,
         if (!wsRoot.empty()) {
             auto wsm = mcpp::manifest::load(wsRoot / "mcpp.toml");
             if (wsm && wsm->workspace.present) {
-                mcpp::project::merge_workspace_deps(*m, *wsm);
+                // #224: anchor relative `path`/`[indices].path` to the
+                // workspace root, not this member's own directory.
+                mcpp::project::merge_workspace_deps(*m, *wsm, wsRoot);
                 if (m->toolchain.byPlatform.empty()) {
                     m->toolchain = wsm->toolchain;
                 }
@@ -616,6 +631,11 @@ prepare_build(bool print_fingerprint,
                 // Inherit workspace indices if member doesn't define any
                 if (m->indices.empty() && !wsm->indices.empty()) {
                     m->indices = wsm->indices;
+                    for (auto& [_, idx] : m->indices) {
+                        if (idx.is_local() && idx.path.is_relative()) {
+                            idx.path = std::filesystem::weakly_canonical(wsRoot / idx.path);
+                        }
+                    }
                 }
             }
         }
@@ -1164,7 +1184,14 @@ prepare_build(bool print_fingerprint,
             auto ns = spec.namespace_.empty()
                 ? std::string(mcpp::pm::kDefaultNamespace)
                 : spec.namespace_;
-            if (ns == mcpp::pm::kDefaultNamespace) return true;
+            if (ns == mcpp::pm::kDefaultNamespace) {
+                // R6: `[indices] default = {...}` (normalized to
+                // kDefaultNamespace by toml.cppm) redirects the default
+                // namespace away from the builtin registry — consult it
+                // before assuming builtin, same as any named namespace.
+                auto it = m->indices.find(std::string(mcpp::pm::kDefaultNamespace));
+                return it == m->indices.end() || it->second.is_builtin();
+            }
 
             auto it = m->indices.find(ns);
             if (it == m->indices.end()) return true;
@@ -1324,7 +1351,14 @@ prepare_build(bool print_fingerprint,
     auto findIndexForNs = [&](const std::string& ns)
         -> const mcpp::pm::IndexSpec*
     {
-        if (ns.empty() || ns == std::string(mcpp::pm::kDefaultNamespace)) return nullptr;
+        if (ns.empty() || ns == std::string(mcpp::pm::kDefaultNamespace)) {
+            // R6: `[indices] default = {...}` (normalized to
+            // kDefaultNamespace by toml.cppm) redirects the default
+            // namespace — return it when present instead of unconditionally
+            // falling back to the builtin index.
+            auto it = m->indices.find(std::string(mcpp::pm::kDefaultNamespace));
+            return it == m->indices.end() ? nullptr : &it->second;
+        }
         if (auto it = m->indices.find(ns); it != m->indices.end()) {
             return &it->second;
         }

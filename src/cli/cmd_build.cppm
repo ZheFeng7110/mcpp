@@ -103,7 +103,12 @@ export int cmd_run(const mcpplibs::cmdline::ParsedArgs& parsed,
     // is the optional binary target name.
     std::optional<std::string> targetName;
     if (parsed.positional_count() > 0) targetName = parsed.positional(0);
-    return mcpp::build::build_run_target(targetName, passthrough);
+    // -p/--package <member>: scope to one workspace member, same flag/rule
+    // as `mcpp build -p` / `mcpp test -p` (mcpp::project::resolve_member_dir).
+    // `mcpp run` is single-member only — no `--workspace` fan-out.
+    std::string package_filter;
+    if (auto p = parsed.value("package")) package_filter = *p;
+    return mcpp::build::build_run_target(targetName, passthrough, package_filter);
 }
 
 export int cmd_test(const mcpplibs::cmdline::ParsedArgs& parsed,
