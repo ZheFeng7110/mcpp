@@ -704,8 +704,8 @@ BuildPlan make_plan(const mcpp::manifest::Manifest&         manifest,
             }
             // Root-relative -I flags → absolute (G8b), mirroring the scanner's
             // treatment of every scanned unit.
-            mcpp::modgraph::absolutize_include_flags(projectRoot, main_cu.packageCflags);
-            mcpp::modgraph::absolutize_include_flags(projectRoot, main_cu.packageCxxflags);
+            mcpp::modgraph::normalize_include_flags(projectRoot, main_cu.packageCflags);
+            mcpp::modgraph::normalize_include_flags(projectRoot, main_cu.packageCxxflags);
 
             // We didn't scan main.cpp earlier (it's not in scanner output unless globbed in).
             // Best-effort: scan its imports here.

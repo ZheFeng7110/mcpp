@@ -97,10 +97,17 @@ std::string local_include_flags(const CompileUnit& cu) {
 }
 
 std::string join_flags(const std::vector<std::string>& flags) {
+    // mcpp#234: each vector element is already one argv token (e.g. a
+    // manifest define `T=long long` arrives here as the single element
+    // `-DT=long long`, pushed whole by apply_glob_flags) — but joining with
+    // a bare space and no quoting let the embedded space split it into two
+    // words once ninja handed the resolved command line to the shell.
+    // shell_quote_arg is a no-op for tokens with nothing shell-significant
+    // (`-std=c++23`, `-O2`, ...), so plain flags are untouched.
     std::string out;
     for (auto const& flag : flags) {
         out += ' ';
-        out += flag;
+        out += shell_quote_arg(flag);
     }
     return out;
 }

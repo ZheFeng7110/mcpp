@@ -127,6 +127,34 @@ TEST(NinjaBackend, CxxFlagsIncludeBuildIncludeDirs) {
         << flags.cxx;
 }
 
+// Cluster A review fix (#226/#234 follow-up): `[build] include_dirs` is a
+// TYPED PATH channel — bare paths from the manifest, dialect prefix applied
+// at emission (-I under GNU, /I under MSVC) — not the FLAG-STRING channel
+// that normalize_include_flags serves (cflags/cxxflags, where the prefix is
+// already embedded in the string by the scanner). Routing dialect-prefixed
+// include tokens through normalize_include_flags (whose prefix table only
+// knows GNU spellings: -I/-iquote/-isystem/-idirafter/-iprefix/-L) silently
+// no-ops under MSVC: "/Iinclude" matches no table entry and is never
+// rewritten against plan.projectRoot, so it survives as a *relative* path —
+// but ninja runs with cwd = the output dir, so the include stops resolving.
+// The fix absolutizes the path directly (dialect-agnostic) before
+// prepending the dialect prefix. This test would FAIL before the fix
+// (emitting the literal, unrewritten "/Iinclude") and passes after.
+TEST(NinjaBackend, MsvcIncludeDirsAreAbsolutizedNotGnuNormalized) {
+    auto plan = minimal_plan();
+    plan.toolchain.compiler = mcpp::toolchain::CompilerId::MSVC;
+    plan.toolchain.binaryPath = "cl.exe";
+    plan.toolchain.targetTriple = "x86_64-pc-windows-msvc";
+    plan.manifest.buildConfig.includeDirs = {"include"};
+
+    auto flags = compute_flags(plan);
+
+    auto expected = "/I" + (plan.projectRoot / "include").string();
+    EXPECT_NE(flags.cxx.find(expected), std::string::npos) << flags.cxx;
+    // The un-rewritten, still-relative token must never appear.
+    EXPECT_EQ(flags.cxx.find("/Iinclude"), std::string::npos) << flags.cxx;
+}
+
 // ── assembly sources (.S/.s → asm_object via $cc, .asm → nasm_object) ────────
 
 TEST(NinjaBackend, GasSourceUsesAsmObjectRule) {
@@ -218,6 +246,48 @@ TEST(NinjaBackend, CompileCommandsSkipNasmAndCoverGas) {
     // GAS units ride the C driver and stay in the CDB.
     EXPECT_NE(cdb.find("copy.S"), std::string::npos) << cdb;
     EXPECT_EQ(cdb.find("\"-std=c11\""), std::string::npos) << cdb;   // asm-safe flags, no C std
+}
+
+// mcpp#234: each packageCflags/packageCxxflags element is already one argv
+// token — apply_glob_flags pushes a define like `T=long long` as the single
+// element `-DT=long long`. join_flags previously joined tokens with a bare
+// space and zero quoting, so once ninja resolved the command line and handed
+// it to the shell, the embedded space split `-DT=long long` into TWO words
+// (`-DT=long` and a bare `long`). The emitted unit_cflags line must carry the
+// define as a single shell-quoted token.
+TEST(NinjaBackend, QuotesFlagValueWithSpace) {
+    auto plan = minimal_plan();
+    plan.compileUnits.push_back({
+        .source = "src/main.c",
+        .object = "obj/main.o",
+        .packageName = "quote_test",
+        .packageCflags = {"-DT=long long"},
+    });
+
+    auto ninja = emit_ninja_string(plan);
+
+    EXPECT_NE(ninja.find("unit_cflags = '-DT=long long'"), std::string::npos)
+        << ninja;
+    // Must NOT appear as two bare, unquoted words split on the space.
+    EXPECT_EQ(ninja.find("unit_cflags = -DT=long long"), std::string::npos)
+        << ninja;
+}
+
+// Plain framework-shaped flags with nothing shell-significant must pass
+// through byte-for-byte unquoted (no over-quoting regression).
+TEST(NinjaBackend, PlainFlagsPassThroughUnquoted) {
+    auto plan = minimal_plan();
+    plan.compileUnits.push_back({
+        .source = "src/main.cpp",
+        .object = "obj/main.o",
+        .packageName = "plain_flag_test",
+        .packageCxxflags = {"-DFOO=1", "-O2"},
+    });
+
+    auto ninja = emit_ninja_string(plan);
+
+    EXPECT_NE(ninja.find("unit_cxxflags = -DFOO=1 -O2"), std::string::npos)
+        << ninja;
 }
 
 TEST(NinjaBackend, RootPackageCxxflagsAreEmittedOncePerUnit) {

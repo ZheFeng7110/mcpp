@@ -68,13 +68,18 @@ struct ScanResult {
 ScanResult scan_package(const std::filesystem::path& root,
                         const mcpp::manifest::Manifest& manifest);
 
-// Absolutize relative `-I<path>` compile flags against the package root
-// (G8b). A manifest's relative -I means root-relative, but ninja runs
-// commands with cwd = the output dir, so a verbatim relative flag resolves
-// against the wrong base. Called at every point where per-unit flag vectors
-// are attached (the scanner here; plan.cppm for a target's entry unit).
-void absolutize_include_flags(const std::filesystem::path& root,
-                              std::vector<std::string>& flags);
+// Absolutize relative include/lib-search-path flags against the package root
+// (G8b, generalized by #226). A manifest's relative include flag means
+// root-relative, but ninja runs commands with cwd = the output dir, so a
+// verbatim relative flag resolves against the wrong base. Recognizes the
+// whole include-family prefix set — -I, -iquote, -isystem, -idirafter,
+// -iprefix, -L — in BOTH the joined spelling (`-iquotehdr`) and the
+// separated spelling (`-isystem` followed by a standalone `hdr` element).
+// Called at every point where per-unit flag vectors are attached (the
+// scanner here; plan.cppm for a target's entry unit; flags.cppm for the
+// manifest-global [build] include_dirs).
+void normalize_include_flags(const std::filesystem::path& root,
+                             std::vector<std::string>& flags);
 
 enum class DependencyVisibility {
     Private,
@@ -543,16 +548,45 @@ std::vector<std::filesystem::path> expand_dir_glob(const std::filesystem::path& 
     return out;
 }
 
-void absolutize_include_flags(const std::filesystem::path& root,
-                              std::vector<std::string>& flags)
+namespace {
+
+// has_root_path: leave absolute AND root-relative ("/x" on Windows)
+// spellings alone — only genuinely root-less paths are project-relative.
+std::string rewrite_rel_copy(const std::string& p, const std::filesystem::path& root) {
+    std::filesystem::path fp(p);
+    if (fp.has_root_path()) return p;
+    return (root / fp).string();
+}
+
+void rewrite_rel(std::string& p, const std::filesystem::path& root) {
+    p = rewrite_rel_copy(p, root);
+}
+
+}  // namespace
+
+void normalize_include_flags(const std::filesystem::path& root,
+                             std::vector<std::string>& flags)
 {
-    for (auto& f : flags) {
-        if (f.size() > 2 && f.starts_with("-I")) {
-            std::filesystem::path p(f.substr(2));
-            // has_root_path: leave absolute AND root-relative ("/x" on
-            // Windows) spellings alone — only genuinely root-less paths are
-            // project-relative.
-            if (!p.has_root_path()) f = "-I" + (root / p).string();
+    // #226: the whole include/lib-search-path family, not just -I. Each
+    // prefix is checked in both spellings:
+    //   joined:    "-iquotehdr"        (element starts_with prefix, has a tail)
+    //   separated: "-isystem", "hdr"   (element == bare prefix, rewrite next)
+    static constexpr std::string_view kIncPrefixes[] =
+        {"-I", "-iquote", "-isystem", "-idirafter", "-iprefix", "-L"};
+
+    for (std::size_t i = 0; i < flags.size(); ++i) {
+        for (auto pre : kIncPrefixes) {
+            if (flags[i] == pre && i + 1 < flags.size()) {          // separated
+                rewrite_rel(flags[i + 1], root);
+                ++i;
+                break;
+            }
+            if (flags[i].size() > pre.size() && flags[i].starts_with(pre)) {  // joined
+                std::string tail = flags[i].substr(pre.size());
+                std::string abs  = rewrite_rel_copy(tail, root);
+                if (abs != tail) flags[i] = std::string(pre) + abs;
+                break;
+            }
         }
     }
 }
@@ -836,9 +870,9 @@ void scan_one_into(ScanResult& result,
             u.packageCflags    = packageCflags;
             u.packageCxxflags  = packageCxxflags;
             apply_glob_flags(u);
-            absolutize_include_flags(root, u.packageCflags);
-            absolutize_include_flags(root, u.packageCxxflags);
-            absolutize_include_flags(root, u.packageAsmflags);
+            normalize_include_flags(root, u.packageCflags);
+            normalize_include_flags(root, u.packageCxxflags);
+            normalize_include_flags(root, u.packageAsmflags);
             result.graph.units.push_back(std::move(u));
             continue;
         }
@@ -851,9 +885,9 @@ void scan_one_into(ScanResult& result,
         r->packageCflags = packageCflags;
         r->packageCxxflags = packageCxxflags;
         apply_glob_flags(*r);
-        absolutize_include_flags(root, r->packageCflags);
-        absolutize_include_flags(root, r->packageCxxflags);
-        absolutize_include_flags(root, r->packageAsmflags);
+        normalize_include_flags(root, r->packageCflags);
+        normalize_include_flags(root, r->packageCxxflags);
+        normalize_include_flags(root, r->packageAsmflags);
         result.graph.units.push_back(std::move(*r));
     }
 
