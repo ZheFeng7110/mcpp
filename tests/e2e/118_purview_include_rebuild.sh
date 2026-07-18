@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# requires:
+# requires: gcc
 # mcpp#235: compile edges must track header/purview/GMF `#include`s via a
+# GCC-only depfile (the awk filter strips GCC -fmodules' reversed rules;
+# Clang/MSVC keep pre-#235 behavior — see ninja_backend posixDepfile gate).
 # depfile. Before this fix, `cxx_module`/`cxx_object` had NO depfile on
 # non-MSVC (only the msvcDeps branch added `deps=msvc`) — the P1689 scan's
 # `$out.dep` was generated then discarded. So editing a file `#include`d

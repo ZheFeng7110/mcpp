@@ -456,7 +456,19 @@ std::string emit_ninja_string(const BuildPlan& plan) {
     // below), so a non-MSVC Windows toolchain keeps the pre-#235
     // behavior (no depfile) rather than depend on an unavailable filter —
     // msvcDeps (cl.exe) is unaffected either way (deps=msvc, no -MMD).
-    const bool posixDepfile = !msvcDeps && !mcpp::platform::is_windows;
+    //
+    // GCC-only: the awk filter strips the "reversed" make-rules that GCC's
+    // `-fmodules -MMD` bolts onto a module-TU depfile (`gcm.cache/<m>.gcm: |
+    // <obj>` etc., which ninja rejects as "inputs may not also have inputs").
+    // Clang's module system (.pcm) does not emit those and its module-TU
+    // depfile shape is different; applying the GCC-shaped filter there is
+    // untested and could yield a wrong dep set. Until Clang is verified,
+    // scope this to GCC — Clang keeps the pre-#235 behavior (no compile-edge
+    // depfile; header/purview rebuild tracking on Clang is a follow-up, same
+    // as it was on 0.0.96, so this is not a regression). e2e 118 declares
+    // `# requires: gcc` and skips where GCC is not the toolchain.
+    const bool posixDepfile = !msvcDeps && !mcpp::platform::is_windows
+        && plan.toolchain.compiler == mcpp::toolchain::CompilerId::GCC;
     const std::string mmd_flag = posixDepfile ? "-MMD -MF $out.d.raw " : "";
     const std::string mmd_filter = posixDepfile
         ? " && awk 'NR==1{print;next} /^[^ ]/{exit} {print}' "
