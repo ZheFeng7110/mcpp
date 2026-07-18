@@ -3073,11 +3073,35 @@ prepare_build(bool print_fingerprint,
                     "`!`-exclude glob in [build].sources)", trip.str()));
             }
             ctx.plan.nasmFormat = *fmt;
+
+            // #232: nasm used to go through a bespoke `ensure_nasm` path
+            // whose `if (cfgNasm)` guard silently swallowed a `get_cfg()`
+            // bootstrap failure (misreporting it as "no nasm"), and whose
+            // install fallback never refreshed the package index and
+            // downgraded a failed install to a warning. Surface the real
+            // config error, then provision through the SAME synchronous
+            // gate the compiler toolchain uses (index refresh before
+            // install, blocking install, hard error on failure) — see the
+            // toolchain resolution block above (~line 872-899).
             auto cfgNasm = get_cfg();
-            std::optional<std::filesystem::path> nasmBin;
-            if (cfgNasm) {
-                nasmBin = mcpp::xlings::ensure_nasm(
-                    mcpp::config::make_xlings_env(**cfgNasm), /*quiet=*/false, {});
+            if (!cfgNasm) return std::unexpected(cfgNasm.error());
+
+            std::optional<std::filesystem::path> nasmBin =
+                mcpp::xlings::find_usable_nasm(mcpp::config::make_xlings_env(**cfgNasm));
+            if (!nasmBin) {
+                mcpp::fetcher::Fetcher nasmFetcher(**cfgNasm);
+                mcpp::fetcher::InstallProgressHandler nasmProgress;
+                auto nasmTarget = std::format("xim:nasm@{}",
+                    mcpp::xlings::pinned::kNasmVersion);
+                auto payload = nasmFetcher.resolve_xpkg_path(
+                    nasmTarget, /*autoInstall=*/true, &nasmProgress);
+                if (!payload) {
+                    return std::unexpected(std::format(
+                        "NASM sources (.asm) present but nasm provisioning "
+                        "failed: {}", payload.error().message));
+                }
+                nasmBin = mcpp::xlings::find_sandbox_nasm(
+                    mcpp::config::make_xlings_env(**cfgNasm));
             }
             if (!nasmBin) {
                 return std::unexpected(std::string(
