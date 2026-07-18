@@ -21,7 +21,30 @@ struct IndexSpec {
 
     bool is_local()   const { return !path.empty(); }
     bool is_pinned()  const { return !rev.empty(); }
-    bool is_builtin() const { return name == "mcpplibs"; }
+    // R6: `name == "mcpplibs"` alone used to mean "builtin" unconditionally,
+    // which was correct while the only way to reach that name was the
+    // literal `[indices] mcpplibs = { url = ..., rev = ... }` pin form (still
+    // routes through the shared global registry, just pinned to a commit —
+    // `path` is never set in that form). Since [indices] now also accepts
+    // `default = {...}` / `"" = {...}` as aliases for the SAME map entry
+    // (both normalize to the "mcpplibs" name — see toml.cppm's [indices]
+    // parse), a `path`-based redirect of the default namespace to a local
+    // checkout would otherwise be misidentified as "builtin" too, and get
+    // silently skipped by the project-index plumbing (ensure_project_index_dir
+    // / prepare.cppm's useProjectEnv) instead of actually redirecting.
+    // `path` set is an unambiguous signal that this entry does NOT point at
+    // the real upstream builtin registry, regardless of which spelling
+    // produced the "mcpplibs" name.
+    //
+    // Note: this only covers the `path` form. A `default`/`""`-alias entry
+    // with `url` (not `path`) would ALSO satisfy `path.empty()` here and be
+    // misidentified as builtin, silently no-opping the redirect — so
+    // toml.cppm's `[indices]` parser rejects that combination at parse time
+    // (loud error) instead of letting it reach this predicate. The literal
+    // `[indices] mcpplibs = { url = ..., rev = ... }` pin form is unaffected
+    // by that rejection and still resolves `is_builtin() == true` here, as
+    // intended.
+    bool is_builtin() const { return name == "mcpplibs" && path.empty(); }
 };
 
 } // namespace mcpp::pm

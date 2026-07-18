@@ -244,6 +244,8 @@ int run(int argc, char** argv) {
             // NB: this positional is a BINARY NAME from [[bin]]/src layout —
             // unrelated to `--target <triple>` (the cross-target axis).
             .arg(cl::Arg("target").help("Binary name (optional)"))
+            .option(cl::Option("package").short_name('p').takes_value().value_name("NAME")
+                .help("Run only the named workspace member (single-member; no --workspace fan-out)"))
             .action(wrap_rc([&passthrough](const cl::ParsedArgs& p) {
                 return cmd_run(p, std::span<const std::string>(passthrough));
             })))

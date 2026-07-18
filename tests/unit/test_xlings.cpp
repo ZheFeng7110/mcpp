@@ -15,6 +15,168 @@ std::filesystem::path make_tempdir(std::string_view name) {
 
 }  // namespace
 
+// ─── find_usable_nasm / find_sandbox_nasm (issue #232) ────────────────
+//
+// #232: nasm used to go through a bespoke `ensure_nasm` that could trigger
+// a side-effecting install of its own. The fix splits this into a pure,
+// side-effect-free PATH+sandbox probe (`find_usable_nasm` /
+// `find_sandbox_nasm`, tested here) and a SEPARATE synchronous
+// provisioning step in mcpp.build.prepare that goes through the same
+// `Fetcher::resolve_xpkg_path` gate the compiler toolchain uses (that step
+// needs `mcpp.config`/`mcpp.fetcher`, which this LEAF module — mcpp.xlings
+// — cannot import, so it isn't unit-testable from here without network;
+// see tests/e2e/105_asm_sources_nasm.sh for the end-to-end coverage).
+
+#if !defined(_WIN32)
+
+namespace {
+
+// A fake `nasm` shell script reporting a fixed `-v` version string, laid
+// out at <dir>/nasm so it can be resolved either via PATH `which()` or via
+// the sandbox layout (<sandboxRoot>/<version>/nasm or .../<version>/bin/nasm).
+std::filesystem::path make_fake_nasm(const std::filesystem::path& dir,
+                                     std::string_view versionLine) {
+    std::filesystem::create_directories(dir);
+    auto nasm = dir / "nasm";
+    std::ofstream os(nasm);
+    // `#!/bin/sh` (a single exec) rather than `#!/usr/bin/env bash` (an
+    // extra `env` -> `bash` hop) — one less fork/exec generation for the
+    // nested `mcpp test` -> test-binary -> capture_exec chain to cross.
+    os << "#!/bin/sh\n"
+       << "if [ \"$1\" = \"-v\" ]; then\n"
+       << "  echo \"" << versionLine << "\"\n"
+       << "  exit 0\n"
+       << "fi\n"
+       << "exit 1\n";
+    os.close();
+    std::filesystem::permissions(
+        nasm,
+        std::filesystem::perms::owner_exec
+        | std::filesystem::perms::owner_read
+        | std::filesystem::perms::owner_write);
+    return nasm;
+}
+
+// The current PATH, minus any directory that already has a real `nasm` on
+// it. `find_usable_nasm`'s version check shells out (`env`/`bash` must
+// still be resolvable), so tests must NOT collapse PATH down to a single
+// directory — only remove the entries that would shadow the fake binary
+// under test.
+std::string path_without_real_nasm() {
+    auto path = mcpp::platform::env::get("PATH").value_or("");
+    std::vector<std::string> kept;
+    std::size_t start = 0;
+    while (start <= path.size()) {
+        auto end = path.find(':', start);
+        auto dir = path.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        if (!dir.empty() && !std::filesystem::exists(std::filesystem::path(dir) / "nasm")) {
+            kept.push_back(dir);
+        }
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    std::string out;
+    for (auto& d : kept) {
+        if (!out.empty()) out += ':';
+        out += d;
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST(FindUsableNasm, FindsOnPathWhenVersionIsAdequate) {
+    auto pathDir = make_tempdir("mcpp-nasm-path");
+    auto expected = make_fake_nasm(pathDir, "NASM version 2.16.03 compiled on Jan  1 2026");
+
+    // Prepend (not replace) PATH: the fake binary must shadow any real
+    // system nasm ahead of it, but `env`/`bash` must stay resolvable for
+    // the fake script's own shebang + the version-check subprocess.
+    auto base = path_without_real_nasm();
+    mcpp::platform::env::ScopedEnv path("PATH", pathDir.string() + ":" + base);
+
+    auto home = make_tempdir("mcpp-nasm-home");  // no sandbox nasm present
+    mcpp::xlings::Env env{.home = home};
+
+    auto found = mcpp::xlings::find_usable_nasm(env);
+    ASSERT_TRUE(found.has_value());
+    EXPECT_EQ(*found, expected);
+
+    std::filesystem::remove_all(pathDir);
+    std::filesystem::remove_all(home);
+}
+
+TEST(FindUsableNasm, RejectsPathNasmBelowMinVersionAndFindsNoSandboxFallback) {
+    auto pathDir = make_tempdir("mcpp-nasm-path-old");
+    make_fake_nasm(pathDir, "NASM version 2.10.00 compiled on Jan  1 2020");
+
+    auto base = path_without_real_nasm();
+    mcpp::platform::env::ScopedEnv path("PATH", pathDir.string() + ":" + base);
+
+    auto home = make_tempdir("mcpp-nasm-home-empty");  // no sandbox nasm
+    mcpp::xlings::Env env{.home = home};
+
+    EXPECT_FALSE(mcpp::xlings::find_usable_nasm(env).has_value());
+
+    std::filesystem::remove_all(pathDir);
+    std::filesystem::remove_all(home);
+}
+
+TEST(FindUsableNasm, FallsBackToSandboxWhenPathHasNoNasm) {
+    // PATH has the usual system directories (so the sandbox script's own
+    // shebang still resolves) but none of them contain a real `nasm`.
+    mcpp::platform::env::ScopedEnv path("PATH", path_without_real_nasm());
+
+    auto home = make_tempdir("mcpp-nasm-home-sandbox");
+    auto sandboxDir = home / "data" / "xpkgs" / "xim-x-nasm" / "3.02";
+    auto expected = make_fake_nasm(sandboxDir, "NASM version 3.02 compiled on Jan  1 2026");
+
+    mcpp::xlings::Env env{.home = home};
+
+    auto found = mcpp::xlings::find_usable_nasm(env);
+    ASSERT_TRUE(found.has_value());
+    EXPECT_EQ(*found, expected);
+
+    std::filesystem::remove_all(home);
+}
+
+TEST(FindSandboxNasm, FindsUnderVersionedBinSubdir) {
+    auto home = make_tempdir("mcpp-nasm-home-bin-subdir");
+    auto sandboxDir = home / "data" / "xpkgs" / "xim-x-nasm" / "3.02" / "bin";
+    auto expected = make_fake_nasm(sandboxDir, "NASM version 3.02 compiled on Jan  1 2026");
+
+    mcpp::xlings::Env env{.home = home};
+
+    auto found = mcpp::xlings::find_sandbox_nasm(env);
+    ASSERT_TRUE(found.has_value());
+    EXPECT_EQ(*found, expected);
+
+    std::filesystem::remove_all(home);
+}
+
+TEST(FindSandboxNasm, RejectsInstalledNasmBelowMinVersion) {
+    auto home = make_tempdir("mcpp-nasm-home-old-sandboxed");
+    auto sandboxDir = home / "data" / "xpkgs" / "xim-x-nasm" / "2.10";
+    make_fake_nasm(sandboxDir, "NASM version 2.10.00 compiled on Jan  1 2020");
+
+    mcpp::xlings::Env env{.home = home};
+
+    EXPECT_FALSE(mcpp::xlings::find_sandbox_nasm(env).has_value());
+
+    std::filesystem::remove_all(home);
+}
+
+TEST(FindSandboxNasm, NoSandboxDirectoryYieldsNullopt) {
+    auto home = make_tempdir("mcpp-nasm-home-absent");
+    mcpp::xlings::Env env{.home = home};
+
+    EXPECT_FALSE(mcpp::xlings::find_sandbox_nasm(env).has_value());
+
+    std::filesystem::remove_all(home);
+}
+
+#endif  // !defined(_WIN32)
+
 TEST(XlingsIndexFreshness, RequiresDefaultMcpplibsIndex) {
     auto home = make_tempdir("mcpp-xlings-index-freshness");
     std::filesystem::create_directories(home / "data" / "xim-pkgindex" / "pkgs");

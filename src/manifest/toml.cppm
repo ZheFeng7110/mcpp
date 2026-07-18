@@ -953,16 +953,47 @@ std::expected<Manifest, ManifestError> parse_string(std::string_view content,
                     continue;
                 }
                 if (!v.is_table()) continue;
+                auto& sub = v.as_table();
+                // #224: a flat (non-namespaced, non-dotted) key whose value is
+                // an inline dep-spec table — `ylib = { path = "..." }` — must
+                // be recognized as ONE dependency spec here, same as
+                // load_deps_table's (1') branch does for [dependencies].
+                // Without this check it falls into load_selector_dep_table
+                // below, which treats "path"/"version"/etc. as nested
+                // selector path components and silently mis-files the entry
+                // under a key like "ylib.path" instead of "ylib".
+                if (looks_like_inline_dep_spec(sub)) {
+                    if (k.find('.') != std::string::npos) {
+                        auto depKey = mcpp::pm::compat::split_legacy_dependency_key(k);
+                        auto selector = mcpp::pm::make_direct_dependency_selector(
+                            depKey.namespace_, depKey.shortName, k);
+                        if (auto r = assign_dep("workspace.dependencies",
+                                                m.workspace.dependencies,
+                                                selector, v,
+                                                depKey.legacyDottedKey); !r) {
+                            return std::unexpected(r.error());
+                        }
+                        continue;
+                    }
+                    auto selector = mcpp::pm::resolve_dependency_selector(
+                        k, mcpp::pm::DependencySelectorMode::OmittedMcpplibsPriority);
+                    if (auto r = assign_dep("workspace.dependencies",
+                                            m.workspace.dependencies,
+                                            selector, v, false); !r) {
+                        return std::unexpected(r.error());
+                    }
+                    continue;
+                }
                 if (is_namespace_table("workspace.dependencies", k)) {
                     if (auto r = load_nested_dep_table("workspace.dependencies",
                                                        m.workspace.dependencies,
-                                                       k, k, v.as_table()); !r) {
+                                                       k, k, sub); !r) {
                         return std::unexpected(r.error());
                     }
                 } else {
                     if (auto r = load_selector_dep_table("workspace.dependencies",
                                                          m.workspace.dependencies,
-                                                         k, v.as_table()); !r) {
+                                                         k, sub); !r) {
                         return std::unexpected(r.error());
                     }
                 }
@@ -979,8 +1010,23 @@ std::expected<Manifest, ManifestError> parse_string(std::string_view content,
     //   mcpplibs = { url = "https://...", rev = "abc123" }            # pin built-in
     if (auto* indices_t = doc->get_table("indices")) {
         for (auto& [k, v] : *indices_t) {
+            // R6: `default` (canonical spelling) or the empty-quoted key `""`
+            // redirects the DEFAULT namespace (bare `gtest = "1.15.2"` deps,
+            // not routed through any explicit namespace prefix) rather than
+            // declaring a literal index named "default". Normalize both
+            // spellings to kDefaultNamespace so prepare.cppm's lookups
+            // (usesBuiltinIndex / findIndexForNs) key on the same string
+            // dependency resolution already uses for the default namespace.
+            bool isDefaultAlias = (k.empty() || k == "default");
+            std::string key = isDefaultAlias ? std::string(kDefaultNamespace) : k;
             mcpp::pm::IndexSpec spec;
-            spec.name = k;
+            // `spec.name` mirrors the (normalized) map key: several call
+            // sites (config.cppm's ensure_project_index_dir, prepare.cppm's
+            // install-target formatting) key xlings' project-index identity
+            // off whichever of {map key, spec.name} they happen to iterate,
+            // so the two must always agree — same invariant as every other
+            // [indices] entry, "default"/"" included.
+            spec.name = key;
 
             if (v.is_string()) {
                 // Short form: key = "url"
@@ -1001,7 +1047,40 @@ std::expected<Manifest, ManifestError> parse_string(std::string_view content,
                     "[indices].{} must be a string (url) or inline table", k)));
             }
 
-            m.indices[k] = std::move(spec);
+            // R6's design goal for the default-namespace redirect is
+            // pointing the default namespace at a LOCAL index checkout
+            // (`path = ...`), so the index repo itself can test module
+            // packages against an unpublished tree. A `url` form silently
+            // no-ops instead of redirecting: is_builtin() (index_spec.cppm)
+            // still returns true whenever `path` is empty, so every
+            // consumer (prepare.cppm's readLuaContent/useProjectEnv/
+            // findRawInstalled, config.cppm's ensure_project_index_dir)
+            // falls through to the builtin/global registry and just
+            // ignores the configured url — no error, nothing redirected.
+            // Reject it loudly at parse time instead of accepting a no-op.
+            // This only fires for the `default`/`""` ALIAS; a literal
+            // `[indices] mcpplibs = { url = ..., rev = ... }` (pin the
+            // builtin registry to a commit) is a different key spelling
+            // and must keep working unchanged.
+            if (isDefaultAlias && spec.path.empty()) {
+                return std::unexpected(error(origin, std::format(
+                    "[indices] default-namespace redirect currently supports only "
+                    "'path = ...' (a local index checkout), not 'url'; got url = '{}'. "
+                    "Use a named namespace for a remote custom index.", spec.url)));
+            }
+
+            // `default`, `""`, and a literal `mcpplibs` key all normalize to
+            // the same map slot (kDefaultNamespace). Without a duplicate
+            // check, declaring more than one of these silently clobbers
+            // whichever was assigned last, order-dependent on TOML table
+            // iteration. Fail loudly instead.
+            if (m.indices.contains(key)) {
+                return std::unexpected(error(origin, std::format(
+                    "[indices] '{}' collides with an existing default-namespace entry "
+                    "(default/\"\"/mcpplibs all map to the same slot)", k)));
+            }
+
+            m.indices[key] = std::move(spec);
         }
     }
 

@@ -34,6 +34,7 @@ namespace pinned {
     inline constexpr std::string_view kPatchelfVersion = "0.18.0";
     inline constexpr std::string_view kNinjaVersion    = "1.12.1";
     inline constexpr std::string_view kXlingsVersion   = "0.4.51";
+    inline constexpr std::string_view kNasmVersion     = "3.02";
 }
 
 // ─── Path helpers (pure functions, no subprocess) ───────────────────
@@ -266,12 +267,23 @@ void ensure_patchelf(const Env& env, bool quiet,
 void ensure_ninja(const Env& env, bool quiet,
                   const BootstrapProgressCallback& cb);
 
-// Resolve a usable nasm (≥ kNasmMinMajor.kNasmMinMinor): PATH first (CI
-// images ship one), the mcpp sandbox second, `xlings install nasm` third.
-// Called lazily — only when a build plan actually contains .asm units. The
-// caller HARD-FAILS on nullopt; assembly sources are never silently skipped.
-std::optional<std::filesystem::path> ensure_nasm(const Env& env, bool quiet,
-                                                 const BootstrapProgressCallback& cb);
+// Fast, side-effect-free probe for a usable nasm (>= 2.16): PATH first (CI
+// images ship one), the mcpp sandbox second. NEVER triggers an install —
+// pure lookup. A build that needs to *provision* nasm goes through the
+// toolchain's synchronous fetcher gate
+// (mcpp::pm::Fetcher::resolve_xpkg_path("xim:nasm@<version>", autoInstall,
+// ...)) from mcpp.build.prepare, the same gate the compiler toolchain uses:
+// this module is a LEAF dependency and must not import mcpp.config /
+// mcpp.fetcher (#232 — the old bespoke `ensure_nasm` install path skipped
+// the index refresh and downgraded install failure to a warning).
+std::optional<std::filesystem::path> find_usable_nasm(const Env& env);
+
+// Locate an already-installed nasm inside the mcpp sandbox
+// ($XLINGS_HOME/data/xpkgs/xim-x-nasm/<version>/...). Pure lookup: no PATH
+// probe, no install. Called lazily — only when a build plan actually
+// contains .asm units — after a provisioning gate has landed the package;
+// the caller HARD-FAILS on nullopt, never silently skips assembly sources.
+std::optional<std::filesystem::path> find_sandbox_nasm(const Env& env);
 
 // ─── Index freshness ────────────────────────────────────────────────
 
@@ -1257,6 +1269,8 @@ bool nasm_version_ok(const std::filesystem::path& bin) {
     return major > 2 || (major == 2 && minor >= 16);
 }
 
+} // namespace
+
 std::optional<std::filesystem::path> find_sandbox_nasm(const Env& env) {
     auto root = paths::xim_tool_root(env, "nasm");
     auto nasm_name = std::string("nasm") + std::string(mcpp::platform::exe_suffix);
@@ -1271,25 +1285,11 @@ std::optional<std::filesystem::path> find_sandbox_nasm(const Env& env) {
     return std::nullopt;
 }
 
-} // namespace
-
-std::optional<std::filesystem::path> ensure_nasm(const Env& env, bool quiet,
-                                                 const BootstrapProgressCallback& cb)
-{
+std::optional<std::filesystem::path> find_usable_nasm(const Env& env) {
     auto nasm_name = std::string("nasm") + std::string(mcpp::platform::exe_suffix);
     if (auto sys = mcpp::platform::fs::which(nasm_name);
         sys && nasm_version_ok(*sys)) {
         return sys;
-    }
-    if (auto boxed = find_sandbox_nasm(env)) return boxed;
-
-    if (!quiet)
-        print_status("Bootstrap", "nasm into mcpp sandbox (one-time)");
-    mcpp::log::ScopedTimer _t_nasm("init", "bootstrap nasm");
-    int rc = install_with_progress(env, "xim:nasm", cb, quiet);
-    if (rc != 0 && !quiet) {
-        std::println(stderr,
-            "warning: failed to bootstrap nasm into mcpp sandbox (exit {})", rc);
     }
     return find_sandbox_nasm(env);
 }
