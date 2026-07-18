@@ -96,7 +96,8 @@ std::string local_include_flags(const CompileUnit& cu) {
     return flags;
 }
 
-std::string join_flags(const std::vector<std::string>& flags) {
+std::string join_flags(const std::vector<std::string>& flags,
+                        bool shellQuote = true) {
     // mcpp#234: each vector element is already one argv token (e.g. a
     // manifest define `T=long long` arrives here as the single element
     // `-DT=long long`, pushed whole by apply_glob_flags) — but joining with
@@ -104,10 +105,18 @@ std::string join_flags(const std::vector<std::string>& flags) {
     // words once ninja handed the resolved command line to the shell.
     // shell_quote_arg is a no-op for tokens with nothing shell-significant
     // (`-std=c++23`, `-O2`, ...), so plain flags are untouched.
+    //
+    // shellQuote=false for mcpp-GENERATED link flags (lu.linkFlags): those
+    // are already correctly shell-quoted + ninja-escaped at construction
+    // (e.g. the rpath token `-Wl,-rpath,'$$ORIGIN'` from plan.cppm — single
+    // quotes protect it from shell $-expansion, `$$` is ninja's literal `$`).
+    // Re-running shell_quote_arg over such a token DOUBLE-quotes it, baking a
+    // literal `'$ORIGIN'` (quotes included) into the binary's RUNPATH so the
+    // dynamic linker can't resolve dependency .so's placed next to the exe.
     std::string out;
     for (auto const& flag : flags) {
         out += ' ';
-        out += shell_quote_arg(flag);
+        out += shellQuote ? shell_quote_arg(flag) : flag;
     }
     return out;
 }
@@ -889,7 +898,7 @@ std::string emit_ninja_string(const BuildPlan& plan) {
             // binaries run on the build host and use the system -lc++,
             // distributable targets get the static LLVM libc++. See
             // CompileFlags::ldStdlibDefault/ldStdlibTest.
-            std::string unit = join_flags(lu.linkFlags);
+            std::string unit = join_flags(lu.linkFlags, /*shellQuote=*/false);
             unit += (lu.kind == mcpp::build::LinkUnit::TestBinary)
                 ? flags.ldStdlibTest : flags.ldStdlibDefault;
             if (!unit.empty())

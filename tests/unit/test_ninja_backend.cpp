@@ -324,6 +324,38 @@ TEST(NinjaBackend, PlainFlagsPassThroughUnquoted) {
         << ninja;
 }
 
+// Regression: mcpp-GENERATED per-unit LINK flags are already correctly
+// shell-quoted + ninja-escaped at construction — e.g. the shared-dep rpath
+// token `-Wl,-rpath,'$$ORIGIN'` (single quotes stop shell $-expansion, `$$`
+// is ninja's literal `$`). join_flags for link flags must NOT re-run
+// shell_quote_arg over them: doing so double-quotes the token, baking a
+// literal `'$ORIGIN'` (quotes included) into the binary's RUNPATH so the
+// dynamic linker can't find dependency .so's next to the exe (e2e 55-57/64).
+TEST(NinjaBackend, LinkFlagsAreNotReQuoted) {
+    auto plan = minimal_plan();
+    plan.compileUnits.push_back({
+        .source = "src/main.cpp",
+        .object = "obj/main.o",
+        .packageName = "rpath_test",
+    });
+    plan.linkUnits.push_back({
+        .targetName = "app",
+        .kind = mcpp::build::LinkUnit::Binary,
+        .objects = {"obj/main.o"},
+        .linkFlags = {"-Wl,-rpath,'$$ORIGIN'"},
+        .output = "bin/app",
+        .entryMain = "src/main.cpp",
+    });
+
+    auto ninja = emit_ninja_string(plan);
+
+    // The rpath token passes through verbatim (ninja `$$` = literal `$`).
+    EXPECT_NE(ninja.find("-Wl,-rpath,'$$ORIGIN'"), std::string::npos) << ninja;
+    // Must NOT be double-quoted: shell_quote_arg escaping an embedded `'`
+    // produces the `'\''` sequence, which only appears if it re-quoted.
+    EXPECT_EQ(ninja.find("'\\''"), std::string::npos) << ninja;
+}
+
 TEST(NinjaBackend, RootPackageCxxflagsAreEmittedOncePerUnit) {
     auto plan = minimal_plan();
     plan.manifest.buildConfig.cxxflags = {"-DROOT_FLAG=1"};
