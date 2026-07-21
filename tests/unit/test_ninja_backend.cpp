@@ -539,3 +539,263 @@ TEST(NinjaBackend, RootPackageCxxflagsAreEmittedOncePerUnit) {
     EXPECT_EQ(ninja.find("cxxflags  = -std=c++23 -O2 -DROOT_FLAG=1"), std::string::npos)
         << ninja;
 }
+
+// mcpp#261: the clang scan rule used shell redirection (`> $out`), which on
+// Windows forced a `cmd /c` wrapper and with it cmd.exe's 8191-char command
+// line ceiling — a quarter of what ninja's CreateProcess path allows. Any
+// package with a large include-dir list overran it. clang-scan-deps has -o
+// (LLVM 17+), so the redirect and the wrapper are both unnecessary.
+TEST(NinjaBackend, ClangScanRuleWritesViaDashOWithoutShellRedirection) {
+    auto plan = minimal_plan();
+    plan.toolchain.compiler = mcpp::toolchain::CompilerId::Clang;
+    plan.toolchain.binaryPath = "/usr/bin/clang++";
+    plan.scanDepsPath = "/usr/bin/clang-scan-deps";
+    plan.compileUnits.push_back({
+        .source = "src/m.cppm",
+        .object = "obj/m.o",
+        .packageName = "objc_rule_test",
+        .providesModule = "m",
+    });
+
+    auto ninja = emit_ninja_string(plan);
+
+    auto scanRule = ninja.find("rule cxx_scan");
+    ASSERT_NE(scanRule, std::string::npos) << ninja;
+    auto scanEnd = ninja.find("description = SCAN", scanRule);
+    ASSERT_NE(scanEnd, std::string::npos) << ninja;
+    auto rule = ninja.substr(scanRule, scanEnd - scanRule);
+
+    EXPECT_NE(rule.find("-format=p1689 -o $out --"), std::string::npos) << rule;
+    EXPECT_EQ(rule.find("> $out"), std::string::npos)
+        << "scan rule must not use shell redirection: " << rule;
+}
+
+// The `cmd /c` wrapper was the only place mcpp put a shell between ninja and
+// a compiler invocation. Keep it gone: it is what re-imposes the 8191 ceiling.
+TEST(NinjaBackend, NoRuleWrapsItsCommandInCmdSlashC) {
+    for (auto compiler : {mcpp::toolchain::CompilerId::GCC,
+                          mcpp::toolchain::CompilerId::Clang}) {
+        auto plan = minimal_plan();
+        plan.toolchain.compiler = compiler;
+        if (compiler == mcpp::toolchain::CompilerId::Clang) {
+            plan.toolchain.binaryPath = "/usr/bin/clang++";
+            plan.scanDepsPath = "/usr/bin/clang-scan-deps";
+        }
+        plan.compileUnits.push_back({
+            .source = "src/m.cppm",
+            .object = "obj/m.o",
+            .packageName = "objc_rule_test",
+            .providesModule = "m",
+        });
+
+        auto ninja = emit_ninja_string(plan);
+        EXPECT_EQ(ninja.find("cmd /c"), std::string::npos)
+            << "compiler=" << static_cast<int>(compiler) << "\n" << ninja;
+    }
+}
+
+// mcpp#261: the compile and scan rules carry an UNBOUNDED flag payload —
+// one -I per dependency include dir — and on Windows ninja spawns through
+// CreateProcess (32767-char ceiling). They now route that payload through a
+// response file, the same mitigation #247 gave the link rules for the same
+// reason. Reachable from a POSIX test host via the msvc dialect, which only
+// ever runs on Windows. NASM is excluded on purpose (it spells response
+// files `-@ file`), and POSIX keeps the inline form byte-identical.
+TEST(NinjaBackend, CompileAndScanRulesRouteFlagsThroughRspfileUnderMsvcDialect) {
+    auto plan = minimal_plan();
+    plan.toolchain.compiler = mcpp::toolchain::CompilerId::MSVC;
+    plan.toolchain.binaryPath = "cl.exe";
+    plan.compileUnits.push_back({
+        .source = "src/m.cppm",
+        .object = "obj/m.o",
+        .packageName = "objc_rule_test",
+        .providesModule = "m",
+    });
+    plan.compileUnits.push_back({
+        .source = "src/a.c",
+        .object = "obj/a.o",
+        .packageName = "objc_rule_test",
+    });
+
+    auto ninja = emit_ninja_string(plan);
+
+    // cxx_module and cxx_object pick their Windows shape through
+    // `if constexpr (is_windows)`, so their response-file form is only
+    // reachable on a Windows host; c_object and cxx_scan have no such
+    // compile-time branch and are assertable everywhere.
+    std::vector<std::string_view> rules{"rule c_object\n", "rule cxx_scan\n"};
+    if constexpr (mcpp::platform::is_windows) {
+        rules.push_back("rule cxx_module\n");
+        rules.push_back("rule cxx_object\n");
+    }
+    for (std::string_view rule : rules) {
+        auto start = ninja.find(rule);
+        ASSERT_NE(start, std::string::npos) << rule << "\n" << ninja;
+        auto end = ninja.find("\n\n", start);
+        ASSERT_NE(end, std::string::npos) << ninja;
+        auto body = ninja.substr(start, end - start);
+
+        EXPECT_NE(body.find("@$out.rsp"), std::string::npos) << body;
+        EXPECT_NE(body.find("rspfile = $out.rsp"), std::string::npos) << body;
+        // ONLY $local_includes may live in the response file: its content
+        // is tokenized GNU-style (backslash = escape), and those are the
+        // only paths this file forward-slashes itself. $cxxflags carries
+        // native-separated paths from flags.cppm and must stay inline —
+        // routing it through the rsp ate the separators of the std.pcm path
+        // and broke every `import std;` on Windows.
+        EXPECT_NE(body.find("rspfile_content = $local_includes\n"),
+                  std::string::npos) << body;
+        // The payload must not ALSO remain inline, or the ceiling stands.
+        auto cmdStart = body.find("command = ");
+        auto cmdEnd = body.find('\n', cmdStart);
+        auto cmd = body.substr(cmdStart, cmdEnd - cmdStart);
+        EXPECT_EQ(cmd.find("$local_includes"), std::string::npos) << cmd;
+        // ...and the flags that must NOT move off the command line stay there.
+        if (rule != "rule c_object\n")
+            EXPECT_NE(cmd.find("$cxxflags"), std::string::npos) << cmd;
+        else
+            EXPECT_NE(cmd.find("$cflags"), std::string::npos) << cmd;
+    }
+}
+
+// POSIX must keep the inline form: ARG_MAX is ample and an inline command is
+// far easier to re-run by hand. This is the byte-identity guard for the
+// #261 change on the platform where it must be a no-op.
+TEST(NinjaBackend, CompileRulesStayInlineOnPosixDrivers) {
+    if constexpr (mcpp::platform::is_windows) {
+        GTEST_SKIP() << "inline form is Windows-exempt by design";
+    } else {
+        auto plan = minimal_plan();  // GCC → gnu dialect, non-msvc deps
+        plan.compileUnits.push_back({
+            .source = "src/a.c",
+            .object = "obj/a.o",
+            .packageName = "objc_rule_test",
+        });
+
+        auto ninja = emit_ninja_string(plan);
+
+        for (std::string_view rule : {"rule cxx_module\n", "rule cxx_object\n",
+                                      "rule c_object\n"}) {
+            auto start = ninja.find(rule);
+            ASSERT_NE(start, std::string::npos) << rule << "\n" << ninja;
+            auto end = ninja.find("\n\n", start);
+            ASSERT_NE(end, std::string::npos) << ninja;
+            auto body = ninja.substr(start, end - start);
+            EXPECT_EQ(body.find("rspfile"), std::string::npos) << body;
+            EXPECT_NE(body.find("$local_includes"), std::string::npos) << body;
+        }
+    }
+}
+
+// mcpp#257: "emit a depfile" and "strip GCC's reversed module rules" are two
+// decisions; 0.0.97 conflated them and left Clang with no include tracking
+// at all. Clang emits a single plain make rule (measured on 20.1.7/22.1.8),
+// so it takes the depfile WITHOUT the awk filter, writing -MF straight to
+// $out.d.
+TEST(NinjaBackend, ClangGetsDepfileWithoutTheGccModuleRuleFilter) {
+    if constexpr (mcpp::platform::is_windows)
+        GTEST_SKIP() << "POSIX depfile shape only";
+
+    auto plan = minimal_plan();
+    plan.toolchain.compiler = mcpp::toolchain::CompilerId::Clang;
+    plan.toolchain.binaryPath = "/usr/bin/clang++";
+
+    auto ninja = emit_ninja_string(plan);
+
+    auto module_rule_start = ninja.find("rule cxx_module");
+    auto object_rule_start = ninja.find("rule cxx_object");
+    ASSERT_NE(module_rule_start, std::string::npos) << ninja;
+    ASSERT_NE(object_rule_start, std::string::npos) << ninja;
+    auto module_rule = ninja.substr(module_rule_start,
+                                    object_rule_start - module_rule_start);
+
+    EXPECT_NE(module_rule.find("-MMD -MF $out.d"), std::string::npos) << ninja;
+    EXPECT_NE(module_rule.find("deps = gcc"), std::string::npos) << ninja;
+    EXPECT_NE(module_rule.find("depfile = $out.d\n"), std::string::npos) << ninja;
+    // No scratch file and no filter: there is nothing to strip.
+    EXPECT_EQ(module_rule.find("$out.d.raw"), std::string::npos) << ninja;
+    EXPECT_EQ(module_rule.find("awk"), std::string::npos) << ninja;
+}
+
+// The other half of the same asymmetry: C and GAS edges include headers too
+// and had no depfile on ANY toolchain.
+TEST(NinjaBackend, CAndAsmRulesAlsoTrackHeaderDeps) {
+    if constexpr (mcpp::platform::is_windows)
+        GTEST_SKIP() << "POSIX depfile shape only";
+
+    auto plan = minimal_plan();
+    plan.compileUnits.push_back({
+        .source = "src/a.c",
+        .object = "obj/a.o",
+        .packageName = "objc_rule_test",
+    });
+    plan.compileUnits.push_back({
+        .source = "src/b.S",
+        .object = "obj/b.o",
+        .packageName = "objc_rule_test",
+    });
+
+    auto ninja = emit_ninja_string(plan);
+
+    for (std::string_view rule : {"rule c_object\n", "rule asm_object\n"}) {
+        // NOTE: asm_object is the `.S` rule. `.s` uses asm_object_raw and
+        // deliberately has no depfile — see below.
+        auto start = ninja.find(rule);
+        ASSERT_NE(start, std::string::npos) << rule << "\n" << ninja;
+        auto end = ninja.find("\n\n", start);
+        ASSERT_NE(end, std::string::npos) << ninja;
+        auto body = ninja.substr(start, end - start);
+        EXPECT_NE(body.find("-MMD -MF $out.d"), std::string::npos) << body;
+        EXPECT_NE(body.find("deps = gcc"), std::string::npos) << body;
+        EXPECT_NE(body.find("depfile = $out.d"), std::string::npos) << body;
+        // C/GAS units never carry module reversed-rules — no filter, and so
+        // no scratch file to bind by mistake.
+        EXPECT_EQ(body.find("$out.d.raw"), std::string::npos) << body;
+        EXPECT_EQ(body.find("awk"), std::string::npos) << body;
+    }
+}
+
+// The C driver preprocesses `.S` but not `.s`, so only `.S` can produce a
+// depfile. Asking anyway makes clang emit "argument unused during
+// compilation: '-MMD'" for every such file and write nothing, and ninja's
+// `deps = gcc` treats an absent depfile as an error — so the two cases need
+// separate rules.
+TEST(NinjaBackend, LowercaseAsmHasNoDepfileAndItsOwnRule) {
+    if constexpr (mcpp::platform::is_windows)
+        GTEST_SKIP() << "POSIX depfile shape only";
+
+    auto plan = minimal_plan();
+    plan.compileUnits.push_back({
+        .source = "src/upper.S",
+        .object = "obj/upper.o",
+        .packageName = "objc_rule_test",
+    });
+    plan.compileUnits.push_back({
+        .source = "src/lower.s",
+        .object = "obj/lower.o",
+        .packageName = "objc_rule_test",
+    });
+
+    auto ninja = emit_ninja_string(plan);
+
+    auto body_of = [&](std::string_view rule) {
+        auto start = ninja.find(rule);
+        EXPECT_NE(start, std::string::npos) << rule << "\n" << ninja;
+        auto end = ninja.find("\n\n", start);
+        return ninja.substr(start, end - start);
+    };
+
+    auto upper = body_of("rule asm_object\n");
+    EXPECT_NE(upper.find("-MMD -MF $out.d"), std::string::npos) << upper;
+    EXPECT_NE(upper.find("depfile = $out.d"), std::string::npos) << upper;
+
+    auto lower = body_of("rule asm_object_raw\n");
+    EXPECT_EQ(lower.find("-MMD"), std::string::npos) << lower;
+    EXPECT_EQ(lower.find("depfile"), std::string::npos) << lower;
+
+    // And the edges must be routed to the matching rule.
+    EXPECT_NE(ninja.find("build obj/upper.o : asm_object src/upper.S"),
+              std::string::npos) << ninja;
+    EXPECT_NE(ninja.find("build obj/lower.o : asm_object_raw src/lower.s"),
+              std::string::npos) << ninja;
+}

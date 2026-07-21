@@ -10,6 +10,8 @@ module;
 export module mcpp.build.prepare;
 
 import std;
+import mcpp.diag;
+import mcpp.platform.axis;
 import mcpp.libs.json;
 import mcpp.log;
 import mcpp.manifest;
@@ -422,22 +424,21 @@ materialize_generated_files(const std::filesystem::path& root,
 // merged into the dependency map BEFORE resolution even starts, so a
 // dependency's own conditional deps are out of scope — see the root cfg
 // block that merges `cc.dependencies` etc.)
-void merge_conditional_sources_flags(mcpp::manifest::Manifest& m,
+void merge_conditional_build_inputs(mcpp::manifest::Manifest& m,
                              const cfgpred::Ctx& ctx,
                              std::string_view targetTriple)
 {
     for (auto const& cc : m.conditionalConfigs) {
         if (!cfgpred::matches(cc.predicate, ctx, targetTriple)) continue;
-        m.buildConfig.cflags.insert(m.buildConfig.cflags.end(),
-                                    cc.cflags.begin(), cc.cflags.end());
-        m.buildConfig.cxxflags.insert(m.buildConfig.cxxflags.end(),
-                                      cc.cxxflags.begin(), cc.cxxflags.end());
-        m.buildConfig.ldflags.insert(m.buildConfig.ldflags.end(),
-                                     cc.ldflags.begin(), cc.ldflags.end());
-        for (auto const& s : cc.sources) {
-            m.buildConfig.sources.push_back(s);
+        // One append() for every field the axis may carry (#258). Matching
+        // sections land AFTER the base entries, so a conditional rule beats
+        // a broader unconditional one under GNU last-wins — which is what
+        // makes an off-OS REMOVAL expressible (`-U` after the base `-D`).
+        mcpp::manifest::append(m.buildConfig, cc.inputs);
+        // `modules.sources` is the scanner's own view and is not part of
+        // BuildInputs, so conditional sources are mirrored into it here.
+        for (auto const& s : cc.inputs.sources)
             m.modules.sources.push_back(s);
-        }
     }
 }
 
@@ -546,6 +547,11 @@ bool graph_or_targets_import_std(const mcpp::modgraph::Graph& graph,
 }
 
 export struct BuildContext {
+    // --strict: degradations reported through mcpp::diag become errors.
+    // Carried on the context because the build's degradations are discovered
+    // during backend emission, i.e. after prepare_build has returned — the
+    // single place that settles the policy is run_build_plan (execute.cppm).
+    bool                            strict = false;
     mcpp::manifest::Manifest        manifest;
     mcpp::toolchain::Toolchain      tc;
     mcpp::toolchain::Fingerprint    fp;
@@ -722,7 +728,7 @@ prepare_build(bool print_fingerprint,
     // feature/platform schema checks below.
     for (auto const& w : m->schemaWarnings) {
         if (overrides.strict) return std::unexpected(w);
-        std::println(stderr, "warning: {}", w);
+        mcpp::diag::warning("manifest/schema", w);
     }
 
     // ─── Toolchain resolution (docs/21) ────────────────────────────────
@@ -804,7 +810,7 @@ prepare_build(bool print_fingerprint,
                 "[package] platforms contains unknown platform '{}' "
                 "(expected: linux | macos | windows)", pf);
             if (overrides.strict) return std::unexpected(msg);
-            std::println(stderr, "warning: {}", msg);
+            mcpp::diag::warning("manifest/platforms", msg);
         }
     }
 
@@ -892,12 +898,27 @@ prepare_build(bool print_fingerprint,
     }
     if (overrides.force_static) m->buildConfig.linkage = "static";
 
+    // #254: everything compiled INTO this build is resolved for the TARGET —
+    // an xpkg descriptor's per-OS sections (sources, flags, deps) and its xpm
+    // asset/version table all describe code that will run on the target, not
+    // on the machine building it. Previously a compile-time host constant,
+    // which is invisible natively (host == target) and picks the wrong leg
+    // under --target.
+    //
+    // Computed HERE, not earlier: `overrides.target_triple` is only complete
+    // above — it is filled from `[build] target` and the config default, then
+    // canonicalized. Reading it before that point would silently fall back to
+    // the host for any project that sets its target in the manifest rather
+    // than on the command line.
+    const auto targetPlatform = mcpp::platform::TargetPlatform::for_os(
+        cfgpred::context_for(overrides.target_triple).os);
+
     // ── L1: merge conditional [target.'cfg(...)'.build] sources/flags AND
     // root-only [target.'cfg(...)'.dependencies] ─────────────────────────────
     // Evaluated now (target resolved) against the resolved target — the
     // --target triple for a cross build, else the host.
     //
-    // #229: merge_conditional_sources_flags MUST run here — before
+    // #229: merge_conditional_build_inputs MUST run here — before
     // `packages[0] = makePackageRoot(*root, *m)` snapshots `m->buildConfig`
     // into `packages[0].privateBuild`/`.manifest` — because that snapshot,
     // not `*m`, is what the modgraph scan and per-TU compile-flag assembly
@@ -909,7 +930,7 @@ prepare_build(bool print_fingerprint,
     // merged exactly once, immediately before it is captured into `packages[]`.
     if (!m->conditionalConfigs.empty()) {
         auto cc_ctx = cfgpred::context_for(overrides.target_triple);
-        merge_conditional_sources_flags(*m, cc_ctx, overrides.target_triple);
+        merge_conditional_build_inputs(*m, cc_ctx, overrides.target_triple);
         for (auto const& cc : m->conditionalConfigs) {
             if (!cfgpred::matches(cc.predicate, cc_ctx, overrides.target_triple))
                 continue;
@@ -1395,7 +1416,7 @@ prepare_build(bool print_fingerprint,
         // 0.0.10+: use structured namespace from DependencySpec.
         auto resolved = mcpp::pm::resolve_semver(
             s.namespace_, s.shortName.empty() ? depName : s.shortName,
-            s.version, fetcher);
+            s.version, fetcher, targetPlatform);
         if (!resolved) return std::unexpected(resolved.error());
         mcpp::ui::info("Resolved",
             std::format("{} {} → v{}", depName, s.version, *resolved));
@@ -1587,7 +1608,7 @@ prepare_build(bool print_fingerprint,
             }
             if (field.kind == mcpp::manifest::McppField::TableBody) {
                 auto dm = mcpp::manifest::synthesize_from_xpkg_lua(
-                    *luaContent, depName, version);
+                    *luaContent, depName, version, targetPlatform);
                 if (!dm) return false;
                 for (auto const& [generatedPath, _] : dm->buildConfig.generatedFiles) {
                     if (!generatedPath.empty()) return true;
@@ -1635,7 +1656,7 @@ prepare_build(bool print_fingerprint,
                 auto field = mcpp::manifest::extract_mcpp_field(*luaContent);
                 if (field.kind == mcpp::manifest::McppField::TableBody) {
                     auto depManifest = mcpp::manifest::synthesize_from_xpkg_lua(
-                        *luaContent, depName, version);
+                        *luaContent, depName, version, targetPlatform);
                     if (!depManifest) {
                         return std::unexpected(std::format(
                             "dependency '{}': {}", depName, depManifest.error().format()));
@@ -1811,7 +1832,8 @@ prepare_build(bool print_fingerprint,
                 "(expected exactly one)", depName, field.value, matches.size()));
             if (auto r = loadFrom(matches.front()); !r) return std::unexpected(r.error());
         } else if (field.kind == mcpp::manifest::McppField::TableBody) {
-            auto dm = mcpp::manifest::synthesize_from_xpkg_lua(*luaContent, depName, version);
+            auto dm = mcpp::manifest::synthesize_from_xpkg_lua(
+                *luaContent, depName, version, targetPlatform);
             if (!dm) return std::unexpected(std::format(
                 "dependency '{}': {}", depName, dm.error().format()));
             warn_unknown_xpkg_keys(*dm, depName);
@@ -1868,7 +1890,7 @@ prepare_build(bool print_fingerprint,
         // just keyed off a different loading branch since path/git deps never
         // pass through loadVersionDep.
         if (!manifest->conditionalConfigs.empty()) {
-            merge_conditional_sources_flags(*manifest,
+            merge_conditional_build_inputs(*manifest,
                                     cfgpred::context_for(overrides.target_triple),
                                     overrides.target_triple);
         }
@@ -2298,7 +2320,7 @@ prepare_build(bool print_fingerprint,
                     "'{}/{}') which is not declared in [dependencies] or "
                     "[feature-deps]", f, parentName, depKey, depKey, depFeat);
                 if (overrides.strict) return std::unexpected(msg);
-                std::println(stderr, "warning: {}", msg);
+                mcpp::diag::warning("features/forwarding", msg);
             }
         }
         return {};
@@ -2396,7 +2418,7 @@ prepare_build(bool print_fingerprint,
                     key.ns, key.shortName,
                     it->second.constraint,
                     item.originalConstraint,
-                    fetcher);
+                    fetcher, targetPlatform);
                 if (!merged) {
                     // Level 1 fallback: multi-version mangling. Two
                     // versions can't be reconciled by SemVer, but they
@@ -2759,7 +2781,7 @@ prepare_build(bool print_fingerprint,
             // BEFORE `propagateLinkFlags`/`makePackageRoot` below, which
             // snapshot this manifest's flags/sources into `packages[]`.
             if (!dep_manifest->conditionalConfigs.empty()) {
-                merge_conditional_sources_flags(*dep_manifest,
+                merge_conditional_build_inputs(*dep_manifest,
                     cfgpred::context_for(overrides.target_triple),
                     overrides.target_triple);
             }
@@ -2998,13 +3020,24 @@ prepare_build(bool print_fingerprint,
             // sources ADD above, `mcpp build` and `mcpp test` must agree
             // (0.0.94 dual-path invariant). featureOrigin tags the entry so
             // the scanner's zero-hit warning can name the owning feature.
+            //
+            // Routed through the SAME append(BuildInputs&) the cfg axis uses
+            // (#258): both axes are contributing additive build inputs, so
+            // "how does a contribution combine with the base" must have one
+            // answer. Only the flags half of the feature axis is expressible
+            // that way — feature `sources` above carry DROP-then-ADD
+            // semantics, and feature `defines` are interface contributions
+            // that propagate along Public edges, so neither is a plain
+            // append and neither belongs in BuildInputs.
             for (auto& [f, entries] : bc.featureFlags) {
                 if (std::ranges::find(active, f) == active.end()) continue;
+                mcpp::manifest::BuildInputs contribution;
                 for (auto const& gf : entries) {
                     auto tagged = gf;
                     tagged.featureOrigin = f;
-                    bc.globFlags.push_back(std::move(tagged));
+                    contribution.globFlags.push_back(std::move(tagged));
                 }
+                mcpp::manifest::append(bc, contribution);
             }
         };
         if (!packages.empty()) {
@@ -3025,7 +3058,7 @@ prepare_build(bool print_fingerprint,
                 auto msg = std::format(
                     "--features requests '{}' which [features] does not declare", *bad);
                 if (overrides.strict) return std::unexpected(msg);
-                std::println(stderr, "warning: {}", msg);
+                mcpp::diag::warning("features/request", msg);
             }
             apply(packages[0], rootReq);
             for (auto& f : activate(*m, rootReq)) activeRootFeatures.insert(f);
@@ -3063,7 +3096,7 @@ prepare_build(bool print_fingerprint,
                         "dependency '{}' does not declare requested feature '{}' "
                         "in its [features] table", pname, f);
                     if (overrides.strict) return std::unexpected(msg);
-                    std::println(stderr, "warning: {}", msg);
+                    mcpp::diag::warning("features/request", msg);
                 }
             }
             // Always apply: even with no requested/default feature, a dep with
@@ -3365,13 +3398,14 @@ prepare_build(bool print_fingerprint,
         return std::unexpected(msg);
     }
     for (auto& w : scan.warnings) {
-        std::println(stderr, "warning: {}", w.format());
+        mcpp::diag::warning("modgraph/scan", w.format());
     }
 
     auto report = mcpp::modgraph::validate(scan.graph, *m, *root);
     for (auto& w : report.warnings) {
-        if (w.path.empty()) std::println(stderr, "warning: {}", w.message);
-        else std::println(stderr, "warning: {}: {}", w.path.string(), w.message);
+        if (w.path.empty()) mcpp::diag::warning("modgraph/validate", w.message);
+        else mcpp::diag::warning("modgraph/validate",
+                                 std::format("{}: {}", w.path.string(), w.message));
     }
     if (!report.ok()) {
         std::string msg = "validation errors:\n";
@@ -3438,6 +3472,7 @@ prepare_build(bool print_fingerprint,
     }
 
     BuildContext ctx;
+    ctx.strict      = overrides.strict;
     ctx.manifest    = *m;
     ctx.tc          = *tc;
     ctx.fp          = fp;
