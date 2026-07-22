@@ -33,7 +33,10 @@ struct Env {
 namespace pinned {
     inline constexpr std::string_view kPatchelfVersion = "0.18.0";
     inline constexpr std::string_view kNinjaVersion    = "1.12.1";
-    inline constexpr std::string_view kXlingsVersion   = "0.4.51";
+    // Keep in lock-step with the XLINGS_VERSION pins in release.yml /
+    // cross-build-test.yml / ci-linux-e2e.yml (the xlings actually bundled
+    // into releases). Printed by `mcpp self env`.
+    inline constexpr std::string_view kXlingsVersion   = "0.4.68";
     inline constexpr std::string_view kNasmVersion     = "3.02";
 }
 
@@ -247,8 +250,19 @@ struct ProjectEnv {
     }
 };
 
+// One index_repos entry for seed_xlings_json. `artifact`/`source` are the
+// xlings >= 0.4.68 per-repo artifact-sync fields (#269); empty means "do not
+// emit the key", which keeps pre-artifact output byte-identical and matches
+// xlings' "undeclared = plain git" semantics. Older xlings ignores both keys.
+struct SeedRepo {
+    std::string name;
+    std::string url;
+    std::string artifact;   // artifact source base, e.g. https://github.com/xlings-res/mcpp-index
+    std::string source;     // "auto" | "artifact" | "git"
+};
+
 void seed_xlings_json(const Env& env,
-                      std::span<const std::pair<std::string,std::string>> repos,
+                      std::span<const SeedRepo> repos,
                       std::string_view mirror = "auto",
                       const ProjectEnv& penv = {});
 
@@ -1108,7 +1122,7 @@ int install_direct(const Env& env, std::string_view target, bool quiet) {
 // ─── Sandbox lifecycle ──────────────────────────────────────────────
 
 void seed_xlings_json(const Env& env,
-                      std::span<const std::pair<std::string,std::string>> repos,
+                      std::span<const SeedRepo> repos,
                       std::string_view mirror,
                       const ProjectEnv& penv)
 {
@@ -1116,10 +1130,16 @@ void seed_xlings_json(const Env& env,
     std::string json = "{\n";
     json += "  \"index_repos\": [\n";
     for (std::size_t i = 0; i < repos.size(); ++i) {
-        json += std::format("    {{ \"name\": \"{}\", \"url\": \"{}\" }}{}\n",
-                            json_escape(repos[i].first),
-                            json_escape(repos[i].second),
-                            i + 1 == repos.size() ? "" : ",");
+        json += std::format("    {{ \"name\": \"{}\", \"url\": \"{}\"",
+                            json_escape(repos[i].name),
+                            json_escape(repos[i].url));
+        if (!repos[i].artifact.empty())
+            json += std::format(", \"artifact\": \"{}\"",
+                                json_escape(repos[i].artifact));
+        if (!repos[i].source.empty())
+            json += std::format(", \"source\": \"{}\"",
+                                json_escape(repos[i].source));
+        json += std::format(" }}{}\n", i + 1 == repos.size() ? "" : ",");
     }
     json += "  ],\n";
     // [xlings] build environment (L-1): materialize deps/workspace/subos/envs
