@@ -125,6 +125,26 @@ export int cmd_test(const mcpplibs::cmdline::ParsedArgs& parsed,
     ov.strict = parsed.is_flag_set("strict");
     if (auto p = parsed.value("package")) ov.package_filter = *p;
 
+    mcpp::build::TestOptions to;
+    if (parsed.positional_count() > 0) to.filter = parsed.positional(0);
+    to.list = parsed.is_flag_set("list");
+    if (auto ts = parsed.value("timeout")) {
+        int secs = 0;
+        auto [p, ec] = std::from_chars(ts->data(), ts->data() + ts->size(), secs);
+        if (ec != std::errc{} || p != ts->data() + ts->size() || secs < 0) {
+            mcpp::ui::error(std::format("invalid --timeout '{}' (whole seconds >= 0)", *ts));
+            return 2;
+        }
+        to.timeoutSecs = secs;
+    }
+    if (auto mf = parsed.value("message-format")) {
+        if (*mf == "json")       to.format = mcpp::build::TestMessageFormat::Json;
+        else if (*mf != "human") {
+            mcpp::ui::error(std::format("unknown --message-format '{}' (human|json)", *mf));
+            return 2;
+        }
+    }
+
     // Workspace fan-out: test every member through run_tests (which scopes its
     // discovery to the member). Continue-on-failure + per-member summary so one
     // red member never hides the rest.
@@ -136,7 +156,7 @@ export int cmd_test(const mcpplibs::cmdline::ParsedArgs& parsed,
             mcpp::build::BuildOverrides mo = ov;
             mo.package_filter = mp;
             mcpp::ui::status("Workspace", std::format("testing member '{}'", mp));
-            int r = mcpp::build::run_tests(passthrough, mo);
+            int r = mcpp::build::run_tests(passthrough, mo, to);
             if (r != 0) { rc = r; failed.push_back(mp); }
         }
         if (failed.empty())
@@ -149,7 +169,7 @@ export int cmd_test(const mcpplibs::cmdline::ParsedArgs& parsed,
                     return s; }()));
         return rc;
     }
-    return mcpp::build::run_tests(passthrough, ov);
+    return mcpp::build::run_tests(passthrough, ov, to);
 }
 
 export int cmd_clean(const mcpplibs::cmdline::ParsedArgs& parsed) {

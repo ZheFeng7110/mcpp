@@ -3,6 +3,38 @@
 > 本文件追踪 `mcpp-community/mcpp` 公开仓的版本演进。
 > 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [0.0.104] — 2026-07-24
+
+> `mcpp test` 能力批次(两轮):逐测试编译隔离、子目录路径命名、过滤器、JSON 输出——四项均为通用能力(cargo/ctest 同形),首个下游消费者是 d2mcpp「练习即测试」重设计(见 d2mcpp 仓 `.agents/docs/2026-07-23-exercises-as-tests-design.md` §4,验收标准即出自该文档)。实施计划见 `.agents/docs/2026-07-23-test-isolation-json-plan.md`。
+
+### 新增
+
+- **`mcpp test` 逐测试编译隔离**:两阶段构建——Phase A 先建包级共享前置(全部非测试 main 的编译单元 + 非测试 link 产物),失败是**包级错误**(报 build failed,绝不渲染成 N 个红测试);Phase B 每个测试作为独立 ninja goal 构建,编译失败只标记**该测试** `FAIL (compile)`(诊断按测试分组输出到 stderr),其余照常编译运行。此前一个编译不过的测试会让整轮 `error: build failed` 零执行。
+- **测试按 `tests/` 相对路径命名**:`tests/00-a/0.cpp` → `00-a/0`,子目录下同名 stem 不再冲突(此前直接 `duplicate test name` 硬错);平铺布局名字不变。
+- **`mcpp test <pattern>`**:按路径名子串过滤要构建/运行的测试。过滤只作用于构建/运行阶段——计划始终含全部测试,`compile_commands.json` 保持完整(clangd 依赖)。无匹配时报错退出码 2。
+- **`mcpp test --message-format json`**:NDJSON 输出,逐测试一条记录流式发射(`test`/`status`=`pass|compile_fail|run_fail`/`exit_code`/`signal`/`compile_output`/`run_output`),包级失败单独 `{"error":"package",...}` 记录,末行 `{"summary":...}`;stdout 纯协议流,人读输出全部静默。供 CI/IDE/d2x Provider 消费。
+- **`[build].flags` glob 覆盖测试 TU**:glob 指名文件,是 source 还是 test 是正交的——匹配的条目经既有 per-target flag 通道(#131)挂到合成测试 target 上,per-test 编译选项从此有 toml 承载。配套:死 glob 警告改为「磁盘上无文件匹配」才触发(此前只数被扫描的 source,指向 tests/ 的合法 glob 会被误警)。
+
+### 新增(批次二,设计评审见 `.agents/docs/2026-07-24-mcpp-test-design-review.md`)
+
+- **Phase B 并行化**:逐测试隔离改为「keep-going 全量预构建(-k 0,跨测试并行)+ 逐测试缓存命中验证/失败重试取诊断」——语义不变,49 测试全量墙钟 29s → 3.7s。
+- **`mcpp test --list`**:只枚举(可过滤的)测试,不解析工具链、不构建;`--message-format json` 输出 `{"test":…,"main":…}` 逐行记录 + total 汇总,坏文件同样可列出。供 d2x Provider 等工具做单一真相源发现。
+- **`mcpp test --timeout <secs>`**:每测试运行截止,超时 SIGKILL 并计为 `FAIL (timeout)` / JSON `"timed_out":true`(POSIX;Windows 暂为尽力而为,不生效)。
+- **JSON 记录增加 `duration_ms`**(该测试构建+运行墙钟);schema 只增不改。
+- **信号退出码规范化**:`WIFSIGNALED → 128+WTERMSIG`(shell 惯例)。此前返回原始 wait status——SIGSEGV 仅因 core-dump 位碰巧显示 139,SIGTERM 死亡会伪装成 `exit 15`;JSON 的 `signal` 字段推导从未可靠触发。属 bug 修复。
+
+### 修复
+
+- **嵌套 mcpp 的 `LD_LIBRARY_PATH` 段错误**:外层 `mcpp run` 为其子进程指向私有 glibc payload 的 loader 路径,子进程再 spawn mcpp 时(如课程 Provider 驱动 `mcpp test`),毒化值继续流入内层 mcpp 的工具子进程——sandbox ninja/gcc 加载错配 libc 后在动态链接器里段错误(残片签名 `__vdso_time`)。现在 `merged_environ` 从继承的 `LD_LIBRARY_PATH`/`DYLD_LIBRARY_PATH` 里**只剥离** `xim-x-glibc` payload 条目:用户自己的条目保留,per-child 显式 override 一如既往优先。下游(d2x `platform.cppm`、d2mcpp `runner.cppm`)的 `unsetenv` workaround 可随本版删除。
+
+### 备注
+
+- e2e 新增 152(子目录命名)/153(隔离与包级归因)/154(过滤器)/155(JSON)/156(嵌套 loader 路径免疫)/157(测试 TU 吃 glob flags + 死 glob 判定)/158(信号退出码+duration)/159(--list)/160(--timeout)。
+- 首个下游消费者已完成端到端接入:d2mcpp「练习即测试」迁移(104 练习 zh/en 52/52 全绿)+ d2x checker 引导链路,全程使用本分支 musl 静态二进制。
+- docs 措辞修正:"(gtest style)" → 框架无关表述;记录合成测试名含 `/` 的命名豁免(zh+en)。
+- `BuildOptions::ninjaTargets`(构建计划子集)为支撑性通用接口,空 = 原行为。
+- musl 静态构建(`--target x86_64-linux-musl`)已验证:五个新 e2e 全绿;静态 mcpp 本体对 loader 毒化免疫,与上述修复共同覆盖嵌套链路的两端。
+
 ## [0.0.103] — 2026-07-22
 
 > #267/#269:索引侧健壮化一批——mcpplibs 索引 URL 组织迁移(不再依赖 GitHub 重定向)+ 采纳 xlings 0.4.68 per-repo artifact 来源(索引同步不再硬依赖可用的 git)。设计见 `.agents/docs/2026-07-22-issue267-269-index-artifact-and-org-migration-design.md`。

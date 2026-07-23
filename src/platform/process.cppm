@@ -34,6 +34,11 @@ module;
 #include <unistd.h>    // pipe, dup2, close, read
 #include <sys/wait.h>  // waitpid
 #include <spawn.h>     // posix_spawnp, posix_spawn_file_actions_* (incl. addchdir_np)
+#include <signal.h>    // kill, SIGKILL (deadline runners)
+#include <cerrno>      // errno, EINTR (deadline wait loop)
+#include <poll.h>      // poll (deadline capture)
+#include <fcntl.h>     // fcntl O_NONBLOCK (deadline capture)
+#include <time.h>      // nanosleep (deadline wait loop)
 #if defined(__APPLE__)
 #include <crt_externs.h>  // _NSGetEnviron — direct `environ` is only linkable
                           // from executables on Apple, not from dylibs
@@ -88,6 +93,21 @@ RunResult capture_exec(
     const std::vector<std::pair<std::string, std::string>>& extraEnv = {},
     std::string_view cwd = {});
 
+// Deadline variants (POSIX): kill the child with SIGKILL once `deadline`
+// elapses and set *timed_out. A zero deadline means no limit. On Windows the
+// deadline is currently ignored (no supported kill-by-handle path in the
+// residual shell launcher) — callers must treat the timeout as best-effort.
+int run_exec_deadline(const std::vector<std::string>& argv,
+                      const std::vector<std::pair<std::string, std::string>>& extraEnv,
+                      std::chrono::milliseconds deadline,
+                      bool* timed_out);
+
+RunResult capture_exec_deadline(
+    const std::vector<std::string>& argv,
+    const std::vector<std::pair<std::string, std::string>>& extraEnv,
+    std::chrono::milliseconds deadline,
+    bool* timed_out);
+
 // Run `command` silently (discard stdout/stderr).
 // On POSIX, stdin is automatically redirected from /dev/null.
 int run_silent(std::string_view command);
@@ -137,6 +157,12 @@ int normalize_exit_code(int rc) {
 #else
     if (WIFEXITED(rc))
         return WEXITSTATUS(rc);
+    // Shell convention for signaled children: 128 + signal number. The raw
+    // wait-status word only *happens* to look right when the core-dump bit
+    // is set (SIGSEGV+core → 0x8B = 139); without it a SIGTERM death would
+    // surface as "exit 15" and be indistinguishable from a normal exit code.
+    if (WIFSIGNALED(rc))
+        return 128 + WTERMSIG(rc);
     return rc;
 #endif
 }
@@ -153,6 +179,32 @@ char** host_environ() {
 #endif
 }
 
+// An outer `mcpp run`/`mcpp test` points LD_LIBRARY_PATH at mcpp's private
+// glibc payload so ITS child (a sandbox-linked user binary) can load. When
+// that child spawns mcpp again (e.g. a course provider driving `mcpp test`),
+// the same value would flow on into the inner mcpp's own children — and the
+// sandbox ninja/gcc (host-glibc binaries) then resolve a MISMATCHED libc and
+// segfault inside the dynamic linker before main (trace signature: a bare
+// `__vdso_time` line). Strip exactly the private-glibc payload entries from
+// inherited loader paths: user-supplied entries survive, and an `extra`
+// override (the correct per-child value) always wins over the inherited var.
+std::string strip_private_glibc(std::string_view paths) {
+    std::string cleaned;
+    std::size_t start = 0;
+    while (start <= paths.size()) {
+        auto end = paths.find(':', start);
+        if (end == std::string_view::npos) end = paths.size();
+        auto item = paths.substr(start, end - start);
+        if (!item.empty() && item.find("/xim-x-glibc/") == std::string_view::npos) {
+            if (!cleaned.empty()) cleaned += ':';
+            cleaned += item;
+        }
+        if (end == paths.size()) break;
+        start = end + 1;
+    }
+    return cleaned;
+}
+
 // Build a child environment block = the current environ with `extra` overrides
 // applied. Returned vector owns the strings; the caller derives a NUL-terminated
 // char* array from it. Built in the PARENT so the child env never requires a
@@ -167,7 +219,14 @@ std::vector<std::string> merged_environ(
         std::string_view entry(*e);
         auto eq = entry.find('=');
         std::string key(eq == std::string_view::npos ? entry : entry.substr(0, eq));
-        if (!overridden.contains(key)) out.emplace_back(entry);
+        if (overridden.contains(key)) continue;
+        if (eq != std::string_view::npos
+            && (key == "LD_LIBRARY_PATH" || key == "DYLD_LIBRARY_PATH")) {
+            auto cleaned = strip_private_glibc(entry.substr(eq + 1));
+            if (!cleaned.empty()) out.push_back(key + "=" + cleaned);
+            continue;   // nothing legitimate left → drop the var entirely
+        }
+        out.emplace_back(entry);
     }
     return out;
 }
@@ -409,6 +468,119 @@ RunResult capture_exec(
 #endif
     }
     return capture_with_env(cmd, extraEnv);
+#endif
+}
+
+int run_exec_deadline(const std::vector<std::string>& argv,
+                      const std::vector<std::pair<std::string, std::string>>& extraEnv,
+                      std::chrono::milliseconds deadline,
+                      bool* timed_out)
+{
+    if (timed_out) *timed_out = false;
+    if (deadline.count() <= 0) return run_exec(argv, extraEnv);
+    if (argv.empty()) return 127;
+#if defined(__linux__) || defined(__APPLE__)
+    auto envStore = merged_environ(extraEnv);
+    std::vector<char*> envp;
+    for (auto& s : envStore) envp.push_back(s.data());
+    envp.push_back(nullptr);
+    std::vector<char*> cargv;
+    for (auto& a : argv) cargv.push_back(const_cast<char*>(a.c_str()));
+    cargv.push_back(nullptr);
+
+    pid_t pid = 0;
+    if (::posix_spawnp(&pid, cargv[0], nullptr, nullptr, cargv.data(), envp.data()) != 0)
+        return 127;
+
+    auto until = std::chrono::steady_clock::now() + deadline;
+    int status = 0;
+    for (;;) {
+        pid_t r = ::waitpid(pid, &status, WNOHANG);
+        if (r == pid) return normalize_exit_code(status);
+        if (r < 0 && errno != EINTR) return 127;
+        if (std::chrono::steady_clock::now() >= until) {
+            ::kill(pid, SIGKILL);
+            while (::waitpid(pid, &status, 0) < 0) { /* EINTR retry */ }
+            if (timed_out) *timed_out = true;
+            return normalize_exit_code(status);
+        }
+        struct timespec ts{0, 20'000'000};   // 20ms
+        ::nanosleep(&ts, nullptr);
+    }
+#else
+    // Windows: the residual shell launcher has no kill-by-handle path yet —
+    // run untimed (documented best-effort semantics).
+    return run_exec(argv, extraEnv);
+#endif
+}
+
+RunResult capture_exec_deadline(
+    const std::vector<std::string>& argv,
+    const std::vector<std::pair<std::string, std::string>>& extraEnv,
+    std::chrono::milliseconds deadline,
+    bool* timed_out)
+{
+    if (timed_out) *timed_out = false;
+    if (deadline.count() <= 0) return capture_exec(argv, extraEnv);
+    RunResult result;
+    if (argv.empty()) { result.exit_code = 127; return result; }
+#if defined(__linux__) || defined(__APPLE__)
+    int fds[2];
+    if (::pipe(fds) != 0) { result.exit_code = 127; return result; }
+
+    auto envStore = merged_environ(extraEnv);
+    std::vector<char*> envp;
+    for (auto& s : envStore) envp.push_back(s.data());
+    envp.push_back(nullptr);
+    std::vector<char*> cargv;
+    for (auto& a : argv) cargv.push_back(const_cast<char*>(a.c_str()));
+    cargv.push_back(nullptr);
+
+    posix_spawn_file_actions_t fa;
+    ::posix_spawn_file_actions_init(&fa);
+    ::posix_spawn_file_actions_adddup2(&fa, fds[1], 1);
+    ::posix_spawn_file_actions_adddup2(&fa, fds[1], 2);
+    ::posix_spawn_file_actions_addclose(&fa, fds[0]);
+    ::posix_spawn_file_actions_addclose(&fa, fds[1]);
+
+    pid_t pid = 0;
+    int sp = ::posix_spawnp(&pid, cargv[0], &fa, nullptr, cargv.data(), envp.data());
+    ::posix_spawn_file_actions_destroy(&fa);
+    ::close(fds[1]);
+    if (sp != 0) { ::close(fds[0]); result.exit_code = 127; return result; }
+
+    ::fcntl(fds[0], F_SETFL, ::fcntl(fds[0], F_GETFL) | O_NONBLOCK);
+
+    auto until = std::chrono::steady_clock::now() + deadline;
+    bool killed = false;
+    std::array<char, 4096> buf{};
+    for (;;) {
+        struct pollfd pfd{fds[0], POLLIN, 0};
+        ::poll(&pfd, 1, 50);
+        for (;;) {
+            ssize_t n = ::read(fds[0], buf.data(), buf.size());
+            if (n > 0) { result.output.append(buf.data(), static_cast<size_t>(n)); continue; }
+            break;
+        }
+        int status = 0;
+        pid_t r = ::waitpid(pid, &status, WNOHANG);
+        if (r == pid) {
+            // Drain whatever is left in the pipe after exit.
+            ssize_t n;
+            while ((n = ::read(fds[0], buf.data(), buf.size())) > 0)
+                result.output.append(buf.data(), static_cast<size_t>(n));
+            ::close(fds[0]);
+            result.exit_code = normalize_exit_code(status);
+            if (timed_out) *timed_out = killed;
+            return result;
+        }
+        if (!killed && std::chrono::steady_clock::now() >= until) {
+            ::kill(pid, SIGKILL);
+            killed = true;
+        }
+    }
+#else
+    return capture_exec(argv, extraEnv);
 #endif
 }
 
