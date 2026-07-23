@@ -16,9 +16,9 @@
 
 ## Tasks
 
-- [ ] **T1 围栏谓词 + 三写入者接入**:post_install.cppm 导出 `containment_root(dir)`(拼写路径取 registry 父 + weakly_canonical)与 `escapes_containment(file, root)`(weakly_canonical 后前缀比较);patchelf_walk 入口算根、每候选 ELF 判定;fixup_gcc_specs/fixup_clang_cfg 写文件前同判。
-- [ ] **T2 单测**:tests/unit/test_post_install_containment.cpp——真实临时目录 + `std::filesystem::create_directory_symlink` 复刻 issue 逃逸拓扑,断言:直连文件不逃逸、经 symlink 目录前缀的文件逃逸、无 registry 组件 → 无围栏、相对/`..` 路径归一。
-- [ ] **T3 13_toolchain_pin.sh 注释更新**:说明 symlink 种子曾是 #273 事故向量、现受围栏保护并有意保留为金丝雀;引用 issue。
-- [ ] **T4 CI wine deb 缓存**(已在工作树):首跑下载 .deb 闭包入 cache,命中跑 dpkg -i,apt-get -f 兜底。
-- [ ] **T5 PR + CI + 合入**:单 PR(Fixes #273),15 检查全绿后 `gh pr merge --squash --admin`。
-- [ ] **T6 release 0.0.104 + 生态验证**:按 release.yml 流程出版本(批次二已定版 0.0.104,本批次并入);xlings 安装链路/d2mcpp/d2x 以 release 产物复验;结果回记。
+- [x] **T1 围栏谓词 + 三写入者接入**:post_install.cppm 导出 `containment_root(dir)`(拼写路径取 registry 父 + weakly_canonical)与 `escapes_containment(file, root)`(weakly_canonical 后前缀比较);patchelf_walk 入口算根、每候选 ELF 判定;fixup_gcc_specs/fixup_clang_cfg 写文件前同判。
+- [x] **T2 单测**:tests/unit/test_post_install_containment.cpp——真实临时目录 + `std::filesystem::create_directory_symlink` 复刻 issue 逃逸拓扑,断言:直连文件不逃逸、经 symlink 目录前缀的文件逃逸、无 registry 组件 → 无围栏、相对/`..` 路径归一。
+- [x] **T3 13_toolchain_pin.sh 注释更新**:说明 symlink 种子曾是 #273 事故向量、现受围栏保护并有意保留为金丝雀;引用 issue。
+- [x] **T4 CI wine deb 缓存**(已在工作树):首跑下载 .deb 闭包入 cache,命中跑 dpkg -i,apt-get -f 兜底。
+- [x] **T5 PR + CI + 合入**:单 PR(Fixes #273),15 检查全绿后 `gh pr merge --squash --admin`。
+- [x] **T6 release 0.0.104 + 生态验证**:按 release.yml 流程出版本(批次二已定版 0.0.104,本批次并入);xlings 安装链路/d2mcpp/d2x 以 release 产物复验;结果回记。
