@@ -46,7 +46,7 @@ namespace mcpp::cli {
 // canonical printer here so the docs/CHANGELOG examples don't drift
 // every time cmdline tweaks its formatting.
 void print_usage() {
-    std::println("mcpp v{} — modern C++23 build tool", mcpp::toolchain::MCPP_VERSION);
+    std::println("mcpp v{} - modern C++23 build tool", mcpp::toolchain::MCPP_VERSION);
     std::println("");
     std::println("Usage:");
     std::println("Project commands:");
@@ -121,7 +121,7 @@ int run(int argc, char** argv) {
         std::string_view a = argv[1];
         if (a == "--help" || a == "-h") { print_usage(); return 0; }
         if (a == "--version" || a == "-V") {
-            std::println("mcpp {} - ", mcpp::toolchain::MCPP_VERSION);
+            std::println("mcpp {}", mcpp::toolchain::MCPP_VERSION);
             return 0;
         }
     }
