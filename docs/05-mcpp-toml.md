@@ -141,6 +141,7 @@ c_standard   = "c11"              # Standard for C source files (default c11)
 cflags       = ["-DFOO=1"]        # Extra C compile flags
 cxxflags     = ["-DBAR=2"]        # Extra C++ compile flags (do not put -std=... here)
 ldflags      = ["-lfoo"]          # Extra link flags
+defines      = ["BIZ=1", "QUX"]   # Preprocessor macros for every TU (desugars to -D; reaches module scans)
 static_stdlib = true               # Statically link libstdc++ (default true)
 target       = "x86_64-linux-musl" # Default build target when no --target is passed
                                    # (≙ cargo build.target; e.g. "ship fully-static")
@@ -181,6 +182,34 @@ the default build's artifacts work out of the box on any macOS ≥ 14. Set
 then only guaranteed to run on the build machine's version and above). A lower
 floor (11–13) requires a self-built libc++ archive (already verified to work, a
 data-level switch, available on request).
+
+`defines` takes **bare** macro names (no `-D`) and desugars each entry to `-D<x>` on
+both the C and C++ compile channels. It reaches every TU in the package — module
+interface units included — so it also reaches the P1689 module scan, which is what
+makes a macro-guarded `import` resolvable. Assembly units pick it up too. It is a
+build input like any other, so `[target.'cfg(...)'.build]` can carry it:
+
+```toml
+[build]
+defines = ["APP_NAME=\"demo\""]
+
+[target.'cfg(windows)'.build]
+defines = ["USE_WIN32", "WINVER=0x0A00"]
+```
+
+Picking the right axis:
+
+| You want the macro on… | Use |
+|---|---|
+| every TU of this package | `[build].defines` (here) |
+| one binary's own entry source only | `[targets.<name>].defines` |
+| a specific set of files | `[build].flags` with a `glob` + `defines` |
+| every TU **and** every consumer's TUs | `[features.<name>].defines` (an interface contribution) |
+
+`[build].defines` is private to the package: it does not propagate to consumers.
+
+Unsupported keys under `[build]` are reported as a warning (an error under
+`--strict`) rather than silently ignored.
 
 Do not configure the C++ standard via `build.cxxflags = ["-std=..."]`. Instead use:
 

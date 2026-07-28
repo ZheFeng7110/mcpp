@@ -442,6 +442,28 @@ void merge_conditional_build_inputs(mcpp::manifest::Manifest& m,
     }
 }
 
+// Desugar `[build].defines` into `-D<x>` on both C and C++ flag channels.
+//
+// ORDER (both halves are load-bearing): this must run AFTER
+// merge_conditional_build_inputs — `defines` is a BuildInputs member, so a
+// matching `[target.'cfg(...)'.build] defines` has been appended by then and
+// folds in the same pass, landing after the unconditional entries so GNU
+// last-wins gives the conditional rule precedence — and BEFORE the manifest is
+// snapshotted into packages[] / fingerprinted, because that snapshot (not the
+// manifest) is what the P1689 scan, the compile edges and compute_fingerprint
+// actually read.
+//
+// Idempotent: clearing the vector after folding makes repeated calls harmless.
+// Both `cflags` and `cxxflags` get the macro; assembly units pick it up for
+// free via the -D/-U/-I subset the ninja backend filters out of packageCflags.
+void fold_build_defines_into_flags(mcpp::manifest::BuildConfig& bc) {
+    for (auto const& d : bc.defines) {
+        bc.cflags.push_back("-D" + d);
+        bc.cxxflags.push_back("-D" + d);
+    }
+    bc.defines.clear();
+}
+
 // Feature-activation closure — THE single implementation (build.mcpp env
 // contract, Stage 2a feature-deps, and the main feature pass all call this):
 // seed = [features].default ∪ requested, expanded transitively over implies;
@@ -943,6 +965,10 @@ prepare_build(bool print_fingerprint,
             m->buildDependencies.insert(cc.buildDependencies.begin(), cc.buildDependencies.end());
         }
     }
+    // `[build].defines` must reach the scanner (P1689) and the compile edge,
+    // and must participate in the fingerprint. Fold before dependency
+    // resolution / fingerprinting.
+    fold_build_defines_into_flags(m->buildConfig);
 
     // msvc@system: a *system* toolchain — located on the machine, never
     // resolved through xim packages. mcpp does not install MSVC.
@@ -2073,6 +2099,7 @@ prepare_build(bool print_fingerprint,
                                     cfgpred::context_for(overrides.target_triple),
                                     overrides.target_triple);
         }
+        fold_build_defines_into_flags(manifest->buildConfig);
 
         return std::pair{effRoot, std::move(*manifest)};
     };
@@ -2964,6 +2991,7 @@ prepare_build(bool print_fingerprint,
                     cfgpred::context_for(overrides.target_triple),
                     overrides.target_triple);
             }
+            fold_build_defines_into_flags(dep_manifest->buildConfig);
         } else {
             auto loaded = loadVersionDep(name, key.ns, key.shortName, spec.version);
             if (!loaded) return std::unexpected(loaded.error());
