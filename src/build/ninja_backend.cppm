@@ -67,7 +67,7 @@ std::string escape_ninja_path(const std::filesystem::path& p) {
     // a response file that gcc/clang/GNU ar tokenize GNU-style, where
     // backslash is an ESCAPE character — `obj\cli.o` would arrive as
     // `objcli.o`. Every Windows consumer of these strings (CreateProcess
-    // path resolution, cl.exe/link.exe, PowerShell Copy-Item, ninja itself)
+    // path resolution, cl.exe/link.exe, `mcpp stage`, ninja itself)
     // accepts forward slashes; POSIX output is byte-identical.
     std::string s = p.generic_string();
     std::string out;
@@ -288,6 +288,10 @@ std::vector<std::string> command_prefixes(const CompileFlags& flags,
     add(flags.ccBinary);
     add(flags.arBinary);
     add(plan.scanDepsPath);
+    // mcpp itself drives the dyndep and stage_file rules; its echoed command
+    // line is noise, while the message it prints on failure is the diagnostic
+    // we want to keep.
+    add(mcpp_exe_path());
     return prefixes;
 }
 
@@ -331,9 +335,27 @@ std::string filter_ninja_output(std::string_view output,
         auto trimmed = ltrim_copy(line);
         if (trimmed.starts_with("ninja: Entering directory")
             || trimmed.starts_with("ninja: build stopped")
-            || trimmed.starts_with("FAILED:")
             || is_ninja_progress_line(trimmed)
             || is_command_line(trimmed, commandPrefixes)) {
+            continue;
+        }
+        // Keep WHICH output failed. Dropping this line entirely (as we used to)
+        // is why #311's report couldn't tell a BMI staging failure from a
+        // compile error. Normalized to lowercase `failed:` so it reads as part
+        // of mcpp's own diagnostics, and `[code=N]` is dropped as noise.
+        if (trimmed.starts_with("FAILED:")) {
+            auto target = ltrim_copy(trimmed.substr(std::string_view("FAILED:").size()));
+            if (target.starts_with("[code=")) {
+                if (auto close = target.find(']'); close != std::string::npos)
+                    target = ltrim_copy(target.substr(close + 1));
+            }
+            while (!target.empty()
+                   && std::isspace(static_cast<unsigned char>(target.back())))
+                target.pop_back();
+            if (target.empty()) continue;
+            filtered += "failed: ";
+            filtered += target;
+            filtered.push_back('\n');
             continue;
         }
         filtered += line;
@@ -400,23 +422,41 @@ std::string emit_ninja_string(const BuildPlan& plan) {
             flags.ldBinary.empty() ? std::string("link.exe")
                                    : escape_ninja_path(flags.ldBinary)));
     }
+    // `$mcpp` is needed by stage_file in EVERY configuration (dyndep or not),
+    // so the binding cannot live inside the `if (dyndep)` below.
+    append(std::format("mcpp      = {}\n", escape_ninja_path(mcpp_exe_path())));
     if (dyndep) {
-        append(std::format("mcpp      = {}\n", escape_ninja_path(mcpp_exe_path())));
         if (!plan.scanDepsPath.empty()) {
             append(std::format("scan_deps = {}\n", escape_ninja_path(plan.scanDepsPath)));
         }
     }
     append("\n");
 
-    append("rule cp_bmi\n");
-    if constexpr (mcpp::platform::is_windows) {
-        // Use PowerShell Copy-Item which handles both forward and back slashes.
-        // cmd.exe `copy` breaks on forward-slash paths from ninja.
-        append("  command = powershell -NoProfile -Command \"Copy-Item -Force '$in' -Destination '$out'\"\n");
-    } else {
-        append("  command = mkdir -p $$(dirname $out) && cp -f $in $out\n");
-    }
-    append("  description = STAGE $out\n\n");
+    // Staging (cache → build dir) runs through mcpp itself instead of a
+    // per-platform shell copy: it skips the write when the destination is
+    // already equivalent, writes out-of-place + renames when it isn't, retries
+    // transient sharing violations, and fails with a diagnostic that names the
+    // likely holder. #311: `Copy-Item -Force` overwrote in place, so a std BMI
+    // that clangd had memory-mapped failed the whole build with error 1224.
+    // `restat = 1` is what makes the no-write path actually pay off — a skipped
+    // stage must not dirty every importer of the staged BMI.
+    // $verify is per-edge: empty (⇒ content comparison, the safe default) for
+    // payloads whose bytes can change under an unchanged name — a rebuilt DLL
+    // keeps its size, PE sections are page-padded — and `--verify size` for the
+    // std artifacts, which are fingerprint-scoped: the cache dir and this build
+    // dir share the fp that covers compiler identity, target triple, stdlib,
+    // std source hash and the dialect flags, so equal size IS equivalence.
+    //
+    // That distinction is not a micro-optimization: reading the destination
+    // needs to OPEN it, and a holder may deny even that (Windows CI: a
+    // MemoryMappedFile opened with FileShare.None → ERROR_SHARING_VIOLATION on
+    // open, so content can't be compared and staging fails). Size comes from
+    // directory metadata, which stays readable — so the fingerprint-scoped
+    // edges survive a lock that would otherwise be unsurvivable.
+    append("rule stage_file\n");
+    append("  command = $mcpp stage $verify --output $out $in\n");
+    append("  description = STAGE $out\n");
+    append("  restat = 1\n\n");
 
     // P1: per-file dyndep rule. Converts one .ddi → .dd independently.
     append(std::format(
@@ -730,11 +770,21 @@ std::string emit_ninja_string(const BuildPlan& plan) {
 
     append("rule runtime_alias\n");
     if constexpr (mcpp::platform::is_windows) {
-        append("  command = powershell -NoProfile -Command \"Copy-Item -Force '$in' -Destination '$out'\"\n");
+        // PE has no soname symlink, so the alias is a copy — and a copy of a
+        // just-rebuilt DLL is exactly the hazard #311 is about (a program still
+        // running from a previous `mcpp run` holds the old one). Route it
+        // through the same staging primitive rather than a second in-place
+        // PowerShell copy. Content-verified, so a same-size rebuild still
+        // refreshes the alias.
+        append("  command = $mcpp stage --output $out $in\n");
     } else {
         append("  command = mkdir -p $$(dirname $out) && rm -f $out && ln -s $$(basename $in) $out\n");
     }
-    append("  description = ALIAS $out\n\n");
+    append("  description = ALIAS $out\n");
+    if constexpr (mcpp::platform::is_windows) {
+        append("  restat = 1\n");
+    }
+    append("\n");
 
     if (dyndep) {
         // Scan rule: produce P1689 .ddi for one TU.
@@ -784,16 +834,24 @@ std::string emit_ninja_string(const BuildPlan& plan) {
     }
 
     // Stage prebuilt std artifacts into the compiler-specific BMI cache.
+    // These four are fingerprint-scoped (see the stage_file rule comment), so
+    // they carry the size-only equivalence check.
+    // (ninja trims trailing whitespace in variable values, hence the space
+//  lives in the rule's command string, not here)
+    static constexpr std::string_view kFpScopedVerify = "  verify = --verify size\n";
     auto std_bmi_dst = mcpp::toolchain::staged_std_bmi_path(plan.toolchain, {});
     auto std_o_dst = std::filesystem::path("obj")
                    / std::format("std{}", dial.objExt);
 
     bool has_std_artifacts = !plan.stdBmiPath.empty() && !plan.stdObjectPath.empty();
     if (has_std_artifacts) {
-        append(std::format("build {} : cp_bmi {}\n", escape_ninja_path(std_bmi_dst),
+        append(std::format("build {} : stage_file {}\n", escape_ninja_path(std_bmi_dst),
                            escape_ninja_path(plan.stdBmiPath)));
-        append(std::format("build {} : cp_bmi {}\n\n", escape_ninja_path(std_o_dst),
+        append(std::string(kFpScopedVerify));
+        append(std::format("build {} : stage_file {}\n", escape_ninja_path(std_o_dst),
                            escape_ninja_path(plan.stdObjectPath)));
+        append(std::string(kFpScopedVerify));
+        append("\n");
     }
 
     bool has_std_compat = !plan.stdCompatBmiPath.empty() && !plan.stdCompatObjectPath.empty();
@@ -804,11 +862,14 @@ std::string emit_ninja_string(const BuildPlan& plan) {
     if (has_std_compat) {
         // std.compat.pcm depends on std.pcm — ensure std.pcm is staged first
         // so clang can resolve the transitive dependency when loading std.compat.pcm.
-        append(std::format("build {} : cp_bmi {} | {}\n", escape_ninja_path(compat_bmi_dst),
+        append(std::format("build {} : stage_file {} | {}\n", escape_ninja_path(compat_bmi_dst),
                            escape_ninja_path(plan.stdCompatBmiPath),
                            escape_ninja_path(std_bmi_dst)));
-        append(std::format("build {} : cp_bmi {}\n\n", escape_ninja_path(compat_o_dst),
+        append(std::string(kFpScopedVerify));
+        append(std::format("build {} : stage_file {}\n", escape_ninja_path(compat_o_dst),
                            escape_ninja_path(plan.stdCompatObjectPath)));
+        append(std::string(kFpScopedVerify));
+        append("\n");
     }
 
     auto bmi_path = [&traits](std::string_view name) {
@@ -1074,10 +1135,13 @@ std::string emit_ninja_string(const BuildPlan& plan) {
     append("\n");
 
     // Windows runtime-DLL deployment: one copy edge per staged dep DLL. Emitted
-    // once (deduped by dest in BuildPlan), reusing the generic cp_bmi copy rule.
+    // once (deduped by dest in BuildPlan), reusing the generic stage_file rule
+    // — which also means a DLL still loaded by a running program from a
+    // previous `mcpp run` gets the skip-if-equivalent treatment instead of a
+    // hard "cannot copy" failure.
     // Inert on RPATH platforms where runtimeDeployFiles is empty.
     for (auto const& d : plan.runtimeDeployFiles) {
-        append(std::format("build {} : cp_bmi {}\n",
+        append(std::format("build {} : stage_file {}\n",
             escape_ninja_path(d.dest),
             escape_ninja_path(d.source)));
     }
