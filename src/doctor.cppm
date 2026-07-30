@@ -150,25 +150,29 @@ export int doctor_report() {
 
     mcpp::ui::status("Checking", "std module");
     if (tc) {
-        auto cacheRoot = mcpp::toolchain::default_cache_root();
-        auto fpDir = cacheRoot;
+        // Entries live at <cache>/std/<identity>/{gcm,pcm}.cache/std.*; the
+        // object sits at the entry root. Look for the object rather than one
+        // compiler's BMI extension so this reports on clang and MSVC too.
+        auto stdRoot = mcpp::toolchain::default_cache_root() / "std";
         std::error_code ec;
-        if (std::filesystem::exists(cacheRoot, ec)) {
+        if (std::filesystem::exists(stdRoot, ec)) {
             bool found = false;
-            for (auto& e : std::filesystem::directory_iterator(cacheRoot, ec)) {
-                auto stdgcm = e.path() / "std.gcm";
-                if (std::filesystem::exists(stdgcm)) {
-                    ok(std::format("{}  ({})",
-                        stdgcm.string(),
-                        mcpp::bmi_cache::human_bytes(std::filesystem::file_size(stdgcm))));
+            for (auto& e : std::filesystem::directory_iterator(stdRoot, ec)) {
+                for (auto name : {"std.o", "std.obj"}) {
+                    auto obj = e.path() / name;
+                    if (!std::filesystem::exists(obj, ec)) continue;
+                    ok(std::format("{}  (entry {})", e.path().string(),
+                                   mcpp::bmi_cache::human_bytes(
+                                       mcpp::bmi_cache::dir_size(e.path()))));
                     found = true;
                     break;
                 }
+                if (found) break;
             }
-            if (!found) warn("no std.gcm found yet (will be built on first `mcpp build`)");
+            if (!found) warn("no std module cached yet (built on first `mcpp build`)");
         } else {
-            warn(std::format("cache root '{}' missing (run `mcpp env` to init)",
-                             cacheRoot.string()));
+            warn(std::format("no std module cache at '{}' yet "
+                             "(built on first `mcpp build`)", stdRoot.string()));
         }
     }
 
@@ -189,11 +193,27 @@ export int doctor_report() {
     mcpp::ui::status("Checking", "cache health");
     auto bmiRoot = mcpp::toolchain::default_cache_root();
     auto sz = mcpp::bmi_cache::dir_size(bmiRoot);
-    if (sz > std::uintmax_t(1) * 1024 * 1024 * 1024) {
-        warn(std::format("BMI cache occupies {} (run `mcpp cache prune` to GC)",
+    if (sz > std::uintmax_t(4) * 1024 * 1024 * 1024) {
+        warn(std::format("build cache occupies {} "
+                         "(`mcpp cache gc --max-size 4GiB` to collect)",
                          mcpp::bmi_cache::human_bytes(sz)));
     } else {
-        ok(std::format("BMI cache size = {}", mcpp::bmi_cache::human_bytes(sz)));
+        ok(std::format("build cache size = {}", mcpp::bmi_cache::human_bytes(sz)));
+    }
+    // The pre-v1 cache was keyed by whole-project fingerprint, which folded in
+    // the consumer's own name and version — so it accumulated one copy of every
+    // dependency per project configuration and never produced a cross-project
+    // hit. Nothing reads it now. Report the size, never delete it.
+    {
+        auto legacyRoot = mcpp::home::legacy_bmi_root();
+        std::error_code lec;
+        if (std::filesystem::is_directory(legacyRoot, lec)) {
+            auto lsz = mcpp::bmi_cache::dir_size(legacyRoot);
+            warn(std::format("pre-v1 cache at '{}' occupies {} and is no longer "
+                             "used — `mcpp cache clean --legacy` reclaims it",
+                             legacyRoot.string(),
+                             mcpp::bmi_cache::human_bytes(lsz)));
+        }
     }
     // Pre-#311 builds could park the std BMI cache in the current working
     // directory (`.mcpp-bmi/`) whenever neither MCPP_HOME nor HOME resolved —
@@ -441,10 +461,11 @@ export int explain_code(std::string_view code) {
          "The [toolchain] pin in mcpp.toml does not match the detected toolchain.\n"
          "Either install the pinned toolchain (xlings install ...) or relax the\n"
          "pin (e.g. \"gcc@>=15\" instead of \"gcc@15.1.0\")."},
-        {"E0005", "BMI cache corruption",
-         "A cached BMI file referenced by manifest.txt is missing on disk. Run\n"
-         "`mcpp cache prune --older-than 0d` to drop stale entries; the next build\n"
-         "will repopulate."},
+        {"E0005", "build cache corruption",
+         "A file listed in a cache entry's entry.json is missing on disk. Such an\n"
+         "entry is treated as a miss and rebuilt, so this is never wrong output —\n"
+         "only wasted space. `mcpp cache verify` lists every affected entry and\n"
+         "`mcpp cache gc --older-than 0s` reclaims them."},
         {"E0006", "index requires a newer mcpp",
          "The package index declares (index.toml [index].min_mcpp) that its\n"
          "descriptors need a newer mcpp than this binary — parsing them would\n"
@@ -486,8 +507,9 @@ export int self_init(bool force) {
         if (!home.empty()) {
             std::error_code ec;
             std::filesystem::remove_all(home / "registry", ec);
-            std::filesystem::remove_all(home / "bmi", ec);
-            std::filesystem::remove_all(home / "cache", ec);
+            std::filesystem::remove_all(home / "cache", ec);        // index metadata
+            std::filesystem::remove_all(home / "build-cache", ec);  // compiled artifacts
+            std::filesystem::remove_all(home / "bmi", ec);          // pre-v1 build cache
         }
     }
 
