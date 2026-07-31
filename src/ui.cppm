@@ -71,6 +71,23 @@ void diagnostic(const Diagnostic& d);
 // Plain output (no verb), respecting -q flag.
 void plain(std::string_view message);
 
+// Flush stdout. Every stdout-writing function above already calls this, so
+// callers only need it when they wrote to stdout directly (std::println) and
+// want that line visible now rather than whenever the libc buffer happens to
+// fill. main() also sets stdout line-buffered, which covers the POSIX
+// platforms; this is what makes the guarantee hold on Windows too, where
+// MSVCRT treats _IOLBF as _IOFBF. Progress-driven output must be visible while
+// the process is still running: a build that is killed mid-flight is exactly
+// when its last lines matter most.
+void flush();
+
+// Make stdout line-buffered. Call once, before any output. See main() for why
+// this is not left to the libc default: the default block size is a different
+// number on every platform (musl 1024, Apple libc st_blksize = 65536 on a pipe,
+// MSVCRT 4096), so identical output becomes visible at wildly different times —
+// and not at all if the process is killed before its buffer fills.
+void set_line_buffered();
+
 // --- progress bar (single-line, \r-rewritten) ---
 class ProgressBar {
 public:
@@ -225,6 +242,27 @@ bool is_color_enabled() { return g_color; }
 void set_quiet(bool q) { g_quiet = q; }
 bool is_quiet()        { return g_quiet; }
 
+void flush() { std::fflush(stdout); }
+
+void set_line_buffered() {
+#if defined(_WIN32)
+    // Not on Windows, and not as a preference. The UCRT documents setvbuf's
+    // size as `2 <= size <= INT_MAX`, and a zero goes through the
+    // invalid-parameter handler, whose default action terminates the process:
+    // 0xC0000409, which git-bash reports as a bare exit 127. The freshly built
+    // mcpp.exe died on `--version` before printing anything.
+    //
+    // Passing a real size instead would buy nothing: MSVCRT has no line
+    // buffering at all — it accepts _IOLBF and treats it as _IOFBF. Windows
+    // gets the same guarantee from ui::flush(), which every stdout-writing
+    // function here calls, so the platform that cannot do this cheaply is also
+    // the one that does not need it: its 4096-byte block is the smallest of the
+    // three anyway, and `mcpp test` routes its result lines through ui::plain.
+#else
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+#endif
+}
+
 void status(std::string_view verb, std::string_view message) {
     if (g_quiet) return;
     init();
@@ -235,6 +273,7 @@ void status(std::string_view verb, std::string_view message) {
     } else {
         std::println("{} {}", v, message);
     }
+    flush();
 }
 
 void info(std::string_view verb, std::string_view message) {
@@ -247,6 +286,7 @@ void info(std::string_view verb, std::string_view message) {
     } else {
         std::println("{} {}", v, message);
     }
+    flush();
 }
 
 void finished(std::string_view profile, std::chrono::milliseconds elapsed,
@@ -269,6 +309,7 @@ void finished(std::string_view profile, std::chrono::milliseconds elapsed,
     } else {
         std::println("{} {}", v, msg);
     }
+    flush();
 }
 
 void warning(std::string_view message) {
@@ -292,6 +333,7 @@ void error(std::string_view message) {
 void plain(std::string_view message) {
     if (g_quiet) return;
     std::println("{}", message);
+    flush();
 }
 
 void diagnostic(const Diagnostic& d) {
