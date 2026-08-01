@@ -6,6 +6,7 @@ import mcpp.build.flags;
 import mcpp.build.ninja;
 import mcpp.build.plan;
 import mcpp.manifest;
+import mcpp.toolchain.dialect;
 import mcpp.toolchain.model;
 import mcpp.platform;
 
@@ -226,12 +227,87 @@ TEST(NinjaBackend, MsvcDialectEmitsIncludeDirsAfterAsTrailingSlashI) {
     auto line_end = ninja.find('\n', line_start);
     auto line = ninja.substr(line_start, line_end - line_start);
 
-    auto i_pos = line.find("-I/dep/include");
+    // Both halves take the dialect's prefix. The plain half used to hardcode
+    // `-I` even here — cl.exe accepts it, so it never broke anything, but it
+    // meant local_include_flags derived the prefix twice and only agreed with
+    // the dialect on one of them. Converging both on include_token fixed it.
+    auto i_pos = line.find("/I/dep/include");
     auto after_pos = line.find("/I/dep/tarball-root");
     ASSERT_NE(i_pos, std::string::npos) << line;
     ASSERT_NE(after_pos, std::string::npos) << line;
     EXPECT_LT(i_pos, after_pos) << line;
     EXPECT_EQ(line.find("-idirafter"), std::string::npos) << line;
+    EXPECT_EQ(line.find("-I/dep"), std::string::npos) << line;
+}
+
+// #331: the per-TU include channel applied only ninja's `$` escaping, while
+// the global channel in flags.cppm shell-quoted. Same manifest include_dirs,
+// two derivations — so a directory with a space in it survived one path and
+// split into separate shell words on the other, which is what every Windows
+// user hits the moment a dependency lands under `C:\Program Files`.
+TEST(NinjaBackend, LocalIncludeDirsWithSpacesAreShellQuoted) {
+    auto plan = minimal_plan();
+    plan.compileUnits.push_back({
+        .source = "src/main.cpp",
+        .object = "obj/main.o",
+        .packageName = "spaced",
+        .localIncludeDirs = {"/opt/my dep/include"},
+        .localIncludeDirsAfter = {"/opt/my dep/after"},
+    });
+
+    auto ninja = emit_ninja_string(plan);
+    auto line_start = ninja.find("local_includes =");
+    ASSERT_NE(line_start, std::string::npos) << ninja;
+    auto line = ninja.substr(line_start, ninja.find('\n', line_start) - line_start);
+
+    // Two escaping layers, in order: ninja's (`$ ` for a literal space, so
+    // ninja does not treat it as a field separator) and then the shell's
+    // (quotes, so what ninja hands to sh stays one word). The old code had
+    // only the first, which is why the path survived ninja and then split in
+    // the shell. The prefix must be INSIDE the quotes — quoting the path
+    // alone would leave `-I` as its own word and reintroduce the split.
+    //
+    // The quote character is the host shell's, not a fixed one: POSIX sh
+    // wants single quotes, cmd.exe double. Hardcoding `'` passed on Linux
+    // and failed on the Windows runner for a difference that is correct.
+    const std::string q = mcpp::platform::is_windows ? "\"" : "'";
+    EXPECT_NE(line.find(q + "-I/opt/my$ dep/include" + q), std::string::npos) << line;
+    EXPECT_NE(line.find(q + "-idirafter/opt/my$ dep/after" + q), std::string::npos) << line;
+}
+
+// #261: on Windows $local_includes is copied into a RESPONSE FILE, which the
+// drivers tokenize GNU-style — a backslash is an escape character there, and
+// quoting does not exempt it. A native-separator token like C:\src\inc loses
+// its separators and every dependency header goes missing, with nothing in
+// the error pointing at the include flag.
+//
+// The separator distinction is real only on Windows: POSIX treats '\' as an
+// ordinary filename character, so generic_string() leaves it alone and this
+// assertion cannot be made from a Linux host. Guarded rather than weakened —
+// a test that passes for the wrong reason everywhere is worse than one that
+// says where it applies. Windows CI is the enforcement point.
+TEST(NinjaBackend, LocalIncludeTokensUseGenericSeparators) {
+    const auto& gnu = mcpp::toolchain::gnu_dialect();
+    auto sub = std::filesystem::path("src") / "inc";
+    auto tok = mcpp::build::include_token(gnu, sub, {},
+                                          mcpp::build::PathForm::Generic);
+    // True on every host: the generic form never uses the native separator.
+    EXPECT_NE(tok.find("src/inc"), std::string::npos) << tok;
+
+    if constexpr (mcpp::platform::is_windows) {
+        auto abs = mcpp::build::include_token(
+            gnu, std::filesystem::path("C:\\src\\inc"), {},
+            mcpp::build::PathForm::Generic);
+        EXPECT_EQ(abs.find('\\'), std::string::npos) << abs;
+
+        // The command-line channel keeps native separators — a backslash is
+        // just a character there, and rewriting those paths would be a change
+        // nobody asked for.
+        auto native = mcpp::build::include_token(
+            gnu, std::filesystem::path("C:\\src\\inc"), {},
+            mcpp::build::PathForm::Native);
+        EXPECT_NE(native.find('\\'), std::string::npos) << native;
+    }
 }
 
 // #249 NASM degradation: nasm_object edges share $local_includes, but NASM

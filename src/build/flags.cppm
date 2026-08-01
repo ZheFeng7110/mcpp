@@ -82,6 +82,39 @@ std::string atomic_link_flag(const std::vector<std::filesystem::path>& linkDirs,
 // escaped as `\"`) — cmd.exe/CreateProcess argv convention.
 std::string shell_quote_arg(std::string_view arg);
 
+// One include-directory token, fully prepared for a ninja command line:
+// dialect prefix, ninja `$` escaping, and shell quoting — in that order.
+//
+// #331: the same manifest `[build] include_dirs` reaches the compiler through
+// two channels — the global blob assembled below, and the per-translation-unit
+// `$local_includes` emitted by ninja_backend. Only the first one quoted, so an
+// include dir containing a space (`C:\Program Files\...`, or `/home/my dir` on
+// Linux) survived one path and split into separate shell words on the other.
+// Both channels call this now; adding a third one and forgetting to quote is
+// how the bug happened, and a shared helper is the only fix that also covers
+// the fourth.
+//
+// `prefixOverride` replaces `d.includePrefix` for the callers that need a
+// different flag for the same kind of path (`-idirafter` for #249's
+// after-dirs, plain `-I` for NASM units which would parse `-idirafter<p>` as
+// `-i dirafter<p>`).
+//
+// `form` picks the separator, and the two channels genuinely need different
+// ones (#261): tokens that stay on the command line keep native separators,
+// while tokens ninja copies into a RESPONSE FILE must be forward-slashed,
+// because the drivers tokenize response files GNU-style — there a backslash
+// is an ESCAPE character and `C:\src\inc` loses its separators. Quoting
+// alone does not save it; the escape happens inside quotes too.
+enum class PathForm {
+    Native,   // command line — a backslash is just a character
+    Generic,  // response file — forward slashes, see above
+};
+
+std::string include_token(const mcpp::toolchain::CommandDialect& d,
+                          const std::filesystem::path& dir,
+                          std::string_view prefixOverride = {},
+                          PathForm form = PathForm::Native);
+
 }  // namespace mcpp::build
 
 namespace mcpp::build {
@@ -92,9 +125,11 @@ std::filesystem::path staged_std_bmi_path(const BuildPlan& plan) {
     return mcpp::toolchain::staged_std_bmi_path(plan.toolchain, plan.outputDir);
 }
 
-// Escape a path for embedding in ninja rule strings.
-std::string escape_path(const std::filesystem::path& p) {
-    auto s = p.string();
+// Escape a string for embedding in ninja rule strings. Takes the text, not a
+// path: round-tripping through std::filesystem::path would re-normalize the
+// separators on Windows, which silently undoes a caller that deliberately
+// chose generic_string() for a response-file token (#261).
+std::string escape_ninja_chars(std::string_view s) {
     std::string out;
     out.reserve(s.size());
     for (char c : s) {
@@ -103,6 +138,11 @@ std::string escape_path(const std::filesystem::path& p) {
         out.push_back(c);
     }
     return out;
+}
+
+// Escape a path for embedding in ninja rule strings (native separators).
+std::string escape_path(const std::filesystem::path& p) {
+    return escape_ninja_chars(p.string());
 }
 
 std::string normalize_ldflag(const std::filesystem::path& root, const std::string& flag) {
@@ -137,6 +177,22 @@ std::string atomic_link_flag(const std::vector<std::filesystem::path>& linkDirs,
         }
     }
     return {};
+}
+
+std::string include_token(const mcpp::toolchain::CommandDialect& d,
+                          const std::filesystem::path& dir,
+                          std::string_view prefixOverride,
+                          PathForm form) {
+    std::string_view prefix =
+        prefixOverride.empty() ? d.includePrefix : prefixOverride;
+    std::string path = form == PathForm::Generic ? dir.generic_string()
+                                                 : dir.string();
+    // Prefix first, then escape+quote the whole token: the prefix and the
+    // path are ONE argv word, so quoting them separately would put the
+    // opening quote in the wrong place and re-split exactly what we came to
+    // join. `escape_path` only adds ninja's `$` escapes and never touches
+    // separators, so the form chosen above survives it.
+    return shell_quote_arg(escape_ninja_chars(std::string(prefix) + path));
 }
 
 std::string shell_quote_arg(std::string_view arg) {
@@ -222,7 +278,7 @@ CompileFlags compute_flags(const BuildPlan& plan) {
     std::vector<std::string> includeTokens;
     for (auto& inc : plan.manifest.buildConfig.includeDirs) {
         std::filesystem::path p = inc.has_root_path() ? inc : (plan.projectRoot / inc);
-        includeTokens.push_back(std::string(d.includePrefix) + p.string());
+        includeTokens.push_back(include_token(d, p));
     }
     // #249: `[build] include_dirs_after` — searched AFTER the toolchain's
     // system dirs via -idirafter (gcc+clang), so entries can't shadow
@@ -233,12 +289,13 @@ CompileFlags compute_flags(const BuildPlan& plan) {
     for (auto& inc : plan.manifest.buildConfig.includeDirsAfter) {
         std::filesystem::path ip(inc);
         std::filesystem::path p = ip.has_root_path() ? ip : (plan.projectRoot / ip);
-        includeTokens.push_back((msvcInclude ? "/I" : "-idirafter") + p.string());
+        includeTokens.push_back(
+            include_token(d, p, msvcInclude ? "/I" : "-idirafter"));
     }
     std::string include_flags;
     for (auto& t : includeTokens) {
         include_flags += ' ';
-        include_flags += shell_quote_arg(escape_path(std::filesystem::path(t)));
+        include_flags += t;   // already prefixed, escaped and quoted
     }
 
     // Sysroot / payload paths — resolved ONCE by the toolchain link model
@@ -354,17 +411,32 @@ CompileFlags compute_flags(const BuildPlan& plan) {
     // /reference//ifcSearchDir).
     auto traits = mcpp::toolchain::bmi_traits(plan.toolchain);
     std::string module_flag{traits.compileModulesFlag};
+    // A BMI flag and its path are ONE shell word, so the quotes have to wrap
+    // both — a build under `/Users/me/my work dir/…` otherwise hands the
+    // shell `-fmodule-file=std=/Users/me/my`, `work`, `dir/…` and the compile
+    // dies on "no such file or directory: 'work'" with nothing naming the
+    // flag that split. The BmiTraits prefixes carry a leading space for this
+    // string channel, and MSVC's is itself two words (`/reference std=`), so
+    // split at the LAST space: everything before it stays outside the quotes.
+    auto bmi_flag = [](std::string_view prefix, const std::filesystem::path& p) {
+        auto sp = prefix.find_last_of(' ');
+        std::string_view lead = sp == std::string_view::npos
+                              ? std::string_view{} : prefix.substr(0, sp + 1);
+        std::string_view body = sp == std::string_view::npos
+                              ? prefix : prefix.substr(sp + 1);
+        return std::string(lead)
+             + shell_quote_arg(escape_ninja_chars(std::string(body) + p.string()));
+    };
     std::string std_module_flag;
     if (!traits.stdBmiUsePrefix.empty() && !plan.stdBmiPath.empty()) {
-        std_module_flag = std::string(traits.stdBmiUsePrefix)
-                        + escape_path(staged_std_bmi_path(plan));
+        std_module_flag = bmi_flag(traits.stdBmiUsePrefix,
+                                   staged_std_bmi_path(plan));
     }
     std::string std_compat_module_flag;
     if (!traits.stdCompatBmiUsePrefix.empty() && !plan.stdCompatBmiPath.empty()) {
         auto compatDst = mcpp::toolchain::staged_std_compat_bmi_path(
             plan.toolchain, plan.outputDir);
-        std_compat_module_flag = std::string(traits.stdCompatBmiUsePrefix)
-                               + escape_path(compatDst);
+        std_compat_module_flag = bmi_flag(traits.stdCompatBmiUsePrefix, compatDst);
     }
     std::string prebuilt_module_flag;
     if (traits.needsPrebuiltModulePath) {
@@ -377,8 +449,8 @@ CompileFlags compute_flags(const BuildPlan& plan) {
         // resolution fails with `module 'X' not found`. The other
         // `-fmodule-file=` flags in this block are already escape_path'd
         // (absolute) for the same reason — this one was a leftover.
-        prebuilt_module_flag = std::string(traits.bmiSearchPrefix)
-                             + escape_path(plan.outputDir / traits.bmiDir);
+        prebuilt_module_flag = bmi_flag(traits.bmiSearchPrefix,
+                                        plan.outputDir / traits.bmiDir);
     }
     std::string cxx_std_flag =
         plan.cppStandardFlag.empty()
