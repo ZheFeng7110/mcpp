@@ -33,6 +33,24 @@ struct LockedPackage {
     std::string hash;       // "sha256:..." or "fnv1a:..."
 };
 
+// Parsed form of a git source string as written to mcpp.lock.
+// Supported forms:
+//   git+https://host/repo#branch=develop@5848943...
+//   git+https://host/repo#tag=v1.0.0
+//   git+https://host/repo#rev=5848943...
+// Only `branch` carries `@<commit>`: a tag or rev already names a fixed point
+// in history, whereas a branch is floating and the recorded commit is what
+// pins it. `resolvedCommit` is therefore empty for tag/rev, and also for a
+// branch entry written before the commit was known.
+struct LockedGitSource {
+    std::string url;
+    std::string refKind;                       // "branch", "tag", or "rev"
+    std::string ref;
+    std::optional<std::string> resolvedCommit; // for branch entries with @commit
+};
+
+std::optional<LockedGitSource> parse_git_source(std::string_view source);
+
 struct Lockfile {
     int                                 schemaVersion = 2;
     std::vector<LockedIndex>            indices;
@@ -157,6 +175,47 @@ std::string compute_hash(const Lockfile& lock) {
         h *= 0x100000001b3ull;
     }
     return std::format("{:016x}", h);
+}
+
+std::optional<LockedGitSource> parse_git_source(std::string_view source) {
+    constexpr std::string_view prefix = "git+";
+    if (!source.starts_with(prefix)) return std::nullopt;
+
+    auto rest = source.substr(prefix.size());
+    auto hashPos = rest.find('#');
+    if (hashPos == std::string_view::npos) return std::nullopt;
+
+    LockedGitSource out;
+    out.url = std::string(rest.substr(0, hashPos));
+    auto fragment = rest.substr(hashPos + 1);
+
+    // fragment is one of: branch=develop@commit, tag=v1.0.0, rev=abc123
+    auto eqPos = fragment.find('=');
+    if (eqPos == std::string_view::npos) return std::nullopt;
+
+    out.refKind = std::string(fragment.substr(0, eqPos));
+    if (out.refKind != "branch" && out.refKind != "tag" && out.refKind != "rev")
+        return std::nullopt;
+
+    auto refPart = fragment.substr(eqPos + 1);
+    out.ref = std::string(refPart);
+    // Only branch entries carry `@<commit>` — see the writer in prepare.cppm,
+    // which appends it for `branch` and nothing else. Splitting unconditionally
+    // would read a tag legitimately named `v1@rc` as ref `v1` plus commit `rc`.
+    // Within branch entries, split on the LAST `@` so a branch name that
+    // contains one ("feat@v2") still round-trips.
+    if (out.refKind == "branch") {
+        if (auto atPos = refPart.rfind('@'); atPos != std::string_view::npos) {
+            out.ref = std::string(refPart.substr(0, atPos));
+            // A bare `branch=foo@` records no commit; leaving an empty string
+            // behind would make the anchor claim a pin it does not have.
+            if (auto commit = refPart.substr(atPos + 1); !commit.empty())
+                out.resolvedCommit = std::string(commit);
+        }
+    }
+
+    if (out.ref.empty()) return std::nullopt;
+    return out;
 }
 
 } // namespace mcpp::pm

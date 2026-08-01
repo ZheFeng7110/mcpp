@@ -412,14 +412,16 @@ inline int cmd_update(const mcpplibs::cmdline::ParsedArgs& parsed) {
 
     // Refresh the index FIRST (#315/D6).
     //
-    // This command used to only drop lock entries and tell the user to run
-    // `mcpp build` — but the build path never reads mcpp.lock (prepare writes
-    // it and nothing on that path loads it), so the whole command was a no-op:
-    // it changed no behaviour whatsoever. It is also the only command whose
-    // stated purpose is "get me newer dependencies", which since #315 is
-    // exactly what an index refresh is for. Explicit intent, so no debounce and
-    // no TTL — but still refused when offline, loudly, rather than silently
-    // doing nothing again.
+    // Until #329 this command changed nothing at all: it dropped lock
+    // entries and told the user to run `mcpp build`, but the build path
+    // never read mcpp.lock. #329 made the lock authoritative for git
+    // branch deps — `mcpp build` now deliberately rebuilds the recorded
+    // commit — so dropping an entry here is the one thing that lets a
+    // branch advance. That is half of what this command does; the index
+    // refresh below is the other half, covering registry-served version
+    // deps. Explicit intent, so no debounce and no TTL — but still
+    // refused when offline, loudly, rather than silently doing nothing
+    // again.
     // Skipped when nothing in the project is served by the shared registry:
     // syncing it does nothing for path deps, git deps or a project `[indices]`
     // entry, and paying a multi-repo network round-trip to achieve nothing is
