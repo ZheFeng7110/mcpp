@@ -19,6 +19,8 @@ import mcpp.platform.process;
 import mcpp.toolchain.cppfly;        // std_flag (dialect- and c++fly-aware -std= spelling)
 import mcpp.toolchain.dialect;       // CommandDialect — gnu vs cl.exe spellings
 import mcpp.toolchain.fingerprint;   // hash_file / hash_string (FNV-1a, 16 hex)
+import mcpp.build.hostprogram;       // bundled `mcpp` module compile (own module: see its header)
+import mcpp.toolchain.hostflags;     // the shared host-compile flag producer
 import mcpp.toolchain.linkmodel;     // shared C-library / clang-cfg-bypass model
 import mcpp.toolchain.model;         // Toolchain, PayloadPaths, is_clang/is_musl_target/is_mingw_target
 import mcpp.toolchain.registry;      // archive_tool
@@ -186,246 +188,32 @@ std::string env_value(const std::string& name) {
 // only ones needed. Passed as separate argv tokens (no shell).
 std::vector<std::string> host_base_flags(const mcpp::toolchain::Toolchain& tc,
                                          std::string_view macosDeploymentTarget) {
-    std::vector<std::string> f;
+    // One driver invocation compiles AND links build.mcpp, so it needs both
+    // sides. Both come from mcpp.toolchain.hostflags — the same producer
+    // flags.cppm and the std module build use. This function used to hand-write
+    // the whole assembly, which is how it kept missing what the main build
+    // already knew (quoting, the macOS deployment target, the MSVC dialect);
+    // see 2026-08-02-host-compile-single-producer-design.md.
+    mcpp::toolchain::HostFlagOptions opt;
+    // The host helper keeps TRUSTING clang's cfg on macOS/Windows: the macOS
+    // link needs the libc++abi/unwind handling the main build's
+    // needs_explicit_libcxx path owns, and duplicating it here produced
+    // undefined __cxa_* / __gxx_personality_v0.
+    opt.cfgBypass = mcpp::toolchain::HostFlagOptions::CfgBypass::LinuxOnly;
+    opt.clangStdlibSelect = true;
+    // binutils -B so the driver finds ld/as (GCC; musl and MinGW ship their own).
+    opt.binutilsPrefix = !mcpp::toolchain::is_musl_target(tc)
+                      && !mcpp::toolchain::is_mingw_target(tc);
+    // The helper is exec'd outside anything mcpp controls, so it must be able
+    // to find the toolchain's private runtime libs itself.
+    opt.runtimeLibDirs = true;
+    opt.macosDeploymentTarget = std::string(macosDeploymentTarget);
 
-    // macOS deployment target, FIRST and unconditionally, because clang
-    // refuses to load a module built for a different one and this function's
-    // result feeds every compile in this file: the bundled `mcpp` module's
-    // precompile, its object step, and the build.mcpp compile itself. Putting
-    // it anywhere narrower produced the mismatch in whichever direction was
-    // left out — first the std BMI (built for 14.0) against a compile with no
-    // version-min, then mcpp.pcm (built at the host default 15.0) against a
-    // compile that had just been given 14.0.
-    if constexpr (mcpp::platform::is_macos) {
-        if (!macosDeploymentTarget.empty())
-            f.push_back(std::string("-mmacosx-version-min=")
-                        + std::string(macosDeploymentTarget));
-    }
-
-    // MSVC carries none of this on the command line: cl.exe and link.exe find
-    // headers and import libraries through INCLUDE / LIB, which detection
-    // synthesized into tc.envOverrides. Emitting the GNU shapes below would
-    // produce a string of unknown options and then LNK1181. The environment
-    // is passed to capture_exec instead — that is the whole MSVC "base".
-    if (tc.compiler == mcpp::toolchain::CompilerId::MSVC) return f;
-
-    const auto lm = mcpp::toolchain::resolve_link_model(tc);
-
-    // Clang with a bundled cfg on LINUX: bypass it (--no-default-config) and
-    // provide everything explicitly, same as the main build — the cfg is an
-    // install-time-generated artifact, so trusting it here while bypassing
-    // it in the main build meant two different toolchains for one project.
-    // On macOS/Windows keep trusting the cfg: the macOS link additionally
-    // needs the platform's libc++abi/unwind handling that the main build's
-    // needs_explicit_libcxx path owns (duplicating it for a host compile
-    // produced undefined __cxa_*/__gxx_personality_v0), and the fixup
-    // pipeline regenerates the cfg deterministically anyway.
-    if (mcpp::toolchain::is_clang(tc)) {
-        if constexpr (!mcpp::platform::is_linux) return f;
-        const auto dm = mcpp::toolchain::resolve_clang_driver(tc);
-        if (dm.hasCfg) {
-            f.push_back("--no-default-config");
-            f.push_back("-nostdinc++");
-            f.push_back("-stdlib=libc++");
-            for (auto& inc : dm.cxxIncludes) f.push_back("-isystem" + inc.string());
-            f.push_back("-fuse-ld=lld");
-            f.push_back("--rtlib=compiler-rt");
-            f.push_back("--unwindlib=libunwind");
-            for (auto& d : dm.libDirs) {
-                f.push_back("-L" + d.string());
-                f.push_back("-Wl,-rpath," + d.string());
-            }
-        }
-        if (lm.mode == mcpp::toolchain::CLibMode::Sysroot) {
-            f.push_back("--sysroot=" + lm.sysroot.string());
-        } else if (lm.mode == mcpp::toolchain::CLibMode::PayloadFirst) {
-            for (auto& inc : lm.systemIncludes) f.push_back("-isystem" + inc.string());
-            f.push_back("-B" + lm.crtDir.string());   // Scrt1.o/crti.o discovery
-            for (auto& d : lm.libDirs) {
-                f.push_back("-L" + d.string());
-                f.push_back("-Wl,-rpath," + d.string());
-            }
-            if (!lm.loader.empty())
-                f.push_back("-Wl,--dynamic-linker=" + lm.loader.string());
-        }
-        // Runtime lib dirs so the produced program can load private libs in-tree.
-        for (auto& d : tc.linkRuntimeDirs) {
-            f.push_back("-L" + d.string());
-            f.push_back("-Wl,-rpath," + d.string());
-        }
-        return f;
-    }
-
-    // GCC: a fresh sandbox g++ needs --sysroot to find the C library + the
-    // include-fixed headers; without a sysroot, wire the glibc payload directly.
-    if (lm.mode == mcpp::toolchain::CLibMode::Sysroot) {
-        f.push_back("--sysroot=" + lm.sysroot.string());
-    } else if (lm.mode == mcpp::toolchain::CLibMode::PayloadFirst) {
-        for (auto& inc : lm.systemIncludes) {
-            f.push_back("-idirafter"); f.push_back(inc.string());
-        }
-        f.push_back("-B" + lm.crtDir.string());          // crt1.o/crti.o discovery
-        for (auto& d : lm.libDirs) f.push_back("-L" + d.string());  // -lc/-lm
-    }
-    // binutils -B so the driver finds ld/as (GCC, non-musl; musl ships its own).
-    if (!mcpp::toolchain::is_musl_target(tc)) {
-        auto ar = mcpp::toolchain::archive_tool(tc);
-        if (!ar.empty()) f.push_back("-B" + ar.parent_path().string());
-    }
-    // Runtime lib dirs so the produced program can load private libs in-tree.
-    // -L is link-time and wanted everywhere; rpath is an ELF-only concept —
-    // this is the one host_base_flags branch a PE target reaches, where the
-    // flag is inert and the self-containment answer is the static link in
-    // run_build_program instead (#299).
-    for (auto& d : tc.linkRuntimeDirs) {
-        f.push_back("-L" + d.string());
-        if constexpr (mcpp::platform::supports_rpath)
-            f.push_back("-Wl,-rpath," + d.string());
-    }
+    const mcpp::toolchain::PathEscape plain = mcpp::toolchain::no_escape;
+    auto f = mcpp::toolchain::host_compile_tokens(tc, opt, plain);
+    for (auto& t : mcpp::toolchain::host_link_tokens(tc, opt, plain))
+        f.push_back(t);
     return f;
-}
-
-// The bundled `mcpp` build module — a typed API over the stdout wire protocol
-// so build.mcpp can `import mcpp;` instead of `#include`. Its own I/O uses
-// C-level primitives in the global module fragment, so the module itself
-// needs no std BMI and stays buildable before one exists. (That was once also
-// a limit on build.mcpp; it no longer is — a build.mcpp may `import std;` and
-// the engine stages the same std module the main build uses.)
-// The functions mirror the directive set 1:1; they just print the
-// `mcpp:` lines the engine already parses. Embedded in the binary (not shipped as
-// a file) so it always matches this mcpp's protocol.
-// NOTE: the module declaration line uses a `@MODULE@` placeholder (substituted
-// with `export module` when written) so mcpp's own line-based module scanner does
-// not mistake this embedded string for build_program.cppm exporting a 2nd module.
-constexpr std::string_view kMcppModuleSource = R"CPP(module;
-#include <cstdio>
-#include <cstdlib>
-@MODULE@ mcpp;
-export namespace mcpp {
-inline void cxxflag(const char* flag)             { std::printf("mcpp:cxxflag=%s\n", flag); }
-inline void cflag(const char* flag)               { std::printf("mcpp:cflag=%s\n", flag); }
-inline void link_lib(const char* name)            { std::printf("mcpp:link-lib=%s\n", name); }
-inline void link_search(const char* dir)          { std::printf("mcpp:link-search=%s\n", dir); }
-inline void define(const char* name)              { std::printf("mcpp:cfg=%s\n", name); }
-inline void generated(const char* path)           { std::printf("mcpp:generated=%s\n", path); }
-inline void source(const char* path)              { std::printf("mcpp:source=%s\n", path); }
-inline void include_dir(const char* dir)          { std::printf("mcpp:include-dir=%s\n", dir); }
-inline void include_dir_after(const char* dir)    { std::printf("mcpp:include-dir-after=%s\n", dir); }
-inline void rerun_if_changed(const char* path)    { std::printf("mcpp:rerun-if-changed=%s\n", path); }
-inline void rerun_if_env_changed(const char* var) { std::printf("mcpp:rerun-if-env-changed=%s\n", var); }
-// ── environment contract (read side; values injected by the engine) ─────
-inline const char* env_or(const char* n)          { const char* v = std::getenv(n); return v ? v : ""; }
-inline const char* target()                       { return env_or("MCPP_TARGET"); }
-inline const char* target_os()                    { return env_or("MCPP_TARGET_OS"); }
-inline const char* target_arch()                  { return env_or("MCPP_TARGET_ARCH"); }
-inline const char* target_env()                   { return env_or("MCPP_TARGET_ENV"); }
-inline const char* host()                         { return env_or("MCPP_HOST"); }
-inline const char* profile()                      { return env_or("MCPP_PROFILE"); }
-inline const char* out_dir()                      { return env_or("MCPP_OUT_DIR"); }
-inline const char* manifest_dir()                 { return env_or("MCPP_MANIFEST_DIR"); }
-inline bool has_feature(const char* name) {
-    char buf[256] = "MCPP_FEATURE_";
-    unsigned long o = 13;
-    for (const char* p = name; *p && o + 1 < sizeof buf; ++p, ++o) {
-        char c = *p;
-        buf[o] = (c >= 'a' && c <= 'z') ? char(c - 'a' + 'A')
-               : ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) ? c : '_';
-    }
-    buf[o] = 0;
-    return std::getenv(buf) != nullptr;
-}
-// mcpp#241: resolved install dir of a declared dependency (by its package
-// name), or "" if not found. Same sanitize as has_feature; wraps
-// MCPP_DEP_<SANITIZED_NAME>_DIR.
-inline const char* dep_dir(const char* name) {
-    char buf[256] = "MCPP_DEP_";
-    unsigned long o = 9;
-    for (const char* p = name; *p && o + 5 < sizeof buf; ++p, ++o) {
-        char c = *p;
-        buf[o] = (c >= 'a' && c <= 'z') ? char(c - 'a' + 'A')
-               : ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) ? c : '_';
-    }
-    buf[o++] = '_'; buf[o++] = 'D'; buf[o++] = 'I'; buf[o++] = 'R'; buf[o] = 0;
-    return env_or(buf);
-}
-}
-)CPP";
-
-// Compile the bundled `mcpp` module into `bdir` and return the extra flags the
-// build.mcpp compile needs to import it (the object `mcpp.o` is linked alongside).
-//   GCC   : -fmodules → gcm.cache/mcpp.gcm + mcpp.o; build.mcpp compiles from
-//           `bdir` (cwd) so GCC finds gcm.cache/mcpp.gcm.
-//   Clang : --precompile → mcpp.pcm, then -c → mcpp.o; pass -fmodule-file=mcpp=<pcm>.
-// Does the source contain `import <name>;`?
-//
-// A plain substring search is not enough here: "import std" is a prefix of
-// "import std.compat", so the naive test reports both for a program that
-// only imports the latter, and mcpp would build a std BMI nobody asked for.
-// Match the whole module name and require the terminating `;`, tolerating
-// the whitespace the grammar allows. Occurrences inside comments or string
-// literals still match — over-detection costs one cached BMI lookup, never
-// a wrong build, and that is the same trade the `import mcpp` check has
-// always made.
-bool imports_module(std::string_view src, std::string_view name) {
-    constexpr std::string_view kImport = "import";
-    std::size_t pos = 0;
-    while ((pos = src.find(kImport, pos)) != std::string_view::npos) {
-        std::size_t i = pos + kImport.size();
-        // `importfoo` is not an import.
-        if (i >= src.size() || (src[i] != ' ' && src[i] != '\t')) { ++pos; continue; }
-        while (i < src.size() && (src[i] == ' ' || src[i] == '\t')) ++i;
-        if (src.compare(i, name.size(), name) == 0) {
-            std::size_t j = i + name.size();
-            while (j < src.size() && (src[j] == ' ' || src[j] == '\t')) ++j;
-            if (j < src.size() && src[j] == ';') return true;
-        }
-        ++pos;
-    }
-    return false;
-}
-
-std::expected<std::vector<std::string>, std::string>
-build_mcpp_module(const fs::path& bdir, const fs::path& compiler,
-                  const std::vector<std::string>& base, const std::string& stdFlag,
-                  bool isClang) {
-    std::error_code ec;
-    fs::path cppm = bdir / "mcpp.cppm";
-    std::string moduleSrc(kMcppModuleSource);
-    if (auto p = moduleSrc.find("@MODULE@"); p != std::string::npos)
-        moduleSrc.replace(p, std::string_view("@MODULE@").size(), "export module");
-    { std::ofstream os(cppm, std::ios::trunc);
-      os << moduleSrc;
-      if (!os) return std::unexpected(std::string("could not write mcpp module source")); }
-
-    auto run = [&](std::vector<std::string> argv, const char* what)
-        -> std::expected<void, std::string> {
-        auto r = mcpp::platform::process::capture_exec(argv, {}, bdir.string());
-        if (r.exit_code != 0)
-            return std::unexpected(std::format("mcpp module {} failed (exit {}):\n{}",
-                                               what, r.exit_code, r.output));
-        return {};
-    };
-    auto with_base = [&](std::vector<std::string> head) {
-        for (auto& b : base) head.push_back(b);
-        return head;
-    };
-
-    std::vector<std::string> extra;
-    if (isClang) {
-        if (auto r = run(with_base({compiler.string(), stdFlag, "--precompile",
-                                    "mcpp.cppm", "-o", "mcpp.pcm"}), "precompile"); !r)
-            return std::unexpected(r.error());
-        if (auto r = run(with_base({compiler.string(), stdFlag, "-c",
-                                    "mcpp.pcm", "-o", "mcpp.o"}), "object"); !r)
-            return std::unexpected(r.error());
-        extra.push_back("-fmodule-file=mcpp=" + (bdir / "mcpp.pcm").string());
-    } else {
-        if (auto r = run(with_base({compiler.string(), stdFlag, "-fmodules", "-c",
-                                    "mcpp.cppm", "-o", "mcpp.o"}), "compile"); !r)
-            return std::unexpected(r.error());
-        extra.push_back("-fmodules");
-    }
-    return extra;
 }
 
 // ── Cache (line-based; one record per line, internal format) ───────────────
@@ -754,24 +542,25 @@ std::expected<void, std::string> run_build_program(
     bool usesStdCompat = imports_module(srcText, "std.compat");
     bool usesStd       = usesStdCompat || imports_module(srcText, "std");
 
-    // Named modules under cl.exe go through .ifc + /reference, a different
-    // pipeline from GCC's gcm.cache and Clang's -fmodule-file. That work is
-    // not done, so say so plainly — one gate for both module kinds, because
-    // they fail for exactly the same reason and two conditions would drift.
-    if (msvcHost && (usesModule || usesStd)) {
-        return std::unexpected(std::string(
-            "build.mcpp: `import mcpp;` / `import std;` are not yet supported "
-            "under MSVC.\n"
-            "       Use #include in build.mcpp, or build with a GCC/Clang "
-            "toolchain."));
-    }
+    // The toolchain's own environment (MSVC's INCLUDE / LIB / VSLANG, which
+    // detection synthesized from the located VC tools + Windows SDK). Needed
+    // by every compile below, the module precompile included.
+    std::vector<std::pair<std::string, std::string>> compileEnv;
+    for (auto const& ev : tc.envOverrides)
+        compileEnv.emplace_back(ev.key, ev.value);
 
+    // Named modules dispatch on the same BmiTraits/CommandDialect rows the
+    // main build uses, so there is no per-family gate here: cl.exe's
+    // .ifc + /reference works because the table already describes it, not
+    // because build.mcpp grew a second implementation of it.
     std::vector<std::string> moduleFlags;
+    fs::path mcppModuleObject;
     if (usesModule) {
-        auto mf = build_mcpp_module(bdir, hostCompiler, base, std_flag,
-                                    mcpp::toolchain::is_clang(tc));
+        auto mf = build_mcpp_module(bdir, hostCompiler, base, std_flag, tc,
+                                    compileEnv);
         if (!mf) return std::unexpected(mf.error());
-        moduleFlags = std::move(*mf);
+        moduleFlags = std::move(mf->useFlags);
+        mcppModuleObject = std::move(mf->object);
     }
 
     // ── `import std;` in build.mcpp ─────────────────────────────────────────
@@ -839,15 +628,19 @@ std::expected<void, std::string> run_build_program(
             if (!usesModule) stdFlags.push_back("-fmodules");
             stdStagedInBdir = true;
         } else {
-            stdFlags.push_back(std::string(traits.stdBmiUsePrefix)
-                               + sm->bmiPath.string());
+            // Through bmi_reference_tokens, not string concatenation: the
+            // traits spell these for the ninja STRING channel, where
+            // `-fmodule-file=std=<p>` (one word) and `/reference std=<p>`
+            // (two) are indistinguishable. Concatenating produced a single
+            // argv element with a space inside it, and cl answered
+            // "C2230: could not find module 'std'".
+            for (auto& t : mcpp::toolchain::bmi_reference_tokens(
+                     traits.stdBmiUsePrefix, sm->bmiPath))
+                stdFlags.push_back(t);
             if (usesStdCompat && !sm->compatBmiPath.empty())
-                stdFlags.push_back(std::string(traits.stdCompatBmiUsePrefix)
-                                   + sm->compatBmiPath.string());
-            // The prefixes carry a leading space for the ninja string channel;
-            // an argv element must not.
-            for (auto& f : stdFlags)
-                if (!f.empty() && f.front() == ' ') f.erase(0, 1);
+                for (auto& t : mcpp::toolchain::bmi_reference_tokens(
+                         traits.stdCompatBmiUsePrefix, sm->compatBmiPath))
+                    stdFlags.push_back(t);
         }
         if (!sm->objectPath.empty() && fs::exists(sm->objectPath))
             stdObjects.push_back(sm->objectPath.string());
@@ -874,14 +667,24 @@ std::expected<void, std::string> run_build_program(
     for (auto& sf : stdFlags)    compileArgv.push_back(sf);
     // The `.mcpp` extension is unknown to every driver, so without this the
     // file is handed to the linker as a linker script.
-    for (auto f : dial.forceCxxLangArgv) compileArgv.emplace_back(f);
-    compileArgv.push_back(src.string());
+    // Per-file where the driver has that form (cl's /Tp), positional
+    // otherwise. Object files follow on this same command line, and cl's
+    // global /TP would compile them as C++ source.
+    if (!dial.perFileCxxPrefix.empty()) {
+        compileArgv.push_back(std::string(dial.perFileCxxPrefix) + src.string());
+    } else {
+        for (auto f : dial.forceCxxLangArgv) compileArgv.emplace_back(f);
+        compileArgv.push_back(src.string());
+    }
     if (usesModule || !stdObjects.empty()) {
-        // Link the module objects (GNU: reset the input language first so the
-        // .o isn't treated as C++ source; cl.exe infers by extension and is
-        // unreachable here anyway, gated above).
-        compileArgv.push_back("-x"); compileArgv.push_back("none");
-        if (usesModule) compileArgv.push_back((bdir / "mcpp.o").string());
+        // Link the module objects. GNU drivers need the input language reset
+        // first, or the .o that follows `-x c++` is handed to the frontend as
+        // C++ source; cl.exe has no `-x` at all and infers from the extension.
+        // This used to be unconditional and was only harmless while MSVC could
+        // not reach it — removing that gate made the dead branch live, and cl
+        // answered with `D9002: ignoring unknown option '-x'`.
+        if (!msvcHost) { compileArgv.push_back("-x"); compileArgv.push_back("none"); }
+        if (usesModule) compileArgv.push_back(mcppModuleObject.string());
         for (auto& so : stdObjects) compileArgv.push_back(so);
     }
     // Self-contained helper link — see the staticHostHelper doctrine above.
@@ -903,14 +706,6 @@ std::expected<void, std::string> run_build_program(
     // only mcpp. Otherwise the project root is fine.
     const bool needsBmiCwd = usesModule || stdStagedInBdir;
     std::string compileCwd = needsBmiCwd ? bdir.string() : root.string();
-    // The toolchain's own environment (MSVC's INCLUDE / LIB / VSLANG, which
-    // detection synthesized from the located VC tools + Windows SDK). Only
-    // ninja_backend consumed these before, so a build.mcpp compile under
-    // cl.exe could not find <cstdio> no matter how correct its argv was —
-    // the third and last layer of #331's first finding.
-    std::vector<std::pair<std::string, std::string>> compileEnv;
-    for (auto const& ev : tc.envOverrides)
-        compileEnv.emplace_back(ev.key, ev.value);
     auto cres = mcpp::platform::process::capture_exec(compileArgv, compileEnv,
                                                      compileCwd);
     if (cres.exit_code != 0) {
