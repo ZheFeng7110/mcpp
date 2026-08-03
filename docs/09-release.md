@@ -6,18 +6,28 @@ packaging *your own* project see [02 — Packaging for Release](02-pack-and-rele
 Until now this process lived only in commit messages and workflow comments. One
 of those commit messages contains a misdiagnosis that is corrected in §5.
 
-## 1. The four version sites are two groups
+## 1. Three persistent version sites, plus one derived CI value
 
 | Site | Group | Moves when |
 |---|---|---|
 | `mcpp.toml` `[package].version` | **being built** | you start work on a new version |
 | `src/toolchain/fingerprint.cppm` `MCPP_VERSION` | **being built** | same commit as above (compiled-in copy) |
 | `.xlings.json` `[workspace].mcpp` | **bootstrapped from** | separately, *after* a release is installable |
-| `ci-fresh-install.yml` `MCPP_PIN` | ~~bootstrapped from~~ | **nothing — it is derived at run time** (§4) |
+| `ci-fresh-install.yml` `MCPP_PIN` | **version under test** | **nothing — it is derived at run time** (§5) |
 
-`.github/tools/check_version_pins.sh` enforces what is left mechanically. The two
-"being built" sites must be equal; the bootstrap pin must never be **newer** than
-the version being built.
+`.github/tools/check_version_pins.sh` machine-checks the persistent
+relationships: the two "being built" sites must be equal, and the bootstrap pin
+must never be **newer** than the version being built.
+
+```bash
+bash .github/tools/check_version_pins.sh
+```
+
+Run it with **bash**, not `sh`. It uses process substitution (`done < <(...)`),
+which POSIX `sh`/dash cannot parse — `sh check_version_pins.sh` fails with
+`Syntax error: redirection unexpected` around line 95. That is the invoking
+shell, not a defect in the script: its shebang is `#!/usr/bin/env bash` and CI
+invokes it as `bash`.
 
 The two groups are deliberately allowed to differ. Bumping them together is what
 an earlier revision of the pin checker required, and it sent every CI job to
@@ -96,8 +106,9 @@ mcpp itself on every platform. Treat it as a *useful check*, not a prerequisite.
 **The one hard constraint is direction**: the pin must never name a version that
 is not yet installable. Bump it only after the release is published, mirrored,
 **and merged into xim-pkgindex** — otherwise every CI job fails with
-`package 'mcpp@<unreleased>' not found`. `check_version_pins.sh` enforces the
-weaker "never newer than the version being built"; the index condition is on you.
+`package 'mcpp@<unreleased>' not found`. Once its syntax issue is repaired,
+`check_version_pins.sh` enforces the weaker "never newer than the version being
+built"; the index condition is on you.
 
 ## 5. `MCPP_PIN` is derived, and why that matters
 
@@ -120,7 +131,8 @@ hardcoded literal only bought the first:
    The guard was already deriving the right answer and throwing it away. Feeding
    both from one value makes that disagreement structurally impossible.
 
-`check_version_pins.sh` fails if a literal `MCPP_PIN:` reappears.
+`check_version_pins.sh` rejects a literal `MCPP_PIN:`. Do not reintroduce one: a literal
+would again let the index guard and the installed version drift apart.
 
 > **Correction.** Commit `3b1cb6b` ("bootstrap pin -> 2026.7.29.2") states *"the
 > index no longer serves .1"* and quotes `version '2026.7.29.1' not found`. That
@@ -134,7 +146,7 @@ hardcoded literal only bought the first:
 ```
 [ ] version bumped in mcpp.toml + fingerprint.cppm (one commit)
 [ ] CHANGELOG entry
-[ ] bash .github/tools/check_version_pins.sh
+[ ] `bash .github/tools/check_version_pins.sh` passes (verifies `mcpp.toml` = `MCPP_VERSION`, and `.xlings.json` is not newer)
 [ ] merge to main, CI green
 [ ] gh workflow run release.yml --ref main
 [ ] release.yml green (4 builds + publish-ecosystem)
