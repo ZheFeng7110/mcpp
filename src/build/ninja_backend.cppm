@@ -19,6 +19,7 @@ export module mcpp.build.ninja;
 
 import std;
 import mcpp.build.backend;
+import mcpp.manifest;
 import mcpp.build.distribution;
 import mcpp.build.plan;
 import mcpp.build.flags;
@@ -1299,7 +1300,60 @@ std::string emit_ninja_string(const BuildPlan& plan) {
     if (!plan.runtimeDeployFiles.empty())
         append("\n");
 
-    if (!plan.linkUnits.empty()) {
+    // ── Declared build-graph nodes (`mcpp:action=`) ─────────────────────────
+    //
+    // One rule + one edge per action. Ordering needs no special handling: a
+    // Source action's outputs ARE the compile edge's inputs, and an Artifact
+    // action's inputs ARE the link edge's outputs, so ninja's own file
+    // dependencies sequence everything. That is the entire reason this is a
+    // graph node rather than a phase — the alternative (a post hook) would
+    // have to re-derive the ordering by hand and would still lose incrementality.
+    std::string actionDefaults;
+    for (std::size_t i = 0; i < plan.actions.size(); ++i) {
+        auto const& a = plan.actions[i];
+        std::string cmd;
+        for (auto const& tok : a.command) {
+            if (!cmd.empty()) cmd += ' ';
+            // BOTH escapes, in the order the rest of this file uses
+            // (include_dir_token does the same): ninja first, shell second.
+            // Shell-quoting alone is not enough — a literal `$` in a token
+            // (a path containing one, or an argument like `-Wl,-rpath,$ORIGIN`)
+            // is a VARIABLE REFERENCE to ninja, and quoting does not stop
+            // ninja from expanding it before the shell ever sees it.
+            //
+            // Safe for ordinary tokens: escape_ninja_chars only touches
+            // ` `, `$` and `:`, and shell_quote_arg returns anything without a
+            // metacharacter byte-for-byte, so a plain `--cpp_out=gen` is
+            // unchanged. Each element here is exactly one argv token by
+            // construction (the typed builder appends them one at a time),
+            // which is the assumption per-token quoting needs and which #331
+            // showed is NOT true of hand-assembled flag blobs.
+            cmd += shell_quote_arg(escape_ninja_chars(tok));
+        }
+        append(std::format("rule mcpp_action_{}\n", i));
+        append(std::format("  command = {}\n", cmd));
+        append(std::format("  description = {} {}\n",
+            a.role == mcpp::manifest::BuildAction::Role::Check    ? "CHECK"
+          : a.role == mcpp::manifest::BuildAction::Role::Artifact ? "ARTIFACT"
+                                                                  : "GENERATE",
+            a.description.empty() ? a.id : a.description));
+        append("\n");
+        std::string outs, ins;
+        for (auto const& o : a.outputs) outs += " " + escape_ninja_path(o);
+        for (auto const& in : a.inputs) ins += " " + escape_ninja_path(in);
+        append(std::format("build{} : mcpp_action_{}{}\n", outs, i, ins));
+        append("\n");
+        // A Source action's outputs are already reachable through the compile
+        // edges that consume them. Check and Artifact outputs are terminal, so
+        // without this nothing would ever ask for them — and under explicit
+        // ninja goals (#274) an edge reachable only via `default` is skipped,
+        // which is exactly how the soname aliases went missing in 0.0.104.
+        if (a.role != mcpp::manifest::BuildAction::Role::Source)
+            for (auto const& o : a.outputs)
+                actionDefaults += " " + escape_ninja_path(o);
+    }
+
+    if (!plan.linkUnits.empty() || !actionDefaults.empty()) {
         std::string defaults;
         for (auto& lu : plan.linkUnits) {
             defaults += " " + escape_ninja_path(lu.output);
@@ -1310,6 +1364,7 @@ std::string emit_ninja_string(const BuildPlan& plan) {
         for (auto const& d : plan.runtimeDeployFiles) {
             defaults += " " + escape_ninja_path(d.dest);
         }
+        defaults += actionDefaults;
         append("default" + defaults + "\n");
     }
 

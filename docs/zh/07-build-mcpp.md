@@ -90,8 +90,111 @@ int main() {
 | `mcpp::source(p)` | `mcpp:source=` |
 | `mcpp::include_dir(d)` / `mcpp::include_dir_after(d)` | `mcpp:include-dir=` / `mcpp:include-dir-after=` |
 | `mcpp::rerun_if_changed(p)` / `mcpp::rerun_if_env_changed(v)` | 对应的 `rerun-*` 指令 |
+| `mcpp::dep_bin(pkg, tool)` *(2026.8.5.1+)* | 读 `MCPP_DEP_<PKG>_BIN_<TOOL>` —— 依赖构建出的 **host 工具**的绝对路径(见下) |
+| `mcpp::action{…}.submit()` *(2026.8.5.1+)* | `mcpp:action=` —— **声明一个构建图节点**,而不是在这里把活干了(见下) |
+
+### 依赖产出的 host 工具(2026.8.5.1+)
+
+在 `mcpp.toml` 里声明需求,然后调用它:
+
+```toml
+[dependencies]
+protobuf = { version = "35.1", tools = ["protoc"] }
+```
+
+```cpp
+// build.mcpp
+import mcpp;
+int main() {
+    const char* protoc = mcpp::dep_bin("protobuf", "protoc");
+    // … 调用它,然后声明它产出了什么 …
+}
+```
+
+mcpp 会**为构建机器**构建那个 `kind = "bin"` target(即使在 `--target` 下),
+全局缓存,并把路径交给你。这个请求写在 `mcpp.toml` 而不是这里,理由和依赖本身
+一样:向依赖图索取一个额外产物是**图级别**的请求,而图必须保持可静态分析。
+完整契约(含 `[tools.overrides]`)见 [05 §2.14](05-mcpp-toml.md)。
+
+### 声明工作而不是干活:`mcpp::action`(2026.8.5.1+)
+
+在**这里**直接把源码写出来是省事的路,超过一定规模就是错的:它每次 prepare 跑
+一遍、全量、串行,失败还只报「build.mcpp exited 1」。**声明**这份工作,它就成为
+构建图里的一条边 —— 增量、并行,失败能归因到具体那条边。
+
+```cpp
+import mcpp;
+int main() {
+    const std::string out = std::string(mcpp::out_dir()) + "/foo.pb.cc";
+    mcpp::action a;
+    a.id = "protoc:foo";
+    a.role = "source";                       // "source" | "check" | "artifact"
+    a.arg(mcpp::dep_bin("protobuf", "protoc"))
+     .arg("--cpp_out=...").arg("proto/foo.proto")
+     .input("proto/foo.proto")
+     .output(out.c_str())
+     .submit();
+}
+```
+
+三种 role,一个原语 —— `role` 只决定这条边的输出接到哪:
+
+| `role` | 输出 | 顺序 | 典型 |
+|---|---|---|---|
+| `source` | 进编译集 | 编译边消费它们 | protoc、转译器 |
+| `check` | 一个 stamp 文件 | **与编译并行**(`blocking = true` 才前置) | clang-tidy、格式/ABI 检查 |
+| `artifact` | 一个新文件 | 它的**输入**是链接产物,所以在链接之后跑 | 签名、打包、size budget |
+
+全程不涉及任何 phase 机制:顺序由 ninja 自己的文件依赖决定 —— 这也是为什么
+`artifact` 不会像朴素的「post 构建钩子」那样把自己重复施加一遍。
+
+**必须写出输出文件名。** mcpp 在 prepare 期就定死源码集、fingerprint 与模块图,
+所以名字未知的产物无法构建。内容可以晚到,名字不行。畸形 action 是**硬错误**,
+绝不静默跳过。
+
+生成**模块接口**时,把它的接口也声明出来:
+
+```cpp
+a.output(gen.c_str()).provides("my.generated").imports("std").submit();
+```
+
+mcpp 会播下一个带着该声明的占位文件,使 prepare 期的扫描与你的生成器将要产出的
+内容一致 —— 与 `[modules].scan_overrides` 同一条「声明 + 验证」的取舍,build 期由
+编译器自己的 P1689 输出复核。
+
+命令是 **argv 而不是 shell 字符串**(不假设存在 shell —— Windows 没有能依赖的那个),
+插值只有封闭的一组:
+
+| 变量 | 含义 |
+|---|---|
+| `${mcpp.out_dir}` | 构建输出目录 |
+| `${mcpp.bin_dir}` | 产出的二进制所在目录 |
+| `${mcpp.compile_db}` | `compile_commands.json` 的路径(clang-tidy 的 `-p` 要的就是它) |
+| `${mcpp.target_file:<name>}` | target `<name>` 构建出的文件 |
 
 上面的裸 stdout 协议仍是底层基底;`import mcpp;` 是其上的类型化层。
+
+### `import mcpp;` 才是会演进的那一面(mcpp 2026.8.5.1+)
+
+和 mcpp 对话有两条路,它们的**兼容性承诺不同**:
+
+| | `import mcpp;` | 手写 `printf("mcpp:…")` |
+|---|---|---|
+| 兼容性 | 该模块**内置在 mcpp 二进制里**,由运行它的那个 mcpp 现场编译,程序与引擎不可能不一致 | 你的字符串是冻结的文本,没有任何东西替你校验 |
+| 新指令 | 以新函数的形式到来 | **不会再新增** |
+| 未知指令 | **硬错误** | 警告后忽略 |
+
+用 `import mcpp;` 的程序会自动声明它编译时对应的协议版本(`mcpp:protocol=<N>`,
+在 `main` 之前发出——你不需要自己写)。mcpp 用它做两件事:
+
+- 程序声明的协议**高于** mcpp 所理解的 → **拒绝执行**,并给出升级提示。继续跑会
+  静默丢掉构建依赖的指令,而「构建成功了但那个 flag 根本没到」是最难查的一类问题。
+- 既然双方已被证明一致,**未知指令就是错误**而不是警告:在同一个协议版本内,
+  它只可能是拼写错误。
+
+`printf` 风格的程序什么都不声明,因此保留历史上的「警告并忽略」行为。这一面
+**冻结在上表的 11 条指令**上——它仍然能用、也会继续能用,但新能力只在类型化 API 里
+落地。**要长期维护的程序请用 `import mcpp;`。**
 
 ### `import std;`(mcpp 2026.8.2.1+)
 
@@ -186,7 +289,9 @@ mcpp **不会**每次构建都重跑 `build.mcpp`。它会缓存程序产出的�
 - 工具链,
 - 任何用 `rerun-if-changed` 声明的文件,
 - 任何用 `rerun-if-env-changed` 声明的环境变量,
-- (或某个 `generated` 产物 / `source=` 选中的文件丢失了)。
+- (或某个 `generated` 产物 / `source=` 选中的文件丢失了),
+- (或该缓存是由一个对某条指令解释不同的 mcpp 写下的——条目带一个格式 **epoch**,
+  遇到不认识的 epoch 就重跑一次,而不是把值按错误的含义重放)。
 
 所以请**声明你的输入**:如果程序读了 `config.h` 或 `USE_FAST` 变量,就分别 emit
 `mcpp:rerun-if-changed=config.h` / `mcpp:rerun-if-env-changed=USE_FAST`。这用一份明确的
@@ -203,3 +308,11 @@ mcpp **不会**每次构建都重跑 `build.mcpp`。它会缓存程序产出的�
   [05 - mcpp.toml 工程文件指南](05-mcpp-toml.md)。
 - **当前工作目录是工程根目录**,因此相对路径(`src/generated.cpp`)会落在你预期的位置。
 - `build.mcpp` 非零退出会中止构建并打印其输出。
+- **运行有时间上限**(mcpp 2026.8.5.1+,**仅 POSIX**):构建程序默认有 **600 秒**,
+  超时后 mcpp 杀掉它并让构建失败,错误里会点名是哪个包。用
+  `MCPP_BUILD_PROGRAM_TIMEOUT=<秒>` 覆盖(`0` = 不限)。**Windows 上这个上限不生效**
+  —— 进程启动器还没有 kill-by-handle 的路径(`mcpp.platform.process`),所以在那里
+  卡死的构建程序仍会把构建挂住。与 `mcpp test --timeout` 是同一条限制;明说,而不是
+  含糊过去。**编译**这一步刻意**不设**上限——与 `mcpp test` 同一条不对称纪律:
+  编译跑得久通常是正当的(首次构建 `std` 模块就是分钟级),杀掉它只会产生莫名其妙的
+  失败;而构建**程序**跑得久通常是卡住了,不设上限就会让整个构建挂死且毫无诊断。

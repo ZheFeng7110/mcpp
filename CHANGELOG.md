@@ -3,6 +3,67 @@
 > 本文件追踪 `mcpp-community/mcpp` 公开仓的版本演进。
 > 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [2026.8.5.1] — 2026-08-05
+
+`build.mcpp` 机制的**架构地基**:把「一条指令是什么」收敛成一张表,并补上三个今天就存在的稳定性缺口。架构分析见 `.agents/docs/2026-08-05-build-mcpp-extensibility-architecture.md`(本次实现其中的步 0 与步 1)。
+
+### 改进
+
+- **新增一条 directive 从改 9 处降到改 1 处。** 一条指令原本要在九个地方定义:`Directives` 结构体字段、`parse_line` 分派、`write_cache` 序列化、`read_cache` 反序列化、`apply` 落到 manifest、`cache_fresh` 的产物存在性校验、`prepare.cppm` 的 `DirectiveMark` 字段、`markDirectiveTail`、`foldDirectiveTailIntoPrivateBuild`,再加内置 `mcpp` 模块的类型化包装。`prepare.cppm` 自己的注释还承认这个拆分**仍不完整**(「link/source/fingerprint residues stay at the call sites」)。
+
+  这是本仓库反复付过学费的「同一决策在 N 处推导」形态(#233/#240/#242/#344):它**不在你新增指令时失败**,而是过一阵子在别的地方失败。现在一条指令就是新模块 `src/build/directives.cppm` 里 `kTable` 的**一行**,解析、缓存读写、落盘应用、声明产物契约、私有作用域折叠全部由该行驱动。
+
+  **作用域是必填字段**,不是可选注释:`include-dir` 之所以是 `PackagePrivate`,是「构建期程序不得静默拓宽包的公开接口」这条供应链规则(Cargo 纪律),把它变成表里一列意味着**下一条指令不回答这个问题就加不进来**。
+
+  > 为什么是新模块而不是继续写 `build_program.cppm`:那个文件的匿名 namespace 在 clang 22 + C++20 modules + `-O2` 下会**误编译自己的邻居**(PR#332 证实一个**从未被调用**的新函数就足以破坏 `contract_env`,PR#334 复现)。`mcpp.build.hostprogram` 当初就是为此拆出去的。
+
+- **`build.mcpp` 有了线协议版本(S1)。** 用 `import mcpp;` 的程序在 `main` 之前自动声明 `mcpp:protocol=<N>`(你不用自己写)。于是:
+
+  - 程序声明的协议**高于**本 mcpp 所理解的 → **拒绝执行**并给出升级提示。原先的行为是警告后忽略,那会让「构建成功了但那个 flag 根本没到」——最难查的一类构建 bug——静默发生。
+  - 既然双方已被证明一致,**未知指令即错误**:同一协议版本内它只可能是拼写错误。
+
+  手写 `printf("mcpp:…")` 的程序什么都不声明,**保留**历史上的「警告并忽略」。这条不对称就是兼容性契约本身:那一面**冻结在现有 11 条指令**上,新能力只在类型化 API 里落地。
+
+- **`build.mcpp` 缓存带上了语义 epoch(S2)。** 缓存条目里的指令是命中时**原样重放**的,所以当引擎对某条指令的**解释**改变时,旧条目必须失效而不是被按新含义重放。纪律照抄 `cache_key::kCacheEpoch`:只在旧条目真的不可用时 bump,且**与 mcpp 版本号解耦**(否则每次发布都会让所有构建程序白重跑一遍)。一条本 mcpp 不认识的 `d` 记录(更新的 mcpp 写的)同样让整条条目作废——只重放认识的那部分,等于应用了程序所要求的一个**真子集**。
+
+- **`build.mcpp` 的运行有了时间上限(S3)。** 默认 600 秒,超时杀掉并让构建失败,错误**点名是哪个包**、并说明怎么改。原先没有任何上限:一个死循环或卡在网络读上的构建程序会让整个构建**挂死且毫无诊断**。
+
+  **编译**这一步刻意不设上限——与 `mcpp test` 同一条不对称纪律(run 有限 / build 无限):编译跑得久通常是正当的(首次构建 `std` 模块就是分钟级),杀掉它只会产生莫名其妙的失败;构建**程序**跑得久通常是卡住了。`capture_exec_deadline` 顺带补上了 `cwd` 形参——没有它,加超时会**静默改变**构建程序相对写入的落点。
+
+### 新增
+
+- **依赖产出的 host 工具:`tools = ["protoc"]`(#355)。** 一个包能构建出消费者在**构建期**需要的二进制(protoc、grpc_cpp_plugin、flatc、moc、转译器),但消费者此前完全拿不到它 —— `mcpp::dep_dir()` 给的是**源码树**,而依赖的 `kind = "bin"` target **从不被构建**(`plan.cppm` 只遍历 root 的 targets;唯一的例外 `kind = "shared"` 是按 `--target` 构建的,当 host 工具用不了)。
+
+  **为什么它不能是主图里的一个节点**:时序。`build.mcpp` 跑在 prepare 内,那时 BuildPlan 还不存在、build.ninja 更在其后 —— 主图产出的东西对需要它的程序来说**永远来得太晚**。再叠上交叉编译,它连架构都不对。所以工具由**嵌套的、面向 host 的子构建**产出,落进全局 store。这正是 Cargo `[build-dependencies]` / Bazel exec configuration / vcpkg `"host": true` / Conan `tool_requires` 的形状。
+
+  **为什么它便宜**:工具是**可执行文件**,与主构建零 ABI 接触。子构建因此可以用工具包自己的 `[toolchain]`、自己的 profile、自己的依赖解析,不必与消费者一致 —— 对照 `kind = "lib"` 依赖,这几条**必须**一致。
+
+  **单一版本轴**:工具的版本就是依赖的版本,所以「protoc 与 protobuf 运行时错配」这类**运行期**才炸的问题结构上不可表达。默认关闭(成本由消费者付),成本门复用已有的 `[features]` + `required_features`。全局 store 按 包版本 × host 工具链 × feature × 自身依赖闭包 缓存。
+
+  **逃生舱** `[tools.overrides]` / `MCPP_TOOL_<PKG>_<TOOL>`:直接指一个现成二进制,**完全跳过构建**。每个同类系统都提供这一条(vcpkg `VCPKG_HOST_TRIPLET`、CMake `LLVM_NATIVE_TOOL_DIR`、Qt `QT_HOST_PATH`),理由一样 —— 源码在本机构建不出来的工具不能是死路。它**刻意不进 cache key**:逃生舱不是可复现输入。
+
+- **`mcpp:action=`:声明构建图节点,而不是在 build.mcpp 里干活。** 在程序里直接写生成逻辑,是每次 prepare 跑一遍、全量、串行,失败报「build.mcpp exited 1」。**声明**成节点后它是图里的一条边 —— 增量、并行、失败可归因到具体那条边。
+
+  **一个原语,三种接线**(`role` 只决定输出接到哪,不是三套机制):`source` 进编译集(protoc、转译器)、`check` 产出 stamp 且**默认与编译并行**(clang-tidy、格式/ABI 检查;`blocking` 可改成前置)、`artifact` 的**输入**是链接产物(签名、打包、size budget)。顺序完全由 ninja 的文件依赖决定,不需要任何 phase 机制 —— 这也是为什么 `artifact` 不会像朴素的「post 钩子」那样把自己重复施加一遍。
+
+  **必须写出输出文件名**:mcpp 在 prepare 期就定死源码集、fingerprint 与模块图,名字未知的产物无法进图。内容可以晚到,名字不行。畸形 action 是**硬错误**而非静默跳过。生成**模块接口**时用 `.provides()/.imports()` 声明,mcpp 会按该声明播下占位文件让 prepare 期的扫描与生成器将要产出的内容一致 —— 与 `[modules].scan_overrides` 同一条「声明+验证」的取舍,build 期由编译器自己的 P1689 复核。
+
+  命令是 **argv 而非 shell 字符串**(不假设存在 shell),插值只有封闭的四个:`${mcpp.out_dir}` / `${mcpp.bin_dir}` / `${mcpp.compile_db}` / `${mcpp.target_file:<name>}`。
+
+- **`host-module = true`:可复用的构建规则以普通包分发。** 「跑 protoc」这类规则应该写一次,而不是每个消费者的 build.mcpp 复制一遍。把它做成普通 mcpp 库包,消费者 `import mcpp.rules.protobuf;` 即可。规则因此**有版本、能测试、能发布**,走的是已有的包管理机制,而且是用 **C++** 写的 —— 不引入第二门语言(xmake 用 Lua rule、Bazel 用 Starlark),这正是 build.mcpp 存在的理由。
+
+  实现上的关键:规则模块与 build.mcpp **在同一条命令里、用同一套 flag** 编译。这不是优化 —— BMI 只对「在 standard / dialect / 编译器身份上与它一致」的编译可用,分成两次独立解析的构建则毫无理由一致,而不一致的表现是 `module X CRC mismatch` 而不是一条清楚的错误。
+
+- **工作目录可外置(`BuildOverrides::work_dir`)。** 一次 `mcpp build` 会往工程根写 5 处(`target/`、`mcpp.lock`、`compile_commands.json`、`.mcpp/`、`target/.build-mcpp`),而「注册表包根是共享的、可能只读、绝不写入」是 `build_program.cppm` 自 G2 起的明文不变量 —— 在此之前没有任何东西能对 build.mcpp 的临时目录之外兑现它。把「源码在哪」与「往哪写」拆开,是 host 工具子构建**能够存在**的前提。五处一起搬:只搬一部分比一处都不搬更糟,那等于照样写进共享目录、只是更不显眼。
+
+### 改进
+
+- **内带 xlings 升级到 `2026.8.5.1`**(自 `2026.8.4.1`)。13 个 pin 点由 `check_version_pins.sh` 机器校验并全部更新。
+
+### 修复
+
+- **自举 pin 指向了索引已不再提供的版本。** `ci-aarch64-fresh-install` 自 2026-08-03 起在 main 上就是红的:`version '2026.8.3.2' not found for 'mcpp'`。`.xlings.json` 的自举 pin 是**自举起点**、故意滞后、不随发布走(docs/09 §4),平时不该动 —— 但它有一条硬约束是**必须命名一个可安装的版本**,这条被打破时正是该 bump 的场合(而不是「发版顺手 bump」那种误用)。改到 `2026.8.4.1`。
+
 ## [2026.8.4.1] — 2026-08-04
 
 ### 修复
