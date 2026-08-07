@@ -74,6 +74,26 @@ namespace paths {
     std::optional<std::filesystem::path>
     xpkgs_from_compiler(const std::filesystem::path& compilerBin);
 
+    // The subos a TOOLCHAIN belongs to (mcpp#352).
+    //
+    // Derived from the compiler rather than from a global: a build already
+    // knows which home its toolchain came from, and asking a second source
+    // would let the two disagree — the "one question, several answerers" shape
+    // that the same investigation found four times over on the xlings side.
+    //
+    // A PURE derivation, with no environment override in it. That is not an
+    // omission: this value gets written into the build cache, and an override
+    // means "for this invocation", not "for this build from now on". Caching
+    // one would make a single `MCPP_SUBOS_DIR=… mcpp run` silently change
+    // where every later run looked. Which subos a RUN should use is a
+    // different question, answered in execute.cppm.
+    //
+    // Empty when the toolchain is not sandbox-resident — a system compiler is
+    // the user's explicit choice of the host world, and there is no subos
+    // speaking for it.
+    std::optional<std::filesystem::path>
+    subos_dir_of(const std::filesystem::path& compilerBin);
+
     // Find a sibling xim tool relative to a compiler binary.
     // e.g. find_sibling_tool(gcc_bin, "binutils") returns highest version
     // dir of xim-x-binutils.
@@ -671,6 +691,19 @@ xpkgs_from_compiler(const std::filesystem::path& compilerBin) {
         if (p.filename() == "xpkgs") return p;
     }
     return std::nullopt;
+}
+
+std::optional<std::filesystem::path>
+subos_dir_of(const std::filesystem::path& compilerBin) {
+    auto xpkgs = xpkgs_from_compiler(compilerBin);
+    if (!xpkgs) return std::nullopt;
+    // <home>/data/xpkgs → <home>/subos/default. Spelled from the xpkgs dir
+    // rather than from Env so a toolchain inherited from ANOTHER home resolves
+    // to that home's subos, which is the one whose payloads the binary was
+    // actually linked against.
+    auto home = xpkgs->parent_path().parent_path();
+    if (home.empty()) return std::nullopt;
+    return home / "subos" / "default";
 }
 
 std::optional<std::filesystem::path>

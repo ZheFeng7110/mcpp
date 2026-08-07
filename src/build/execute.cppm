@@ -20,6 +20,8 @@ import mcpp.manifest;
 import mcpp.modgraph.scanner;
 import mcpp.toolchain.stdmod;
 import mcpp.xlings;
+import mcpp.xlings.subos_info;
+import mcpp.log;
 import mcpp.platform;
 import mcpp.fetcher.progress;
 import mcpp.project;
@@ -60,6 +62,12 @@ struct BuildCacheEntry {
     // plan.runtimeLibraryDirs is empty.
     std::string runEnvKey;
     std::string runEnvValue;
+    // The subos this build's toolchain belongs to (mcpp#352). The DIRECTORY,
+    // never the resolved variables: the environment is the subos's property
+    // and must be re-read on every run, while WHICH subos is the build's
+    // property and would otherwise be unknowable on the fast path -- which
+    // has no toolchain to derive it from.
+    std::string subosDir;
     // The resolved profile this entry was built for. Entries used to be keyed
     // by target triple alone, and the fast paths only refuse to run when an
     // EXPLICIT --profile/--dev/--release is passed — so a bare `mcpp build`
@@ -139,6 +147,16 @@ std::vector<BuildCacheEntry> read_build_cache(const std::filesystem::path& proje
             std::getline(f, e.runEnvValue);
             haveNextLine = static_cast<bool>(std::getline(f, line));
         }
+        // Optional subos line. Same back-compat contract: absent ⇒ empty ⇒
+        // the run fast path treats the entry as a miss, exactly as it already
+        // does for a cache written before runtimeEnvKey existed. Running with
+        // a DIFFERENT environment than the full path would be worse than not
+        // using the cache at all -- the program would work once and then
+        // silently stop finding its runtime data.
+        if (haveNextLine && line.starts_with("subos=")) {
+            e.subosDir = line.substr(6);
+            haveNextLine = static_cast<bool>(std::getline(f, line));
+        }
         // Optional profile line. Same back-compat contract as the two blocks
         // above: absent ⇒ e.profile stays empty ⇒ every fast path treats the
         // entry as a miss and falls through to prepare_build.
@@ -167,7 +185,8 @@ void write_build_cache(const std::filesystem::path& projectRoot,
                        const std::string& runEnvKey = "",
                        const std::string& runEnvValue = "",
                        const std::string& profile = "",
-                       const std::string& cacheMode = "") {
+                       const std::string& cacheMode = "",
+                       const std::string& subosDir = "") {
     auto path = projectRoot / kBuildCacheFile;
     auto entries = read_build_cache(projectRoot);
 
@@ -182,7 +201,7 @@ void write_build_cache(const std::filesystem::path& projectRoot,
     // Insert at front (MRU).
     BuildCacheEntry newEntry{targetTriple, outputDir.string(), ninjaProgram, fingerprintHex,
                              runtimeEnvKey, runtimeEnvValue, std::move(runTargets),
-                             runEnvKey, runEnvValue, profile, cacheMode};
+                             runEnvKey, runEnvValue, subosDir, profile, cacheMode};
     entries.insert(entries.begin(), std::move(newEntry));
 
     // Trim to LRU capacity.
@@ -210,6 +229,7 @@ void write_build_cache(const std::filesystem::path& projectRoot,
         for (auto& [name, exe] : e.runTargets) f << name << '\t' << exe << '\n';
         f << "runEnv=" << e.runEnvKey << '\n';
         f << e.runEnvValue << '\n';
+        f << "subos=" << e.subosDir << '\n';
         f << "profile=" << e.profile << '\n';
         f << "cacheMode=" << e.cacheMode << '\n';
     }
@@ -285,6 +305,55 @@ compute_run_env(const mcpp::build::BuildPlan& plan) {
     auto value = mcpp::platform::env::prepend_path_list(key, plan.runtimeLibraryDirs);
     if (key.empty() || value.empty()) return {"", ""};
     return {key, value};
+}
+
+// The environment the active subos declares for the programs it hosts
+// (mcpp#352).
+//
+// A GL application needs three things and mcpp only ever supplied two: the
+// binary links (bootstrap), it finds its libraries (RPATH), and then it has to
+// be told which driver module to load and which GL vendors exist. That third
+// one is a set of environment variables, xlings's graphics packages declare
+// them into the subos, and until now nothing carried them to a program mcpp
+// launched — `xlings subos use` applied them, `mcpp run` did not. Hence a
+// binary that links fine and exits 255 with no output.
+//
+// Resolved at RUN time, deliberately not cached with the build: these values
+// belong to the subos, not to the build, and a user who switches subos between
+// `mcpp build` and `mcpp run` must get the new one. It is a file read.
+//
+// mcpp does not know what any of these variables MEAN, and that is the design:
+// when the ecosystem gains a Vulkan loader or a new driver bridge, the
+// declaration changes and this code does not.
+// The subos a RUN should use: an explicit override if the caller set one,
+// otherwise the subos this build belongs to.
+//
+// The override lives HERE and not in the derivation, because the derivation's
+// answer is cached and this one must not be: MCPP_SUBOS_DIR says "for this
+// invocation". It exists so tests can exercise this path without touching a
+// developer's real subos — an earlier e2e wrote through a symlink and
+// permanently broke a real toolchain — and so a user can point one run at
+// another subos without switching the active one.
+std::filesystem::path subos_dir_for_run(const std::filesystem::path& buildSubos) {
+    if (const char* e = std::getenv("MCPP_SUBOS_DIR"); e && *e)
+        return std::filesystem::path(e);
+    return buildSubos;
+}
+
+std::vector<std::pair<std::string, std::string>>
+compute_subos_env(const mcpp::build::BuildPlan& plan) {
+    auto built = mcpp::xlings::paths::subos_dir_of(plan.toolchain.binaryPath);
+    auto dir = subos_dir_for_run(built ? *built : std::filesystem::path{});
+    if (dir.empty()) return {};
+    auto info = mcpp::xlings::subos::read(dir);
+    // The note is a `verbose` line rather than a warning: a subos with no
+    // self-description is the normal state of every machine whose subos
+    // predates the block, and a warning on every run would train people to
+    // ignore it. It becomes loud only where it explains a failure — the GL
+    // diagnostic path in doctor.
+    if (!info.note.empty())
+        mcpp::log::verbose("subos", info.note);
+    return mcpp::xlings::subos::resolve_env(info, dir);
 }
 
 // Compile a prepared BuildContext. Shared between `mcpp build` and `mcpp run`
@@ -398,12 +467,14 @@ export int run_build_plan(BuildContext& ctx, bool verbose, bool no_cache,
         auto fpHex = ctx.outputDir.filename().string();
         auto runTargets = compute_run_targets(ctx.plan);
         auto [runEnvKey, runEnvValue] = compute_run_env(ctx.plan);
+        auto subosDir = mcpp::xlings::paths::subos_dir_of(ctx.plan.toolchain.binaryPath);
         write_build_cache(ctx.projectRoot, ctx.outputDir, r->ninjaProgram,
                           std::string(targetOverride), fpHex,
                           r->runtimeEnvKey.empty() ? "-" : r->runtimeEnvKey,
                           r->runtimeEnvValue,
                           std::move(runTargets), runEnvKey, runEnvValue,
-                          ctx.profile, std::string(cache_mode_name(ctx.cacheMode)));
+                          ctx.profile, std::string(cache_mode_name(ctx.cacheMode)),
+                          subosDir ? subosDir->string() : std::string{});
     }
 
     // The one place the --strict policy is settled. Degradations reported by
@@ -754,6 +825,25 @@ std::optional<int> try_fast_run(const std::filesystem::path& projectRoot,
     std::vector<std::pair<std::string, std::string>> childEnv;
     if (!match->runEnvKey.empty() && !match->runEnvValue.empty())
         childEnv.emplace_back(match->runEnvKey, match->runEnvValue);
+    // ...and the subos's declared environment, re-READ here rather than taken
+    // from the cache. Which subos is a build property (cached above); what it
+    // declares is the subos's own, and a user who installs a graphics stack
+    // between two runs must get it without rebuilding.
+    //
+    // This is the half that a fast path is most likely to lose, and losing it
+    // would be invisible in the worst way: the first `mcpp run` after a build
+    // takes the full path and works, every later one takes this path and does
+    // not. A GL program would run once and then stop finding its driver.
+    {
+        // Same rule as the full path, through the same helper: an override
+        // for this invocation, else the subos this build was recorded against.
+        auto subosDir = subos_dir_for_run(std::filesystem::path(match->subosDir));
+        if (!subosDir.empty()) {
+            auto info = mcpp::xlings::subos::read(subosDir);
+            for (auto& kv : mcpp::xlings::subos::resolve_env(info, subosDir))
+                childEnv.push_back(std::move(kv));
+        }
+    }
 
     return mcpp::platform::process::run_exec(argv, childEnv) == 0 ? 0 : 1;
 }
@@ -827,6 +917,8 @@ export int build_run_target(const std::optional<std::string>& targetName,
     auto [runEnvKey, runEnvValue] = compute_run_env(ctx->plan);
     if (!runEnvKey.empty() && !runEnvValue.empty())
         childEnv.emplace_back(runEnvKey, runEnvValue);
+    // ...plus whatever the subos declares for the programs it hosts (#352).
+    for (auto& kv : compute_subos_env(ctx->plan)) childEnv.push_back(std::move(kv));
 
     // Direct exec (no /bin/sh): the loader env reaches ONLY the target child,
     // never mcpp or a host shell. Fixes the bundled-glibc-vs-host-libtinfo
@@ -1213,6 +1305,9 @@ export int run_tests(std::span<const std::string> passthrough,
     auto runtimeEnvKey = mcpp::platform::env::runtime_library_path_key();
     auto runtimeEnvValue = mcpp::platform::env::prepend_path_list(
         runtimeEnvKey, ctx->plan.runtimeLibraryDirs);
+    // Read once for the whole run rather than per test: it is one file, and
+    // every test in a run belongs to the same subos.
+    const auto subosEnv = compute_subos_env(ctx->plan);
 
     // macOS deliberately has no runtime-library-path key (env.cppm): injecting
     // DYLD_LIBRARY_PATH would reach every executable ninja launches and can
@@ -1283,6 +1378,10 @@ export int run_tests(std::span<const std::string> passthrough,
         std::vector<std::pair<std::string, std::string>> childEnv;
         if (!runtimeEnvKey.empty() && !runtimeEnvValue.empty())
             childEnv.emplace_back(runtimeEnvKey, runtimeEnvValue);
+        // ...and the subos's declared environment, same as `mcpp run` (#352).
+        // A GL test that cannot find a driver fails the same way a GL program
+        // does, so it must be told the same things.
+        for (auto& kv : subosEnv) childEnv.push_back(kv);
 
         // Prepend the sandbox's subos/default/bin to the CHILD PATH so test
         // binaries that shell out to bootstrapped tools (patchelf, ninja) find

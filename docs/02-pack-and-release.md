@@ -1,9 +1,42 @@
 # 02 — Packaging for Release
 
-> A default dynamically linked binary produced by `mcpp build` normally has a
-> loader and RUNPATH tied to the build sandbox. To distribute it to other
-> machines or deploy it to a server, use `mcpp pack` to produce a release
-> tarball or directory with the appropriate runtime closure.
+> A default dynamically linked binary produced by `mcpp build` has a loader and
+> RUNPATH tied to the build sandbox. It is a development artifact, not a
+> deliverable. Three routes turn it into one — and none of them uses the host's
+> C library.
+
+## Three ways to ship
+
+Every route below produces an artifact whose C runtime comes from the
+ecosystem, never from `/lib64`. That is deliberate: mcpp builds against a
+private glibc precisely so a binary's behaviour does not depend on which
+distribution happens to be underneath it, and reaching back out to the host's
+libc to distribute would give that away at the last step.
+
+| | Route | Command | Where its C runtime comes from | Choose it when |
+|---|---|---|---|---|
+| **A** | Through the ecosystem | `mcpp emit xpkg` → `xlings install <pkg>` | the target machine's own xlings payloads | the target has xlings |
+| **B** | One static file | `mcpp build --target x86_64-linux-musl` | nowhere — it is linked in | you want a single file with no runtime at all |
+| **C** | Carry the runtime | `mcpp pack --mode self-contained` | shipped inside the bundle | any Linux, including older than the build machine |
+
+**On route A, and the thing that surprises people.** The `PT_INTERP` baked into
+a freshly built binary points at *your* machine's payload, so copying that file
+to another machine by hand does not work — the path is not there. That is not a
+property of the artifact so much as of the copy: installed through `xlings`, the
+package's ELF files are repointed at the target machine's own payloads at
+install time. The baked path is a build-machine detail, not a distribution
+format. If you are hand-copying binaries between machines, you want B or C.
+
+**On route B.** `--target …-musl` implies a static link, so there is no loader,
+no RUNPATH and nothing to find at run time. It is the smallest and most
+portable result, and the one to reach for first when the program does not need
+glibc-specific behaviour (NSS lookups, `dlopen` of host plugins).
+
+**On route C.** The bundle carries this toolchain's glibc and its loader, so it
+runs on distributions older than the build machine — the case B cannot cover
+when glibc is actually required. Read the `/proc/self/exe` note below before
+choosing it: launching through a bundled loader changes what the program sees
+about itself.
 
 ## Two axes: target (libc) × mode (bundling depth)
 
@@ -127,6 +160,37 @@ exec "$here/lib/ld-linux-x86-64.so.2" --library-path "$here/lib" "$here/bin/myap
 
 The layout and wrapper above use an x86_64 example. The packer derives the
 loader name from the target; for aarch64 it is `ld-linux-aarch64.so.1`.
+
+#### Trap: `/proc/self/exe` under the bundled loader
+
+Being started *by* the loader has a consequence the layout above does not
+show: the kernel sets `/proc/self/exe` to the **loader**, not to your program,
+and `/proc/self/cmdline` carries the `--library-path` argument. Every "find my
+resources next to the executable" path therefore resolves against `lib/`
+instead of the bundle root — and it does so silently. In practice that means
+a GUI toolkit rendering blank text because it cannot find its fonts, an
+`assets/` directory that appears to be missing, and helper binaries shipped
+alongside the program that cannot be located. Code that parses `argv` from
+`/proc/self/cmdline` sees the loader's arguments mixed in.
+
+This affects `self-contained` only. `vendored`, `system` and `static` all
+carry a `PT_INTERP` that the kernel can use directly, so `/proc/self/exe` is
+correct there.
+
+The wrapper exports **`MCPP_BUNDLE_DIR`** (the bundle root) for this. Resolve
+against it first and fall back only when it is unset:
+
+```c
+const char *base = getenv("MCPP_BUNDLE_DIR");   /* set by run.sh */
+if (!base) {
+    /* not launched through the wrapper — /proc/self/exe is trustworthy */
+}
+```
+
+If the application cannot be changed — a third-party GUI framework doing its
+own resolution, say — use `--mode vendored` instead. It repoints `PT_INTERP`
+at the host loader, at the cost of requiring the host's glibc to be at least
+as new as the one the artifact was built against.
 
 ## Configuration
 
