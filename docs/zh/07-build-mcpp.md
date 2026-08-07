@@ -156,7 +156,7 @@ int main() {
     const std::string out = std::string(mcpp::out_dir()) + "/foo.pb.cc";
     mcpp::action a;
     a.id = "protoc:foo";
-    a.role = "source";                       // "source" | "check" | "artifact"
+    a.role = "source";              // "source" | "check" | "object" | "artifact"
     a.arg(mcpp::dep_bin("protobuf", "protoc"))
      .arg("--cpp_out=...").arg("proto/foo.proto")
      .input("proto/foo.proto")
@@ -165,16 +165,37 @@ int main() {
 }
 ```
 
-三种 role,一个原语 —— `role` 只决定这条边的输出接到哪:
+四种 role,一个原语 —— `role` 只决定这条边的输出接到哪:
 
 | `role` | 输出 | 顺序 | 典型 |
 |---|---|---|---|
 | `source` | 进编译集 | 编译边消费它们 | protoc、转译器 |
 | `check` | 一个 stamp 文件 | **与编译并行**(`blocking = true` 才前置) | clang-tidy、格式/ABI 检查 |
+| `object` | 进**链接**集 | 链接边消费它们 | 资源编译器、`objcopy` 嵌 blob、生成的 `.def`、预编译 `.o` |
 | `artifact` | 一个新文件 | 它的**输入**是链接产物,所以在链接之后跑 | 签名、打包、size budget |
 
 全程不涉及任何 phase 机制:顺序由 ninja 自己的文件依赖决定 —— 这也是为什么
 `artifact` 不会像朴素的「post 构建钩子」那样把自己重复施加一遍。
+
+`object`(2026.8.7.1+)可选 `.target("name")`,可重复。它之所以需要名字:与
+`artifact` 不同,它跑在链接**之前**,没有 `${mcpp.target_file:…}` 可以反推。
+**每一个**匹配不到链接单元的名字都是错误 —— 包括写在一个匹配得上的名字旁边的那个,
+那正是拼错真实的样子。
+
+**优先省略它。** 不写 target 时,产物接到本次构建里该包产出的每个镜像 —— 可执行、
+动态库,**以及测试二进制**。测试二进制在这个集合里,是因为它链接的是同一份库代码:
+把它排除掉,`mcpp build` 会通过而 `mcpp test` 在这个 action 本来要提供的那个符号上
+报 `undefined symbol`。改成显式点名也不行 —— 测试链接单元是从 `tests/*.cpp`
+**发现**出来的,名字不在 `mcpp.toml` 里,而写了它的 `build.mcpp` 在普通
+`mcpp build` 下会直接构建失败,因为那条链接单元根本不存在。
+
+如果本次构建里没有任何东西能接收这些产物(纯静态库包),mcpp 会报一条 degradation:
+这条边只能经由链接被达成,没有链接就意味着命令一次都不会跑,而构建什么都不说。
+
+> 把预编译对象写进 `[build].ldflags` 同样能到达链接器,但**不要**用它承载构建产物:
+> ldflags 是链接命令里的一串字符、不是图里的文件,没有任何东西跟踪它,改了它得到的是
+> `ninja: no work to do`。Windows 资源请用 [`[resources]`](05-mcpp-toml.md);
+> `object` 是其余一切的出口。
 
 **必须写出输出文件名。** mcpp 在 prepare 期就定死源码集、fingerprint 与模块图,
 所以名字未知的产物无法构建。内容可以晚到,名字不行。畸形 action 是**硬错误**,

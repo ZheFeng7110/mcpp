@@ -170,7 +170,7 @@ int main() {
     const std::string out = std::string(mcpp::out_dir()) + "/foo.pb.cc";
     mcpp::action a;
     a.id = "protoc:foo";
-    a.role = "source";                       // "source" | "check" | "artifact"
+    a.role = "source";              // "source" | "check" | "object" | "artifact"
     a.arg(mcpp::dep_bin("protobuf", "protoc"))
      .arg("--cpp_out=...").arg("proto/foo.proto")
      .input("proto/foo.proto")
@@ -179,18 +179,44 @@ int main() {
 }
 ```
 
-Three roles, one primitive — `role` only decides where the edge's outputs
+Four roles, one primitive — `role` only decides where the edge's outputs
 attach:
 
 | `role` | Outputs | Ordering | Typical |
 |---|---|---|---|
 | `source` | join the compile set | the compile edge consumes them | protoc, a transpiler |
 | `check` | a stamp file | runs **alongside** compilation (set `blocking = true` to gate it) | clang-tidy, a format or ABI check |
+| `object` | join the **link** set | the link edge consumes them | a resource compiler, `objcopy` embedding a blob, a generated `.def`, a pre-built `.o` |
 | `artifact` | a new file | its *inputs* are link outputs, so it runs after the link | codesign, packaging, size budgets |
 
 No phase machinery is involved: ninja's own file dependencies do the
 sequencing, which is also why an `artifact` action cannot double-apply itself
 the way a naive "post-build hook" would.
+
+`object` (2026.8.7.1+) takes an optional `.target("name")`, repeatable. It needs
+a name at all because, unlike `artifact`, it runs *before* the link and so has
+no `${mcpp.target_file:…}` to infer one from; every name that matches no link
+unit is an error, including one written next to a name that does match.
+
+**Prefer omitting it.** With no target, the outputs attach to every image the
+declaring package produces in this build — binary, shared library **and test
+binary**. Test binaries are in that set because they link the same library code:
+leave them out and `mcpp build` succeeds while `mcpp test` dies with `undefined
+symbol` on the very symbol the action exists to provide. Naming them instead is
+not an option — test link units are discovered from `tests/*.cpp`, so their
+names are not in `mcpp.toml`, and a `build.mcpp` that spells one stops building
+under plain `mcpp build`, where that unit does not exist.
+
+If nothing in the build can receive the outputs (an archive-only package), mcpp
+reports a degradation: the edge is reachable only through a link, so with no
+link the command would never run and the build would say nothing.
+
+> Naming a pre-built object in `[build].ldflags` also reaches the linker, and
+> should not be used for anything the build produces: ldflags is a flat string
+> in the link command, not a file in the graph, so nothing tracks it and editing
+> it gives you `ninja: no work to do`. For Windows resources specifically, use
+> [`[resources]`](05-mcpp-toml.md) —
+> `object` is the escape hatch for everything else.
 
 **You must name the output files.** mcpp fixes the source set, the fingerprint
 and the module graph during prepare, so an output whose *name* is unknown

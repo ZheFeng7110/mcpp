@@ -3,6 +3,66 @@
 > 本文件追踪 `mcpp-community/mcpp` 公开仓的版本演进。
 > 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [2026.8.7.1] — 2026-08-07
+
+两处「模型比生态少一层」。设计与实测证据见 `.agents/docs/2026-08-07-windows-resources-and-version-identity-design.md`。
+
+### 新增
+
+- **`[resources]`:exe 图标与版本信息现在是 `mcpp.toml` 里的一行(#365)。**
+
+  ```toml
+  [resources]
+  icon = "assets/app.ico"
+  ```
+
+  `FILEVERSION` / `ProductName` / `FileDescription` / `CompanyName` / `LegalCopyright` 全部从 `[package]` 取默认值,资源脚本由 mcpp 生成。自写 `.rc` 写 `files = [...]`,mcpp 编译并**跟踪**它。
+
+  **只有 PE 目标消费这一节**;在 Linux/macOS 上它「不适用」——不是降级、不是带警告地跳过:没有消费者,构建逐字节不变,也不说话。所以**不需要(也不能)加 `cfg(windows)` 谓词**。节名不叫 `[windows]` 是因为「图标」作为概念不是 Windows 专有的,将来 macOS `.icns` 扩同一节而不是把这条轴按 OS 切三份。
+
+  **声明了却不存在的文件是硬错误**,这是对 issue 第 3 条请求的**有意偏离**:mcpp 里每个「声明过的输入」都是这个规则(`main = "…"` 必须匹配恰好一个文件、nasm 缺失是硬错误),而「缺失就跳过」会把这个 feature 要消灭的失效模式写成规定行为——一个没有图标、没有版本信息、且什么都没说的正式二进制。不要图标已经可表达:把那一行删掉。
+
+  **这条校验在每个目标上都跑**,「不适用」只停在*编译*那一步。路径存不存在是关于工作树的事实、不是关于目标的事实;按 PE 设门会让 Linux/macOS 的构建与 CI 完全看不见 `icon` 里的拼写错误,只有 Windows job 变红——正是这条硬错误要消灭的「太晚才知道」。
+
+- **`role = "object"`:build.mcpp 的 action 现在能把产物接到链接输入上。** 角色表原本三格接在「编译输入 / 无 / 链接输出」上,缺的正是「链接输入」——一个构建图显然有的接线点。后果不是理论上的:预编译对象只能塞进 `[build].ldflags`,而那是链接命令里的一串字符、不是图里的文件,于是改了图标得到 `ninja: no work to do`。
+
+  可选 `.target("name")` 指定接哪条边;**省略是推荐写法**,它接到本次构建产出的每个镜像——可执行、动态库**与测试二进制**。测试二进制在默认集合里不是顺手加的:它链接的是同一份库代码,排除掉会让 `mcpp build` 通过而 `mcpp test` 在这个 action 本来要提供的那个符号上报 `undefined symbol`;而改成显式点名也不成立——测试链接单元是从 `tests/*.cpp` **发现**出来的,名字不在 `mcpp.toml` 里,写了它的 build.mcpp 在普通 `mcpp build` 下会直接构建失败。**每一个**匹配不到链接单元的名字都是错误,包括写在一个匹配得上的名字旁边的那个(拼错的真实形状)。本次构建里没有任何镜像可接时报 degradation——这条边只能经由链接被达成,没有链接就意味着命令一次都不跑。
+
+### 修复
+
+- **解析出的版本现在是索引里的字面键,不是重新渲染的数字(#363)。** `resolve_semver` 一直把索引的字面版本键读到手里,然后 `return parsed[i].str()` —— 从解析出的数字重造一个地址。渲染器复现不了的东西就变成了不存在的地址:
+
+  | 上游键 | 旧行为 |
+  |---|---|
+  | `1.92.8-docking` | 截断成 `1.92.8`,与非 docking 那个**塌成同一个可比较版本**(两个不同 tarball) |
+  | `25.0.4.7.1`(jdk-corretto,五段) | 截断成 `25.0.4.7` —— **索引里没有这个键** |
+  | `pre-v0.0.5`(khistory,唯一的发布) | 静默跳过,然后报「no valid versions in index」——把责任推给一个发布得好好的包 |
+
+  现在字面键与序一起传递,`version_req` 只负责**排序**。连带修的:
+
+  - **预发布按 SemVer 排序**,且范围按 npm/Cargo 规则**看不见预发布**,除非约束自己在同一数值元组上带了预发布。`^1.92.8` 因此确定性地选 `1.92.8`,不再在两个 tarball 之间由一个看不见差别的序做取舍。同一条规则顺带修掉 `^1.2.3` 会漏进 `2.0.0-alpha`。
+  - **数值段不再截断在第四段**。真实索引里 `jdk-corretto` 发五段键;截断让 `25.0.4.7.1` 与 `25.0.4.7.2` 比较相等。
+  - **别名条目(`{ ref = "…" }`)不再是范围候选**。`jdk-temurin` 的 `["25.0.4"] = { ref = "25.0.4+7" }` 曾与它自己的目标构成一次「平局」。精确寻址不变。
+  - **不可排序的键**(`b10069`、`latest`、`pre-v0.0.5`)成为一等公民的一类:只参与精确匹配,范围约束下报**指名的**错误并给出可粘贴的 pin 行。
+  - **真平局硬错**。只差 build metadata 的两个键(`1.0.0+a` / `1.0.0+b`)是两个 tarball、两个 sha256,序说不出该要哪个;旧行为按描述符里的行序取第一个,意味着索引的一次排版调整会改变构建出来的东西。
+
+- **mcpp.lock 记录解析结果,并覆盖传递依赖。** 它记的一直是**约束本身**(`version = "^1.92.8"`),而一个记录范围的 lock 不锁定任何东西;`Compiling compat.imgui v^1.92.8` 这行也一样。两者读的都是 `m->dependencies`(未解析的输入、且只有直接依赖),而解析结果 `ResolvedRecord` **早就覆盖整张图**——修法是把两个消费者都指过去,而不是补第三处回写。
+
+  lock 头部现在自己声明**它还不 pin 后续构建**(index 依赖仍每次从约束重新解析)。一个记着真实版本却不生效的文件,比一个明显记着范围的文件更容易被误当权威。
+
+  **dev-dependencies 不进 lock。** 解析结果覆盖整张图,而 `mcpp test` 解析 dev-deps、`mcpp build` 不解析——照单全收会让一个进 VCS 的文件取决于「上一条命令是什么」,build/test/build 写出三个不同的文件。判据:**lock 是 manifest 的函数,不是命令的函数**。头部注释也写了这一条。
+
+- **`[resources]` 在 MSVC 下找不到 `rc.exe`。** 工具链 PATH 覆盖按 `find_first_of(";:")` 切分,而 Windows 路径的**盘符冒号**就在下标 1——`C:\Windows Kits\…` 被切成 `C` 加一段「当前盘相对路径」,同盘时侥幸命中、跨盘必然找不到。而这条 PATH 遍历正是 msvc 下的**主路径**(`rc.exe` 属于 Windows SDK,从不在 `cl.exe` 旁边)。两个调用点各自推导同一条规则、且已经彼此不一致,现在收敛成一个 `split_env_list`。
+
+- **`.rc` 现在能穿过工程级 fast path。** `sources_newer_than` 只扫 `src/**/*` 的 C++ 扩展名,一次只改资源脚本的构建因此报 `Finished dev in 0.15s` —— 而 `.rc` 的 implicit input 集合来自扫描它、扫描发生在 prepare,所以往脚本里新加一行 `#include "ids.h"` 那个头文件永远不会被跟踪。与 `build.mcpp`、glob 输入(#359)是同一类:**mtime 扫描看不见,但改了它图就该长得不一样**。只扫 `files`——`icon` 与 `extra-inputs` 已经是 ninja 的 implicit input。
+
+### 其他
+
+- 版本号 2026.8.6.3 → **2026.8.7.1**。
+- **行为变化(生态可见)**:`cc-connect` 这类「稳定版 + 预发布版」并存的包,`^1.3` 从 `1.3.3-beta.1` 改为解析到 `1.3.2`;`jdk-corretto`/`jdk-temurin` 这类带别名的包,范围解析改为选中真条目(`25.0.4.7.1` 而非别名 `25.0.4`),store 目录名随之变化。
+- **诊断口径**:`resources/versioninfo`(版本资源 Windows 读不到)与 `resources/no-image`(声明了却没有任何镜像可嵌)由 warning 改为 **degradation** —— 它们的 impact 正是本批要消灭的静默失效,`--strict` 必须看得见;`role = "object"` 无消费者新增 `action/no-target`,同口径。
+- README 的包索引链接由仓库地址改为 <https://mcpplibs.github.io/mcpp-index/>。
+
 ## [2026.8.5.4] — 2026-08-06
 
 命令长度这一族缺陷的**第七次**,这次不再补洞。架构分析见 `.agents/docs/2026-08-06-command-length-architecture.md`。
