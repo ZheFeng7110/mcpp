@@ -24,16 +24,12 @@ export namespace mcpp::modgraph {
 // to parse. Ninja never notices because it renders everything via
 // generic_string(); the CDB is the first `.string()` consumer.
 //
-// POSIX is untouched (its native separator already is `/`). Replacing only
-// `/` is also safe for already-native Windows input: it never contains `/`.
+// POSIX is untouched (`make_preferred()` is a no-op there, and it is also
+// safe for already-native Windows input, which never contains `/`).
 std::filesystem::path native_path_from_generic(std::string_view s) {
-    constexpr char kSep = std::filesystem::path::preferred_separator;
-    if (kSep == '/') return std::filesystem::path(s);
-    std::string p(s);
-    for (auto& c : p) {
-        if (c == '/') c = kSep;
-    }
-    return std::filesystem::path(std::move(p));
+    std::filesystem::path p(s);
+    p.make_preferred();
+    return p;
 }
 
 // Does `candidate` match `glob`, interpreted relative to `root`?

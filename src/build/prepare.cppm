@@ -2997,11 +2997,13 @@ prepare_build(bool print_fingerprint,
         std::vector<std::filesystem::path> dirs;
         for (auto const& inc : manifest.buildConfig.includeDirs) {
             if (inc.is_absolute()) {
-                // Native spelling (see native_path_from_generic): a TOML
-                // `C:/SDL2/include` stays mixed on MSVC and leaks into the
-                // CDB's -I otherwise.
-                appendUniquePath(dirs,
-                    mcpp::modgraph::native_path_from_generic(inc.generic_string()));
+                // Native spelling: a TOML `C:/SDL2/include` stays mixed on
+                // MSVC and leaks into the CDB's -I otherwise. Direct
+                // make_preferred — no generic_string round trip, which can
+                // throw for names the ANSI codepage cannot spell (mcpp#230).
+                auto n = inc;
+                n.make_preferred();
+                appendUniquePath(dirs, std::move(n));
                 continue;
             }
             for (auto& dir : mcpp::modgraph::expand_dir_glob(
@@ -3021,8 +3023,9 @@ prepare_build(bool print_fingerprint,
         std::vector<std::filesystem::path> dirs;
         for (auto const& inc : manifest.buildConfig.includeDirsAfter) {
             if (inc.is_absolute()) {
-                appendUniquePath(dirs,
-                    mcpp::modgraph::native_path_from_generic(inc.generic_string()));
+                auto n = inc;
+                n.make_preferred();
+                appendUniquePath(dirs, std::move(n));
                 continue;
             }
             for (auto& dir : mcpp::modgraph::expand_dir_glob(

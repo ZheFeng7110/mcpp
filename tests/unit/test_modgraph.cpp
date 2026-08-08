@@ -167,9 +167,9 @@ TEST(Scanner, GlobLiteralPrefixDerivation) {
 // into a MIXED `root\a/b` — which used to leak into compile_commands.json
 // (`file` / `-c` for every source under a multi-segment glob) and break CLion.
 // glob_literal_prefix must return NATIVE separators so the walk and everything
-// downstream is native too.
+// downstream is native too. (The generic spelling is already locked down by
+// Scanner.GlobLiteralPrefixDerivation above.)
 TEST(Scanner, GlobLiteralPrefixUsesNativeSeparators) {
-    EXPECT_EQ(glob_literal_prefix("a/b/c.cpp").generic_string(), "a/b");
     if constexpr (std::filesystem::path::preferred_separator == '\\') {
         EXPECT_EQ(glob_literal_prefix("a/b/c.cpp").string(), "a\\b");
         EXPECT_EQ(glob_literal_prefix("a/b/c.cpp").string().find('/'),
@@ -757,6 +757,9 @@ TEST(Scanner, PerGlobFlagsMatchBraceAlternation) {
 
 // G8b: relative -I flags are root-relative in the manifest but ninja runs
 // with cwd = output dir — the scanner absolutizes them on every unit.
+// The absolute spelling is NORMALIZED to native separators (#390): MSVC's
+// path keeps the input `/` verbatim, and `-I/abs/path` written with forward
+// slashes used to survive into the CDB's arguments as a mixed path.
 TEST(Scanner, RelativeIncludeFlagsAbsolutized) {
     auto dir = make_tempdir("mcpp-scanner-relinc");
     write(dir / "src" / "a.cpp", "int a();\n");
@@ -774,8 +777,11 @@ TEST(Scanner, RelativeIncludeFlagsAbsolutized) {
     ASSERT_EQ(res.graph.units.size(), 1u);
     auto& fl = res.graph.units[0].packageCxxflags;
     EXPECT_EQ(fl[0], "-I" + (dir / "inc").string());
-    EXPECT_EQ(fl[1], "-I/abs/path");   // absolute stays
-    EXPECT_EQ(fl[2], "-DKEEP");        // non-include untouched
+    if constexpr (std::filesystem::path::preferred_separator == '\\')
+        EXPECT_EQ(fl[1], "-I\\abs\\path");   // absolute stays, but native
+    else
+        EXPECT_EQ(fl[1], "-I/abs/path");     // absolute stays
+    EXPECT_EQ(fl[2], "-DKEEP");              // non-include untouched
 
     std::filesystem::remove_all(dir);
 }

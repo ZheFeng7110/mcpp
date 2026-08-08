@@ -501,10 +501,18 @@ namespace {
 
 // has_root_path: leave absolute AND root-relative ("/x" on Windows)
 // spellings alone — only genuinely root-less paths are project-relative.
+// Both branches normalize to NATIVE separators: a `-Ithird_party/inc` cxxflag
+// would otherwise come back as `C:\proj\third_party/inc` on MSVC (path keeps
+// the input `/` verbatim) and reach the CDB's arguments via packageCxxflags.
 std::string rewrite_rel_copy(const std::string& p, const std::filesystem::path& root) {
     std::filesystem::path fp(p);
-    if (fp.has_root_path()) return p;
-    return (root / fp).string();
+    if (fp.has_root_path()) {
+        fp.make_preferred();
+        return fp.string();
+    }
+    auto joined = root / fp;
+    joined.make_preferred();
+    return joined.string();
 }
 
 void rewrite_rel(std::string& p, const std::filesystem::path& root) {
@@ -691,8 +699,12 @@ local_include_dirs_for(const std::filesystem::path& root,
         if (inc.is_absolute()) {
             // A TOML value like `C:/SDL2/include` keeps its `/` on MSVC —
             // normalize so the CDB's -I comes out native (mixed separators
-            // break CLion). See mcpp::modgraph::native_path_from_generic.
-            dirs.push_back(native_path_from_generic(inc.generic_string()));
+            // break CLion). Direct make_preferred, no generic_string round
+            // trip: the narrow conversion can throw for names the ANSI
+            // codepage cannot spell (mcpp#230).
+            auto n = inc;
+            n.make_preferred();
+            dirs.push_back(std::move(n));
             continue;
         }
         for (auto& d : expand_dir_glob(root, inc.generic_string())) {
@@ -711,7 +723,9 @@ local_include_dirs_after_for(const std::filesystem::path& root,
     std::vector<std::filesystem::path> dirs;
     for (auto const& inc : manifest.buildConfig.includeDirsAfter) {
         if (inc.is_absolute()) {
-            dirs.push_back(native_path_from_generic(inc.generic_string()));
+            auto n = inc;
+            n.make_preferred();
+            dirs.push_back(std::move(n));
             continue;
         }
         for (auto& d : expand_dir_glob(root, inc.generic_string())) {
