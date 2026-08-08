@@ -249,4 +249,65 @@ TEST(SubosInfo, UnknownOpIsDroppedLikeXlingsDrops) {
     EXPECT_EQ(env[0].second, "/yes");
 }
 
+
+
+
+// `prepend` prepends TO the caller's value rather than replacing it. Same
+// reason: the pair replaces the variable, so emitting the declared value alone
+// discards whatever search path the user had.
+TEST(SubosResolveEnv, PrependKeepsTheExportedValue) {
+    Tmp t;
+    t.write(R"({"workspace":{},"subos_info":{"schema_version":1,"runtime":"glibc@2.39",
+        "envs":{"glibc@2.39":[{"var":"LD_LIBRARY_PATH","op":"prepend","value":"/sub/lib"}]}}})");
+    auto info = su::read(t.dir);
+    auto out = su::resolve_env(
+        info, t.dir, [](std::string_view v) -> std::optional<std::string> {
+            if (v == "LD_LIBRARY_PATH") return std::string("/user/lib");
+            return std::nullopt;
+        });
+    ASSERT_EQ(out.size(), 1u);
+    const auto sep = mcpp::platform::env::path_list_separator();
+    EXPECT_EQ(out[0].second, std::string("/sub/lib") + sep + "/user/lib");
+}
+
+// Already there: prepending again would grow the list on every nested run.
+TEST(SubosResolveEnv, PrependIsIdempotentAgainstTheExportedValue) {
+    Tmp t;
+    t.write(R"({"workspace":{},"subos_info":{"schema_version":1,"runtime":"glibc@2.39",
+        "envs":{"glibc@2.39":[{"var":"LD_LIBRARY_PATH","op":"prepend","value":"/sub/lib"}]}}})");
+    auto info = su::read(t.dir);
+    const auto sep = mcpp::platform::env::path_list_separator();
+    const auto existing = std::string("/sub/lib") + sep + "/user/lib";
+    auto out = su::resolve_env(
+        info, t.dir, [&](std::string_view v) -> std::optional<std::string> {
+            if (v == "LD_LIBRARY_PATH") return existing;
+            return std::nullopt;
+        });
+    ASSERT_EQ(out.size(), 1u);
+    EXPECT_EQ(out[0].second, existing);
+}
+
+// `set` wins over an exported value, and that is deliberate.
+//
+// This assertion exists to stop the opposite reading from being reintroduced
+// -- it was, once, as a fix for mcpp#382, and withdrawn: `set` and "a default
+// the user may override" are two intentions, and a subos needs the first for
+// variables naming its own configuration. The escape hatch that issue wants is
+// a NEW op from xlings, whose wire format this is, not a second meaning for
+// this one applied by one consumer.
+TEST(SubosResolveEnv, SetWinsOverAnExportedValue) {
+    Tmp t;
+    t.write(R"({"workspace":{},"subos_info":{"schema_version":1,
+        "runtime":"glibc@2.39",
+        "envs":{"glibc@2.39":[{"var":"GALLIUM_DRIVER","op":"set","value":"d3d12"}]}}})");
+    auto info = su::read(t.dir);
+    auto out = su::resolve_env(
+        info, t.dir, [](std::string_view v) -> std::optional<std::string> {
+            if (v == "GALLIUM_DRIVER") return std::string("llvmpipe");
+            return std::nullopt;
+        });
+    ASSERT_EQ(out.size(), 1u);
+    EXPECT_EQ(out[0].second, "d3d12");
+}
+
 }  // namespace

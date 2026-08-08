@@ -201,8 +201,20 @@ Info read(const std::filesystem::path& subosDir) {
 // never matches and the joined value is a corrupt list. Caught by CI on
 // Windows, not by any amount of reading.
 std::vector<std::pair<std::string, std::string>>
-resolve_env(const Info& info, const std::filesystem::path& subosDir) {
+resolve_env(const Info& info, const std::filesystem::path& subosDir,
+            const std::function<std::optional<std::string>(std::string_view)>&
+                ambient = {}) {
     std::vector<std::pair<std::string, std::string>> out;
+
+    // What the caller's environment already says about a variable.
+    //
+    // The declarations are merged against this, not in a vacuum, because the
+    // result REPLACES the variable in the child (it goes in as extraEnv). A
+    // resolution that ignores the ambient value silently discards it.
+    auto ambient_of = [&](std::string_view var) -> std::optional<std::string> {
+        if (!ambient) return std::nullopt;
+        return ambient(var);
+    };
 
     const std::string subos = subosDir.string();
     auto expand = [&](std::string v) {
@@ -241,7 +253,45 @@ resolve_env(const Info& info, const std::filesystem::path& subosDir) {
             std::pair<std::string, std::string>* hit = nullptr;
             for (auto& kv : out)
                 if (kv.first == d.var) { hit = &kv; break; }
-            if (!hit) { out.emplace_back(d.var, value); continue; }
+            if (!hit) {
+                auto amb = ambient_of(d.var);
+                if (d.op == "set") {
+                    // `set` wins, ambient or not.
+                    //
+                    // Deliberately NOT "yield to an exported value". That
+                    // reading was written here first and withdrawn: `set` and
+                    // "default" are two different intentions, and a subos has
+                    // real need of the first -- a variable naming its own
+                    // loader configuration must not be overridable by a stale
+                    // value in the caller's shell. Collapsing them here would
+                    // remove the ability to express it.
+                    //
+                    // It is also not mcpp's vocabulary to redefine. `envs` is
+                    // xlings' wire format; a consumer that quietly gives an op
+                    // a second meaning makes the same subos behave differently
+                    // depending on which tool launched the program.
+                    //
+                    // The escape hatch mcpp#382 asks for (a recipe declaring a
+                    // DEFAULT the user can override) therefore wants a new op
+                    // from xlings, not a reinterpretation of this one. When it
+                    // exists, it is honoured here -- unknown ops are dropped
+                    // today, which is why it has to arrive on both sides.
+                    out.emplace_back(d.var, value);
+                    continue;
+                }
+                // `prepend` against the ambient value, not instead of it.
+                // These entries replace the variable in the child, so
+                // emitting the declared value alone DROPS whatever the caller
+                // had -- for a PATH-shaped variable that is the user's whole
+                // search path.
+                if (amb && !amb->empty() && !contains_element(*amb, value))
+                    out.emplace_back(d.var, value + sep + *amb);
+                else if (amb && !amb->empty())
+                    out.emplace_back(d.var, *amb);
+                else
+                    out.emplace_back(d.var, value);
+                continue;
+            }
             if (d.op == "set") { hit->second = value; continue; }
             if (!contains_element(hit->second, value))
                 hit->second = value + sep + hit->second;
