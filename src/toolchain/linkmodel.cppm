@@ -72,7 +72,7 @@ struct ToolchainLinkModel {
     std::vector<std::filesystem::path> systemIncludes;
 
     // Rendering knobs derived from the toolchain at resolve time.
-    bool clangDriver   = false;  // clang: -isystem + rpath/loader on link
+    bool clangDriver   = false;  // clang: -isystem headers; gcc: -idirafter
                                  // gcc:   -idirafter (…#include_next), -B/-L only
     bool clangWithCfg  = false;  // sibling <driver>.cfg exists (bundled LLVM)
 
@@ -107,15 +107,45 @@ struct ToolchainLinkModel {
         std::vector<std::string> out;
         if (mode == CLibMode::Sysroot) {
             out.push_back("--sysroot=" + esc(sysroot));
+            // Sysroot mode still needs the interpreter named explicitly when
+            // we know it. mcpp replaces gcc's `*link:` to stop the payload's
+            // accumulated rpath entries reaching artifacts, and the pristine
+            // spec it restores carries the HOST's default loader — so removing
+            // the addressing without supplying a replacement would silently
+            // hand every artifact /lib64/ld-linux. The hermeticity check
+            // catches that, which is how it was found.
+            if (!loader.empty())
+                out.push_back("-Wl,--dynamic-linker=" + esc(loader));
+            // ...and the runtime search path, for the same reason. Replacing
+            // `*link:` removes the rpath the payload's specs used to inject
+            // along with the loader; supplying one without the other produces
+            // a binary whose interpreter is right and whose libm is not found.
+            for (auto& dir : libDirs) {
+                out.push_back("-L" + esc(dir));
+                out.push_back("-Wl,-rpath," + esc(dir));
+            }
             return out;
         }
         if (mode != CLibMode::PayloadFirst) return out;
         if (!crtDir.empty()) out.push_back("-B" + esc(crtDir));
         for (auto& dir : libDirs) {
             out.push_back("-L" + esc(dir));
-            if (clangDriver) out.push_back("-Wl,-rpath," + esc(dir));
+            out.push_back("-Wl,-rpath," + esc(dir));
         }
-        if (clangDriver && !loader.empty())
+        // Emitted for BOTH drivers.
+        //
+        // GCC used to be left to its specs here, on the theory that the
+        // install-time fixup owned the loader. That made the RUN side a
+        // per-toolchain-install decision while the COMPILE side stayed
+        // per-build, and the two named different glibc versions the moment a
+        // second one was installed.
+        //
+        // mcpp already refuses to depend on clang's install-time cfg
+        // (`--no-default-config`, "reproducible builds, no dependence on the
+        // install-time-generated cfg"). The same reasoning had simply never
+        // been applied to gcc. Measured: an explicit -Wl,--dynamic-linker
+        // overrides what the specs inject.
+        if (!loader.empty())
             out.push_back("-Wl,--dynamic-linker=" + esc(loader));
         return out;
     }
@@ -290,20 +320,69 @@ ToolchainLinkModel resolve_link_model(const Toolchain& tc) {
     // cross-compile resolves by what it builds FOR.
     if (is_msvc_target(tc) || is_mingw_target(tc)) return lm;
 
+    // The compiler's OWN runtime lives beside it, not in the C library:
+    // libgcc_s.so.1 for GCC. A produced binary links it whether or not the
+    // build ever mentions it, so its directory has to be on the artifact's
+    // RUNPATH -- and gcc's patched specs used to put it there, which is
+    // exactly why removing that rewrite has to put it back.
+    //
+    // Both modes need this, and only one got it at first. PayloadFirst
+    // artifacts came out with a single RUNPATH entry (the glibc payload) and
+    // resolved libgcc_s.so.1 from the HOST -- or, on a machine without one,
+    // not at all: `error while loading shared libraries: libgcc_s.so.1`. This
+    // developer machine has a usable sysroot, so every local build took the
+    // other branch and the gap only surfaced on CI (e2e 29).
+    //
+    // Not for musl (self-contained sysroot, static world) and not for clang,
+    // which brings compiler-rt and libunwind instead.
+    auto add_compiler_runtime_dir = [&] {
+        if (is_musl_target(tc) || lm.clangDriver || tc.binaryPath.empty()) return;
+        std::error_code lec;
+        auto gccLib = tc.binaryPath.parent_path().parent_path() / "lib64";
+        if (std::filesystem::exists(gccLib, lec))
+            lm.libDirs.push_back(gccLib);
+    };
+
     auto payload_first = [&] {
         auto& pp = *tc.payloadPaths;
         lm.mode   = CLibMode::PayloadFirst;
         lm.crtDir = pp.glibcLib;
         lm.libDirs.push_back(pp.glibcLib);
+        add_compiler_runtime_dir();
         lm.systemIncludes.push_back(pp.glibcInclude);
         if (!pp.linuxInclude.empty())
             lm.systemIncludes.push_back(pp.linuxInclude);
-        if (lm.clangDriver)
-            lm.loader = resolve_loader(pp.glibcLib, tc.targetTriple);
+        // Resolved for both drivers now that both emit it.
+        lm.loader = resolve_loader(pp.glibcLib, tc.targetTriple);
     };
     auto sysroot_mode = [&](const std::filesystem::path& root) {
         lm.mode    = CLibMode::Sysroot;
         lm.sysroot = root;
+        // Name the interpreter even here: see link_tokens. The payload is the
+        // address (R6 — artifacts bind the payload, never the mutable view),
+        // and it is known whenever a runtime binding resolved.
+        //
+        // The pair mirrors exactly what fixup_gcc_specs used to bake in
+        // (`<glibcLib>:<gccLib>`): the C library, and the compiler's own
+        // runtime (libgcc_s, libstdc++). Emitting it per build is the whole
+        // point — the baked copy was a per-toolchain-install decision that no
+        // longer matched the per-build one, and it accumulated one dead entry
+        // per home that ever touched the shared payload.
+        //
+        // Never for a musl target. Its sysroot is self-contained -- it brings
+        // its own libc, CRT and loader -- and the glibc payload here belongs
+        // to the HOST toolchain, which merely happens to be probed alongside.
+        // Putting it on the link path let ld pull glibc's static libc.a into a
+        // musl link: `undefined reference to _DYNAMIC`, `hidden symbol
+        // _DYNAMIC isn't defined`, from dl-reloc-static-pie.o. The musl branch
+        // below already says this about headers; it holds for libraries and
+        // the loader too.
+        if (!is_musl_target(tc)
+            && tc.payloadPaths && !tc.payloadPaths->glibcLib.empty()) {
+            lm.loader = resolve_loader(tc.payloadPaths->glibcLib, tc.targetTriple);
+            lm.libDirs.push_back(tc.payloadPaths->glibcLib);
+        }
+        add_compiler_runtime_dir();
         // Supplement kernel headers when the sysroot lacks them (glibc's
         // local_lim.h needs <linux/limits.h>). Self-contained musl sysroots
         // ship their own; a cross target must not see host-arch headers.

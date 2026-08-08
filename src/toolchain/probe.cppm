@@ -50,11 +50,15 @@ std::filesystem::path
 probe_sysroot(const std::filesystem::path& compilerBin,
               const std::string& envPrefix);
 
-// Probe fine-grained sysroot paths from sibling xpkgs payloads.
-// Returns populated PayloadPaths if glibc xpkg found; linux-headers
-// may be empty if not available.
+// Resolve the payload paths for an EXPLICIT runtime binding ("glibc@2.39").
+//
+// The version is named by the caller's authority, never searched for. An
+// empty binding returns nullopt: declining PayloadFirst is correct, guessing
+// is what split the compile and run halves apart (see §3.2 of
+// 2026-08-08-payload-version-and-contract-drift-design.md).
 std::optional<PayloadPaths>
-probe_payload_paths(const std::filesystem::path& compilerBin);
+probe_payload_paths(const std::filesystem::path& compilerBin,
+                    std::string_view runtimeBinding);
 
 // Ensure sysroot directory has complete headers by symlinking from
 // payload xpkgs. Called when GCC's probed sysroot exists but may
@@ -287,20 +291,47 @@ probe_sysroot(const std::filesystem::path& compilerBin,
                                      mcpp::platform::null_redirect));
     if (r) {
         auto s = trim_line(*r);
-        if (!s.empty() && std::filesystem::exists(s)) {
-            if (usable(s)) return s;
+
+        // A usable sysroot that belongs to somebody else is still somebody
+        // else's. gcc records this path as a string when it is built and
+        // reports it forever after; on a machine with several checkouts the
+        // recorded one routinely exists AND carries headers, so accepting it
+        // on usability alone hands the build another project's tree. Measured
+        // right here: this repo's gcc reported a sysroot under an unrelated
+        // one, and every build took its headers.
+        //
+        // The ownership test lives inside remap_xlings_baked_sysroot, which is
+        // exactly why the order matters -- the early return below reached it
+        // only when the path was missing, so the case the remap exists for was
+        // the one case it never saw.
+        const bool ownedByThisHome =
+            !s.empty() && mcpp::fallback::sysroot_is_owned(s, compilerBin);
+
+        if (ownedByThisHome && usable(s)) return s;
+        if (!s.empty() && std::filesystem::exists(s) && !usable(s))
             mcpp::log::debug("probe", std::format(
                 "sysroot '{}' exists but lacks usr/include/stdlib.h — ignoring", s));
-        }
 
         // GCC bakes the build-time sysroot into the binary. For xlings-built
         // GCC this is a path like <buildhost>/.xlings/subos/default that
-        // doesn't exist on the user's machine. Remap via fallback module.
+        // doesn't exist on the user's machine -- or exists and belongs to a
+        // different one. Remap via fallback module.
         if (auto remapped = mcpp::fallback::remap_xlings_baked_sysroot(s, compilerBin)) {
             if (usable(*remapped)) return *remapped;
             mcpp::log::debug("probe", std::format(
                 "remapped sysroot '{}' lacks usr/include/stdlib.h — ignoring",
                 remapped->string()));
+        }
+
+        // Last resort: a foreign but usable sysroot beats no sysroot. This is
+        // the pre-existing behaviour, kept for machines that have no registry
+        // subos to remap to -- it is a worse answer, not a wrong one, and
+        // taking nothing here would break them outright.
+        if (!s.empty() && std::filesystem::exists(s) && usable(s)) {
+            mcpp::log::verbose("probe", std::format(
+                "using sysroot '{}', which is outside this toolchain's "
+                "registry — no equivalent found under it", s));
+            return std::filesystem::path(s);
         }
     }
 
@@ -326,19 +357,72 @@ probe_sysroot(const std::filesystem::path& compilerBin,
     return {};
 }
 
+// Resolve `<name>@<version>` to the payload ROOT for that exact version.
+//
+// The version is named, never searched: the caller has an authority (the
+// resolved runtime binding) and this turns it into an address. Two payload
+// roots are tried in the order the rest of the file uses -- the compiler's own
+// siblings first, then the active home -- because an inherited or symlinked
+// compiler resolves into its owner home while the active home may be the one
+// that just installed the payload.
+std::optional<std::filesystem::path>
+payload_root_for_binding(const std::filesystem::path& compilerBin,
+                         std::string_view binding) {
+    const auto at = binding.find('@');
+    if (at == std::string_view::npos || at == 0 || at + 1 >= binding.size())
+        return std::nullopt;
+    const auto name    = binding.substr(0, at);
+    const auto version = std::string(binding.substr(at + 1));
+
+    std::error_code ec;
+    // Compiler siblings: <...>/xpkgs/xim-x-<name>/<version>
+    if (auto xpkgs = mcpp::xlings::paths::xpkgs_from_compiler(compilerBin)) {
+        auto root = *xpkgs / std::format("xim-x-{}", name) / version;
+        if (std::filesystem::exists(root, ec)) return root;
+    }
+    // Active home.
+    if (auto xpkgs = mcpp::xlings::paths::active_home_xpkgs()) {
+        auto root = *xpkgs / std::format("xim-x-{}", name) / version;
+        if (std::filesystem::exists(root, ec)) return root;
+    }
+    return std::nullopt;
+}
+
+// `runtimeBinding` is the AUTHORITY -- `--runtime`, else the active subos's
+// `subos_info.runtime`. Empty is a refusal, not a licence to guess: a guess
+// here is how the compile side and the artifact's interpreter came to name
+// different glibc versions, and nothing about the resulting binary looks
+// wrong until it loads a library built against the other one.
 std::optional<PayloadPaths>
-probe_payload_paths(const std::filesystem::path& compilerBin) {
+probe_payload_paths(const std::filesystem::path& compilerBin,
+                    std::string_view runtimeBinding) {
+    if (runtimeBinding.empty()) {
+        mcpp::log::verbose("probe",
+            "no runtime binding resolved — declining PayloadFirst rather than "
+            "picking a libc by directory order");
+        return std::nullopt;
+    }
+    // Only a libc family has a payload of this shape. `macos_sdk`/`ucrt` are
+    // resolved elsewhere, and a musl target uses the sysroot mode.
+    if (!runtimeBinding.starts_with("glibc@")) {
+        mcpp::log::verbose("probe", std::format(
+            "runtime '{}' is not a glibc payload — no PayloadFirst",
+            std::string(runtimeBinding)));
+        return std::nullopt;
+    }
+
+    auto glibc = payload_root_for_binding(compilerBin, runtimeBinding);
+    if (!glibc) {
+        mcpp::log::verbose("probe", std::format(
+            "runtime '{}' is not installed in this home",
+            std::string(runtimeBinding)));
+        return std::nullopt;
+    }
+
     namespace paths = mcpp::xlings::paths;
 
-    // Find glibc xpkg (required). Compiler siblings first; fall back to the
-    // ACTIVE home registry — an inherited/symlinked compiler resolves into
-    // its owner home, while the active home may own (or have just installed)
-    // the sysroot payloads.
-    auto glibc = paths::find_sibling_tool(compilerBin, "glibc");
-    if (!glibc) glibc = paths::find_home_tool("glibc", "include/features.h");
-    if (!glibc) return std::nullopt;
-
-    // Glibc layout: <root>/include/ + <root>/lib64/ (or lib/).
+    // Layout WITHIN the chosen payload. This convention stays: it answers
+    // "where inside", not "which one".
     auto glibcInclude = *glibc / "include";
     if (!std::filesystem::exists(glibcInclude / "features.h"))
         return std::nullopt;

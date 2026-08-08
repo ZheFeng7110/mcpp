@@ -180,7 +180,7 @@ TEST(LinkModel, GccSysrootSupplementsMissingKernelHeaders) {
     EXPECT_NE(lm.compile_flags(ident).find("-isystem"), std::string::npos);
 }
 
-TEST(LinkModel, GccPayloadUsesIdirafterAndNoLoader) {
+TEST(LinkModel, GccPayloadEmitsIdirafterAndItsOwnAddressing) {
     Tmp dir;
     auto glibcLib = dir.path / "glibc" / "lib64";
     touch(glibcLib / "ld-linux-x86-64.so.2");
@@ -194,12 +194,20 @@ TEST(LinkModel, GccPayloadUsesIdirafterAndNoLoader) {
     };
     auto lm = tc::resolve_link_model(t);
     EXPECT_EQ(lm.mode, tc::CLibMode::PayloadFirst);
+    // Headers still differ by driver: libstdc++'s #include_next wrappers need
+    // -idirafter, and that has not changed.
     EXPECT_NE(lm.compile_flags(ident).find("-idirafter"), std::string::npos);
+
+    // Addressing no longer differs. GCC used to be left to its install-time
+    // specs here, which made the RUN side a per-toolchain-install decision
+    // while the COMPILE side stayed per-build -- and the two named different
+    // glibc versions as soon as a second one was installed. mcpp already
+    // refuses to depend on clang's install-time cfg for exactly this reason.
     auto link = lm.link_flags(ident);
     EXPECT_NE(link.find(" -B"), std::string::npos);
-    // GCC's loader/rpath is owned by the specs fixup, not the command line.
-    EXPECT_EQ(link.find("dynamic-linker"), std::string::npos);
-    EXPECT_EQ(link.find("-rpath"), std::string::npos);
+    EXPECT_NE(link.find("--dynamic-linker=" + lm.loader.string()),
+              std::string::npos);
+    EXPECT_NE(link.find("-Wl,-rpath," + glibcLib.string()), std::string::npos);
 }
 
 TEST(LinkModel, NothingUsableYieldsNoneAndEmptyFlags) {
@@ -211,5 +219,21 @@ TEST(LinkModel, NothingUsableYieldsNoneAndEmptyFlags) {
     EXPECT_TRUE(lm.compile_flags(ident).empty());
     EXPECT_TRUE(lm.link_flags(ident).empty());
 }
+
+
+// 关于 `find_sibling_tool` 的顺序:**不在这里测**。
+//
+// 它的注释曾写着 "Return the first (highest) version dir",而代码只是取
+// directory_iterator 的第一项 —— 没有排序。为它写一条断言的尝试失败了:
+// 结果取决于 readdir 顺序,所以那条测试在本机通过、在别的机器上可能失败,
+// **通过和失败都不说明问题**。
+//
+// 正确的做法不是把不确定性钉住,而是让它不再被用于选版本:版本由权威
+// (`--runtime` / subos 的 `subos_info.runtime`)给出,`find_sibling_tool`
+// 只负责定位包根。确定性的判据在 test_toolchain_probe.cpp —— 给定
+// `glibc@2.39`,即使 home 里同时有 2.44,也必须返回 2.39。
+//
+// 注释本身已改为陈述事实(顺序未定义,调用方不得依赖)。
+// 设计:.agents/docs/2026-08-08-payload-version-and-contract-drift-design.md §3.2
 
 }  // namespace
