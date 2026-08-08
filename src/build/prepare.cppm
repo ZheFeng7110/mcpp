@@ -16,6 +16,7 @@ import mcpp.platform.axis;
 import mcpp.libs.json;
 import mcpp.log;
 import mcpp.manifest;
+import mcpp.modgraph.glob;
 import mcpp.modgraph.graph;
 import mcpp.modgraph.scanner;
 import mcpp.modgraph.validate;
@@ -2996,7 +2997,11 @@ prepare_build(bool print_fingerprint,
         std::vector<std::filesystem::path> dirs;
         for (auto const& inc : manifest.buildConfig.includeDirs) {
             if (inc.is_absolute()) {
-                appendUniquePath(dirs, inc);
+                // Native spelling (see native_path_from_generic): a TOML
+                // `C:/SDL2/include` stays mixed on MSVC and leaks into the
+                // CDB's -I otherwise.
+                appendUniquePath(dirs,
+                    mcpp::modgraph::native_path_from_generic(inc.generic_string()));
                 continue;
             }
             for (auto& dir : mcpp::modgraph::expand_dir_glob(
@@ -3016,7 +3021,8 @@ prepare_build(bool print_fingerprint,
         std::vector<std::filesystem::path> dirs;
         for (auto const& inc : manifest.buildConfig.includeDirsAfter) {
             if (inc.is_absolute()) {
-                appendUniquePath(dirs, inc);
+                appendUniquePath(dirs,
+                    mcpp::modgraph::native_path_from_generic(inc.generic_string()));
                 continue;
             }
             for (auto& dir : mcpp::modgraph::expand_dir_glob(

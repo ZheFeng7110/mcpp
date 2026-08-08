@@ -268,7 +268,12 @@ std::filesystem::path glob_literal_prefix(std::string_view glob) {
         ? glob : glob.substr(0, wildcard);
     auto slash = literal.find_last_of('/');
     if (slash == std::string_view::npos) return {};
-    return std::filesystem::path(literal.substr(0, slash));
+    // Native separators, not the raw generic form: MSVC keeps the input's
+    // `/` verbatim, and `root / p` plus the directory walk then propagate a
+    // MIXED `root\generated/modules` into every downstream path — which is
+    // what `compile_commands.json`'s `file` field showed on Windows for
+    // multi-segment globs. See mcpp::modgraph::native_path_from_generic.
+    return native_path_from_generic(literal.substr(0, slash));
 }
 
 // mcpp#228: `{a,b}` alternation, recursively. Finds the first top-level `{`,
@@ -442,7 +447,9 @@ std::vector<std::filesystem::path> expand_dir_glob(const std::filesystem::path& 
     // expand_glob) — include_dirs entries are meant to name one literal
     // directory each; a caller wanting alternatives lists multiple entries.
     if (glob.find('*') == std::string_view::npos) {
-        auto p = root / std::filesystem::path(glob);
+        // Native spelling (see native_path_from_generic — a raw `a/b` would
+        // come back mixed from .string() on MSVC).
+        auto p = root / native_path_from_generic(glob);
         if (std::filesystem::is_directory(p, ec)) out.push_back(p);
         return out;
     }
@@ -682,7 +689,10 @@ local_include_dirs_for(const std::filesystem::path& root,
     std::vector<std::filesystem::path> dirs;
     for (auto const& inc : manifest.buildConfig.includeDirs) {
         if (inc.is_absolute()) {
-            dirs.push_back(inc);
+            // A TOML value like `C:/SDL2/include` keeps its `/` on MSVC —
+            // normalize so the CDB's -I comes out native (mixed separators
+            // break CLion). See mcpp::modgraph::native_path_from_generic.
+            dirs.push_back(native_path_from_generic(inc.generic_string()));
             continue;
         }
         for (auto& d : expand_dir_glob(root, inc.generic_string())) {
@@ -701,7 +711,7 @@ local_include_dirs_after_for(const std::filesystem::path& root,
     std::vector<std::filesystem::path> dirs;
     for (auto const& inc : manifest.buildConfig.includeDirsAfter) {
         if (inc.is_absolute()) {
-            dirs.push_back(inc);
+            dirs.push_back(native_path_from_generic(inc.generic_string()));
             continue;
         }
         for (auto& d : expand_dir_glob(root, inc.generic_string())) {
@@ -738,7 +748,10 @@ void scan_one_into(ScanResult& result,
             // Literal absolute entry — e.g. a dependency build.mcpp's OUT_DIR
             // generated source, which lives OUTSIDE the (possibly read-only)
             // package root. No glob expansion; taken as-is when it exists.
-            if (std::filesystem::path gp(g); gp.is_absolute()) {
+            // Native spelling: a raw `C:/abs/x.cppm` would stay mixed on MSVC
+            // (see native_path_from_generic) and leak into the CDB.
+            auto gp = native_path_from_generic(g);
+            if (gp.is_absolute()) {
                 std::error_code aec;
                 if (std::filesystem::is_regular_file(gp, aec)) all_files.insert(gp);
                 continue;

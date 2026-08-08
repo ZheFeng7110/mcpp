@@ -12,6 +12,30 @@ import std;
 
 export namespace mcpp::modgraph {
 
+// Convert a manifest-style path or glob prefix (always spelled with the
+// generic `/` separator) to the platform's native spelling.
+//
+// MSVC's std::filesystem::path preserves the separators of the string it
+// was constructed from instead of normalizing them, so wrapping a raw
+// `generated/modules` in a path and joining it with `root / p` yields the
+// MIXED `C:\...\generated/modules` — and the directory-walk children built
+// on top of that stay mixed. `.string()` then carries the mixed form into
+// `compile_commands.json` (its `file` / `-c` fields), which CLion refuses
+// to parse. Ninja never notices because it renders everything via
+// generic_string(); the CDB is the first `.string()` consumer.
+//
+// POSIX is untouched (its native separator already is `/`). Replacing only
+// `/` is also safe for already-native Windows input: it never contains `/`.
+std::filesystem::path native_path_from_generic(std::string_view s) {
+    constexpr char kSep = std::filesystem::path::preferred_separator;
+    if (kSep == '/') return std::filesystem::path(s);
+    std::string p(s);
+    for (auto& c : p) {
+        if (c == '/') c = kSep;
+    }
+    return std::filesystem::path(std::move(p));
+}
+
 // Does `candidate` match `glob`, interpreted relative to `root`?
 //
 // Supports "**" (any number of directory levels) and "*" (within one segment).
