@@ -937,7 +937,14 @@ over glibc, macOS natively, `aarch64-ios`, `aarch64-ios-sim` (run under the
 simulator) and `x86_64-ios-sim` under that engine. Windows is not claimed:
 libc++ over the MSVC runtime is a configuration the package does not carry,
 and a `workflow_dispatch` probe measures that row on request without being
-a gate. The package's first three CI corrections were its own (a report
+a gate. That probe's reading on `x86_64-pc-windows-msvc` under 2026.9.14.1
+is an engine finding as much as a package one: the report names the package
+as the C++ layer, and the std module precompile stops at `invalid exception
+model 'dwarf'`, because `graph_runtime_compile_flags` emits
+`-fdwarf-exceptions` on every PE target while the MSVC target accepts only
+its own exception model. A Windows claim would need that flag confined to
+the MinGW rows in addition to the package's own Windows configuration; it
+stays out of this batch. The package's first three CI corrections were its own (a report
 line asserted with one space, a `c-abi` line that the report does not
 print for a payload layer, and an example floor that a patch had not
 written), which is the same shape §14 records for the sandbox script.
