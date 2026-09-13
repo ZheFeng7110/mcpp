@@ -934,7 +934,10 @@ openxlings/xim-pkgindex#837, the bootstrap pin moved, and the sandbox
 script at 14 of 14 against the published engine. `llvm.libcxx` 22.1.8.2
 states `platforms = ["linux", "macos", "ios"]` and its CI is green on Linux
 over glibc, macOS natively, `aarch64-ios`, `aarch64-ios-sim` (run under the
-simulator) and `x86_64-ios-sim` under that engine. Windows is not claimed:
+simulator) and `x86_64-ios-sim` under that engine; it is indexed as
+mcpplibs/mcpp-index#413, and a sandbox build on the released engine over
+the CN mirror resolves the 22.1.8.2 entry, names it as the C++ layer, links
+no libc++ shared object and prints `1-2-3`. Windows is not claimed:
 libc++ over the MSVC runtime is a configuration the package does not carry,
 and a `workflow_dispatch` probe measures that row on request without being
 a gate. That probe's reading on `x86_64-pc-windows-msvc` under 2026.9.14.1
