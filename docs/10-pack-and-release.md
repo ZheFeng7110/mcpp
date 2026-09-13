@@ -191,6 +191,20 @@ on every row, whatever file that row links it to (see
 prebuilt binaries per triple and has no single staged tree, so
 `mcpp pack <lib> --format <name>` is refused rather than ignored.
 
+**A `kind = "app"` target whose artifact is a shared object accepts more than
+one `--target`** (mcpp 2026.9.13.2+): on every Android row an application
+*is* the shared library the platform loads, so `mcpp pack myapp --target
+aarch64-linux-android --target x86_64-linux-android` builds and stages both
+legs into one tree, exactly as a library package's several triples already
+do. Each leg lands at `lib/<abi>/lib<name>.so` (`aarch64` → `arm64-v8a`,
+`x86_64` → `x86_64`), the declared deploy files are staged once, and one
+dispatch runs against the combined tree — which is what lets a member such as
+`dist-apk` build one universal APK. A single `--target` keeps today's flat
+`lib/lib<name>.so` layout unchanged. A target whose artifact is an executable
+on any requested row is still refused for a second `--target`: packing one
+executable for several triples would need several executables, which is a
+different mechanism (`lipo`'s universal binary) that this does not provide.
+
 When `-o` is given a bare filename, the output is placed under `target/dist/`;
 when it includes a directory (relative or absolute), the literal path is used.
 
@@ -482,6 +496,19 @@ Linux either.
 A `kind = "lib"` / `"shared"` target packs normally on macOS — a library package
 never runs the artifact. This restriction is only for programs.
 
+The dependency closure can now be **read** rather than run — `mcpp.pack.binfmt`
+walks a Mach-O's load commands (`LC_LOAD_DYLIB` and its weak/re-export/upward
+siblings for names, `LC_RPATH` for search entries) the same way it already
+reads a PE's import table, and resolves `@executable_path`, `@loader_path` and
+`@rpath` the way `dyld` would, without loading anything. `mcpp pack` does not
+call it yet: bundling a resolved dylib beside the program needs an editor for
+`LC_RPATH` (a load command has no free space to grow into), and that editor is
+designed once resolution is measured on a real macOS build, not before. Until
+then a Mach-O program still stages without its closure — see [Producing a
+distributable](30-build-mcpp.md#producing-a-distributable-pack_format--stage_dir-20269111)
+for what a dispatched format (`.app`, `.ipa`) can already do with a tree that
+has a program and no closure.
+
 ## Configuration
 
 Packaging behavior is configured via the `[pack]` section in `mcpp.toml`. The
@@ -513,11 +540,12 @@ The `static` mode additionally requires a musl toolchain configured under
 
 ## Planned Support
 
-macOS **program** bundling (the Mach-O dependency closure, via `otool -L` /
-`LC_LOAD_DYLIB`, and `install_name_tool` for relocation) is still on the
-roadmap; until it lands `mcpp pack <program>` refuses on that format rather than
-producing something that only looks like a bundle. Windows DLL bundling beyond
-the current `.zip` is also on the roadmap.
+macOS **program** bundling is still on the roadmap. The closure is read now
+(`mcpp.pack.binfmt`'s Mach-O load-command walk — no `otool` needed), but
+bundling a resolved dylib beside the program and rewriting `LC_RPATH` for it
+is not; until that lands `mcpp pack <program>` still refuses on that format
+rather than producing something that only looks like a bundle. Windows DLL
+bundling beyond the current `.zip` is also on the roadmap.
 
 Distribution formats such as `.deb`, `.rpm`, AppImage and `.msi` are **not** on
 this list, and that is a decision rather than an omission: they live in

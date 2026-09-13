@@ -606,6 +606,14 @@ mcpp 会写出 `<暂存树>.stage-manifest` —— 一个兄弟文件,永不是�
 依赖的共享库、同时程序自己的字节并没有变的情况,会把上一次的可分发物原地留下,并报告为
 已是最新。
 
+**这份 manifest 的第一行是 `closure = walked` 或 `closure = not-walked`。**
+`mcpp pack` 会先暂存程序本身与它声明过的运行期文件,再去问这台宿主机能不能解析该产物的
+依赖闭包 —— 所以这棵树可以在没有闭包的情况下存在:今天是一个 Mach-O 程序,或者在
+Windows 宿主上打包一个非 PE 产物。`--format tar` 与 `--format dir` 在这种情况下仍然让
+命令失败,因为归档本身就是闭包;一个被分发出去的格式无论如何都会拿到这棵树,manifest 上
+多出第二行 `reason = <原因>`,点名是哪种机制在这台宿主上不可用。需要闭包的提供方读这个
+字段,而不是从一个空的 `lib/` 里去猜测缺口。
+
 命令是 **argv 而不是 shell 字符串**(不假设存在 shell —— Windows 没有能依赖的那个),
 插值只有封闭的一组:
 
@@ -937,20 +945,21 @@ grpc     = { version = "1.83.0", tools = ["grpc_cpp_plugin"] }
 - **默认关闭。** 没人要就什么都不构建,成本由消费者付。包用 `[features]` +
   `required_features` 给昂贵的部分加门(protobuf 的 `protoc` 需要 libprotoc 的
   ~157 个额外 TU,只用运行时的人绝不该编译它)。
-- **全局缓存**,按 包版本 × host 工具链 × feature × 自身依赖闭包 键控 —— 每台机器
+- **全局缓存**,按 包的源码 × host 工具链 × feature × 自身依赖闭包 键控 —— 每台机器
   构建一次,而不是每个工程一次。
 
-**这个键里没有源码内容,而对 `path` 依赖这一点是看得见的。** 已发布的版本不可变,
-所以对来自索引的工具,这个键是精确的。而正在旁边被编辑的工具,两次构建之间版本相同,
-缓存里的二进制就留在原地:在
+**这个键里有源码,以每种来源能给出的形式。** 已发布的版本不可变,所以对来自索引的
+工具,版本本身就标识了源码。`git` 工具按解析出的 commit 键控。`path` 工具没有随源码
+移动的版本,所以按树的印记键控:每个普通文件的相对路径、大小与修改时间,不计
+`target/`、`.git/`、`.mcpp/` 与 compile database。于是改动工具的 emitter 在下一次构建
+到达消费者,改回去也到达,而没有变化的树仍是 store 命中、不重建。在
 [`examples/12-a-new-device-language`](../../examples/12-a-new-device-language/)
-上实测,改动工具的 emitter 之后 `mcpp run` 打印的是上一次的答案,而抬高工具包的版本
-之后它被重建、产物随之改变。抬版本,或用 `mcpp cache clean` 清空构建缓存 ——
-tool store 就住在里面,路径是 `<mcpp cache dir>/tool/<index>/<name>@<version>/`。
+上实测;此前这个键只有版本,改动 emitter 之后 `mcpp run` 打印的是上一次的答案,直到
+版本被抬高。树被编辑时条目会累积;`mcpp cache clean` 清空 store,路径是
+`<mcpp cache dir>/tool/<index>/<name>@<version>[+<source>]/`。
 
-**缺口在重建,不在跟踪。** 把工具列进 action 输入的规则,确实会在那个文件的字节变化
-时重跑 —— 实测直接覆盖 store 里的二进制,产物随之改变。不发生的是「让这些字节变化」
-的那次重建。
+action 自己的跟踪与 store 的键是两回事。把工具列进 action 输入的规则,会在那个文件的
+字节变化时重跑 —— 实测直接覆盖 store 里的二进制,产物随之改变。
 
 ### `[tools.overrides]` —— 使用已有的二进制
 

@@ -671,6 +671,36 @@ something a dependency can supply, so there is nothing a later step could learn
 that would change the answer -- and a machine without Xcode should not download
 a compiler before being told the compiler is not what is missing.
 
+### The C++ runtime and the compiler runtime are packages on these rows
+
+The payload's static libc++ is a macOS object, which ld64 refuses in an iOS
+link, and its resource directory carries `libclang_rt.osx.a` and no `ios` or
+`iossim` archive. Both layers therefore come from the dependency graph, as
+the C library and the builtins do on the bare-metal rows:
+
+```toml
+[target.'cfg(os = "ios")'.dependencies]
+llvm.libcxx               = "22.1.8.1"   # libc++ and libc++abi as source, with the std module
+llvm.compiler-rt-builtins = "22.1.8.5"   # __isPlatformVersionAtLeast and the generic routines
+```
+
+A framework declares the two lines once and every application inherits them.
+The report names both layers as the graph's, the link carries `-nostdlib++`,
+and the artifact's load commands name no `libc++.1.dylib`: the headers a
+translation unit is compiled against, the module it imports and the objects it
+links are one release by construction.
+
+Without the first declaration the runtime is the SDK's libc++. A program that
+does not import `std` then takes the SDK's headers too
+(`-nostdinc++ -isystem <sdk>/usr/include/c++/v1`) and links `-lc++`. A program
+that imports `std` keeps the payload's module and headers over the SDK's
+dylib, as every iOS build did before this release; the two are different
+releases of libc++, and prepare reports the pairing once, naming the two lines
+above, because it links until an inline path in the newer headers names an
+export the older dylib lacks. Without the second declaration, prepare reports
+once that the payload has no compiler runtime for the platform; a program that
+never reaches an availability check links regardless.
+
 ### The deployment target
 
 `[build] ios_deployment_target` sits beside `macos_deployment_target`, and the

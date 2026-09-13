@@ -152,6 +152,17 @@ error: unknown --format 'bogus'.
 的预构建产物,没有单独一棵暂存树,所以 `mcpp pack <库> --format <name>` 会被拒绝,
 而不是被忽略。
 
+**产物是共享目标文件的 `kind = "app"` target 可以接受一个以上的 `--target`**
+(mcpp 2026.9.13.2+):在每一行 Android 上,一个应用*就是*平台加载的那个共享库,
+所以 `mcpp pack myapp --target aarch64-linux-android --target x86_64-linux-android`
+会构建并把两条腿暂存进同一棵树里,与库包的多三元组做法完全一致。每条腿落在
+`lib/<abi>/lib<name>.so`(`aarch64` → `arm64-v8a`,`x86_64` → `x86_64`),声明的
+部署文件只暂存一次,随后对这棵合并后的树只跑一次分派——这正是 `dist-apk` 这样的
+成员能构建出一个通用 APK 的原因。只给一个 `--target` 时,今天这种扁平的
+`lib/lib<name>.so` 布局保持不变。产物在任何被请求的一行上是可执行文件的 target,
+第二个 `--target` 依旧被拒绝:为多个三元组打包一个可执行文件需要多个可执行文件,
+那是另一种机制(`lipo` 的通用二进制),不在此列。
+
 `-o` 接受裸文件名时自动归到 `target/dist/`;含目录(相对或绝对)
 时按字面路径输出。
 
@@ -408,6 +419,17 @@ mcpp pack --target x86_64-windows-gnu     # 在 Linux 宿主上
 `kind = "lib"` / `"shared"` 目标在 macOS 上照常打包 —— 库打包从不运行产物。
 这条限制只针对程序。
 
+依赖闭包现在可以被**读出来**而不必运行了 —— `mcpp.pack.binfmt` 走一遍 Mach-O 的
+load command(`LC_LOAD_DYLIB` 及其 weak/re-export/upward 三个变体给出名字,
+`LC_RPATH` 给出搜索项),读法与它读 PE 导入表一样;并按 `dyld` 的规则解析
+`@executable_path`、`@loader_path`、`@rpath`,全程不加载任何东西。`mcpp pack`
+还没有调用它:把解析到的 dylib 拷到程序旁边、再重写它的 `LC_RPATH`,需要一个
+load command 编辑器(一条 load command 里没有空间可以塞进更长的路径),这个编辑器
+要等在真实的 macOS 构建上量过解析结果之后才设计,而不是先设计。在那之前,Mach-O
+程序仍然是"暂存但没有闭包"——一个被分发出去的格式(`.app`、`.ipa`)已经能拿这样一棵
+"有程序、没闭包"的树做什么,见
+[产出可分发物](30-build-mcpp.md#产出可分发物pack_format-与-stage_dir20269111)。
+
 ## 配置项
 
 打包行为通过 `mcpp.toml` 中的 `[pack]` 节配置,常用字段如下:
@@ -435,10 +457,11 @@ force_bundle = ["libfoo.so"]        # 即使命中 PEP 600 名单也强制打包
 
 ## 待支持
 
-macOS **程序** bundling(Mach-O 依赖闭包,走 `otool -L` / `LC_LOAD_DYLIB`,
-重定位走 `install_name_tool`)仍在规划中;在它落地之前,`mcpp pack <程序>`
-会在该格式上拒绝,而不是产出一个只是看起来像 bundle 的东西。当前 `.zip`
-之外的 Windows DLL 分发,同样在规划中。
+macOS **程序** bundling 仍在规划中。闭包现在已经能读出来了(`mcpp.pack.binfmt`
+走一遍 Mach-O 的 load command,不需要 `otool`),但把解析到的 dylib 拷到程序旁边、
+再重写它的 `LC_RPATH` 还没做;在这落地之前,`mcpp pack <程序>` 仍会在该格式上拒绝,
+而不是产出一个只是看起来像 bundle 的东西。当前 `.zip` 之外的 Windows DLL 分发,
+同样在规划中。
 
 `.deb`、`.rpm`、AppImage、`.msi` 这些分发格式**不在**这份清单上,而这是一个决定而不是
 一处遗漏:它们住在包里,经 `--format <name>` 到达用户,理由见上一节。`[pack]` 的内建

@@ -709,6 +709,17 @@ changes, and a closure that grew a dependency's shared library while the
 program's own bytes did not would leave the previous distributable in place,
 reported as up to date.
 
+**The manifest's first line is `closure = walked` or `closure = not-walked`.**
+`mcpp pack` stages the program and its declared runtime
+files before it asks whether this host can resolve the artifact's dependency
+closure, so the tree can exist without one — a Mach-O program today, or a
+non-PE artifact packed from a Windows host. `--format tar` and `--format dir`
+still fail the command in that case, since the archive IS the closure; a
+dispatched format receives the tree regardless, with a second manifest line,
+`reason = <why>`, naming the mechanism that was unavailable. A provider that
+needs the closure reads the field rather than inferring a gap from an empty
+`lib/`.
+
 Commands are an **argv, not a shell string** (no shell is assumed — Windows has
 none to rely on), and the only interpolations are a closed set:
 
@@ -1110,23 +1121,28 @@ Four properties worth knowing:
   consumer's to pay. A package gates the expensive part with
   `[features]` + `required_features` (protobuf's `protoc` needs libprotoc's
   ~157 extra TUs, which the runtime's users must not compile).
-- **Cached globally**, keyed on package version × host toolchain × features ×
-  its own dependency closure — built once per machine, not once per project.
+- **Cached globally**, keyed on the package's source × host toolchain ×
+  features × its own dependency closure — built once per machine, not once
+  per project.
 
-**The key holds no source content, and for a `path` dependency that is visible.**
-A published version is immutable, so for a tool that arrives from an index the
-key is exact. A tool being edited next door has the same version from one build
-to the next, and the cached binary stays: measured on
-[`examples/12-a-new-device-language`](../examples/12-a-new-device-language/),
-a change to the tool's emitter left `mcpp run` printing the previous answer,
-while bumping the tool package's version rebuilt it and changed the artifact.
-Bump the version, or empty the build cache with `mcpp cache clean` — the tool
-store lives inside it, at `<mcpp cache dir>/tool/<index>/<name>@<version>/`.
+**The key holds the source, in the form each source kind can offer.** A
+published version is immutable, so for a tool that arrives from an index the
+version alone identifies its sources. A `git` tool is keyed by the commit it
+resolved to. A `path` tool has no version that moves when its sources do, so
+it is keyed by a stamp of its tree: every regular file's relative path, size
+and modification time, with `target/`, `.git/`, `.mcpp/` and the compile
+database excluded. An edit to the tool's emitter therefore reaches the
+consumer on the next build, and so does its reversal, while a tree that did
+not change is a store hit and is not rebuilt. Measured on
+[`examples/12-a-new-device-language`](../examples/12-a-new-device-language/);
+before this rule the key held the version alone and a change to the emitter
+left `mcpp run` printing the previous answer until the version was bumped.
+Entries accumulate as a tree is edited; `mcpp cache clean` empties the store,
+which lives at `<mcpp cache dir>/tool/<index>/<name>@<version>[+<source>]/`.
 
-This is a gap in the rebuild, not in the tracking. An action that declares the
-tool among its inputs does re-run when that file's bytes change, measured by
-overwriting the binary in the store: the artifact followed. What does not happen
-is the rebuild that would change those bytes.
+The action's own tracking is separate from the store's key. An action that
+declares the tool among its inputs re-runs when that file's bytes change,
+measured by overwriting the binary in the store: the artifact followed.
 
 ### `[tools.overrides]` — use an existing binary
 

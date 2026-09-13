@@ -4596,6 +4596,11 @@ prepare_build(bool print_fingerprint,
         // version-keyed directory, so name@version identifies its sources.
         // Path and git checkouts can change under an unchanged identity.
         std::string sourceKind;
+        // What identifies the SOURCES when the version does not: the resolved
+        // commit for `git`, the package root for `path`, empty for an index
+        // package. Read by the tool store, whose key must hold everything
+        // that can change a built tool's bytes (#630, item 6).
+        std::string sourceRef;
     };
     std::vector<DepCacheIdentity> dep_cache_identities;
     struct GitLockIdentity {
@@ -4614,6 +4619,24 @@ prepare_build(bool print_fingerprint,
         std::string constraint;         // AND-combined original constraints (version src only)
         std::string requestedBy;        // human-readable for error messages
         std::string source;             // "version" | "path" | "git" — for type-clash check
+        // The declaration's identity beyond `source`, so a SECOND declaration
+        // of the same (ns, name) can be compared for "the same reference"
+        // rather than merely "the same kind". `git`: "<url>#<refKind>=<ref>",
+        // from the DECLARED ref (never the resolved commit — comparing two
+        // branch names must not need a network round trip to decide whether
+        // they conflict). `path`: the canonical absolute directory. `version`:
+        // the original constraint string ("*" for none). See the
+        // `dependency/source-override` decision at the resolve hit (2026-09-13
+        // #630 record, §2.2).
+        std::string sourceRef;
+        // True when this record's declaration came from the root manifest's
+        // own [dependencies]/[dev-dependencies]/[build-dependencies]
+        // (`item.consumerDepIndex == kMainConsumer` at the time the record
+        // was created). Bounds the root's privilege to override a
+        // conflicting declaration of the SAME identity the way
+        // `DependencySpec::linkage` is honoured only on the root's own
+        // edges — see dep_spec.cppm.
+        bool        fromRoot = false;
         // Reached ONLY through [dev-dependencies]. mcpp.lock excludes these:
         // dev-deps are resolved under `mcpp test` and not under `mcpp build`, so
         // recording them makes a VCS-committed file depend on which command ran
@@ -6431,6 +6454,31 @@ prepare_build(bool print_fingerprint,
                             /*buildOnly=*/true});
     }
 
+    // `ResolvedRecord::sourceRef` for a given declaration — see the field's
+    // comment. Computed from what was AUTHORED, not from a network round
+    // trip: a `branch` reference is compared by name here, and the two
+    // clones it may eventually resolve to are a question `resolveSemver`-style
+    // ANSWERING code, not this IDENTITY code, would have to ask.
+    auto sourceRefOf = [&](const std::string& kind,
+                           const mcpp::manifest::DependencySpec& s,
+                           const std::filesystem::path& resolveRoot,
+                           const std::string& originalConstraint) -> std::string {
+        if (kind == "git") {
+            return std::format("{}#{}={}", s.git, s.gitRefKind, s.gitRev);
+        }
+        if (kind == "path") {
+            std::filesystem::path p = s.path;
+            auto base = resolveRoot.empty() ? *root : resolveRoot;
+            if (p.is_relative()) p = base / p;
+            std::error_code ec;
+            auto canon = std::filesystem::weakly_canonical(p, ec);
+            return (ec ? p : canon).lexically_normal().generic_string();
+        }
+        // "version": the constraint as authored; empty means unconstrained,
+        // matching `addrset::unify`'s treatment of a bare-name claim.
+        return originalConstraint.empty() ? std::string("*") : originalConstraint;
+    };
+
     while (!worklist.empty()) {
         auto item = std::move(worklist.front());
         worklist.pop_front();
@@ -6471,19 +6519,114 @@ prepare_build(bool print_fingerprint,
             spec.isPath()    ? "path"
             : spec.isGit()    ? "git"
             : "version";
+        // The commit a `git` dependency resolved to, carried out of the clone
+        // branch below for the cache identity.
+        std::string sourceCommit;
 
         if (auto it = resolved.find(key); it != resolved.end()) {
             // A package is dev-only until some non-dev consumer wants it. Order
             // of arrival must not decide, so this is an AND over every request.
             it->second.devOnly = it->second.devOnly && item.devOnly;
-            // Conflict detection.
+            // Conflict detection: a KIND clash (`path`/`git`/`version` differ).
+            // Rows 4 and 5 of the decision table in the 2026-09-13-630 record
+            // §2.2. Two non-root requesters keep the outright refusal (row
+            // 5); when the root is a party, its declaration wins instead
+            // (row 4) — a whole-graph choice of WHICH checkout an identity
+            // resolves to is exactly the kind of decision
+            // `DependencySpec::linkage` already reserves to the root's own
+            // edges (dep_spec.cppm).
             if (it->second.source != sourceKind) {
-                return std::unexpected(std::format(
-                    "dependency '{}{}{}' is requested as both a {} dep "
-                    "(by '{}') and a {} dep (by '{}'). Pick one.",
+                const bool existingIsRoot = it->second.fromRoot;
+                const bool incomingIsRoot = item.consumerDepIndex == kMainConsumer;
+
+                if (!existingIsRoot && !incomingIsRoot) {
+                    return std::unexpected(std::format(
+                        "dependency '{}{}{}' is requested as both a {} dep "
+                        "(by '{}') and a {} dep (by '{}'). Pick one.\n"
+                        "       declare '{}{}{}' in the root to settle it.",
+                        key.ns, key.ns.empty() ? "" : ".", key.shortName,
+                        it->second.source, it->second.requestedBy,
+                        sourceKind, item.requestedBy,
+                        key.ns, key.ns.empty() ? "" : ".", key.shortName));
+                }
+                if (incomingIsRoot && !existingIsRoot) {
+                    // FIFO SEEDING MAKES THIS UNREACHABLE. Every root-declared
+                    // identity is pushed onto `worklist` before this loop
+                    // starts; a transitive dependency's request is pushed
+                    // onto the BACK of the same deque while the loop runs.
+                    // The root's own entry for any identity is therefore
+                    // always dequeued — and resolved — before any
+                    // dependency's request for that identity can arrive. If
+                    // this branch is ever reached, the invariant broke
+                    // upstream (the seed reordered, or a new seed source was
+                    // added after the loop starts): refusing and naming the
+                    // invariant is safer than silently letting whichever side
+                    // arrived first win, which is the accident #630 reports.
+                    return std::unexpected(std::format(
+                        "internal: dependency '{}{}{}': the root's "
+                        "declaration arrived after '{}' had already resolved "
+                        "it. This is unreachable under first-in-first-out "
+                        "worklist seeding; please report this as an mcpp "
+                        "engine defect.",
+                        key.ns, key.ns.empty() ? "" : ".", key.shortName,
+                        it->second.requestedBy));
+                }
+
+                // The root already holds this identity (existingIsRoot); the
+                // incoming, non-root declaration is overridden. When the
+                // OVERRIDDEN declaration is a version requirement, it is
+                // still a promise about the graph and is checked against
+                // what the root's checkout actually is — the same
+                // Holds/Violated test `addrset::unify` runs for a tool pin
+                // (address_set.cppm).
+                if (sourceKind == "version") {
+                    const std::string winnerVersion = it->second.source == "version"
+                        ? it->second.version
+                        : (it->second.depIndex < dep_manifests.size()
+                               ? dep_manifests[it->second.depIndex]->package.version
+                               : std::string{});
+                    auto req = mcpp::version_req::parse_req(item.originalConstraint);
+                    auto ver = mcpp::version_req::parse_version(winnerVersion);
+                    // An unparseable requirement or checkout version is
+                    // reported as an override below rather than refused: a
+                    // refusal manufactured from ignorance is worse than the
+                    // silent override it would be preventing (the same
+                    // reasoning `addrset::check` states for an unparseable
+                    // spelling).
+                    if (req && ver && !mcpp::version_req::matches(*req, *ver)) {
+                        return std::unexpected(std::format(
+                            "'{}{}{}' is pinned to {} (version {}) by '{}', "
+                            "and '{}' requires {}.\n"
+                            "       One checkout of a package is used, so the "
+                            "two cannot both hold.\n"
+                            "       fix: relax the requirement, or point the "
+                            "root's pin at a checkout satisfying it.",
+                            key.ns, key.ns.empty() ? "" : ".", key.shortName,
+                            it->second.sourceRef, winnerVersion,
+                            it->second.requestedBy,
+                            item.requestedBy, item.originalConstraint));
+                    }
+                }
+
+                mcpp::diag::warning("dependency/source-override", std::format(
+                    "'{}{}{}' is declared as a {} dep (by '{}', {}) and as a "
+                    "{} dep (by '{}', {}); the root's declaration wins.",
                     key.ns, key.ns.empty() ? "" : ".", key.shortName,
-                    it->second.source, it->second.requestedBy,
-                    sourceKind, item.requestedBy));
+                    it->second.source, it->second.requestedBy, it->second.sourceRef,
+                    sourceKind, item.requestedBy,
+                    sourceKind == "version" ? item.originalConstraint
+                                            : sourceRefOf(sourceKind, spec,
+                                                          item.resolveRoot,
+                                                          item.originalConstraint)),
+                    std::format("declare '{}{}{}' in the root to choose the other.",
+                        key.ns, key.ns.empty() ? "" : ".", key.shortName));
+
+                if (it->second.depIndex + 1 < packages.size()) {
+                    recordDependencyEdge(item.consumerDepIndex,
+                                         it->second.depIndex + 1,
+                                         spec, item.buildOnly);
+                }
+                continue;
             }
             if (sourceKind == "version" && it->second.version != spec.version) {
                 // SemVer merge attempt: AND-combine the two original
@@ -6655,6 +6798,13 @@ prepare_build(bool print_fingerprint,
                         .constraint        = item.originalConstraint,
                         .requestedBy       = item.requestedBy,
                         .source            = "version",
+                        .sourceRef         = item.originalConstraint.empty()
+                                                 ? std::string("*") : item.originalConstraint,
+                        // The mangling fallback refuses a main-package
+                        // participant earlier (see the branch's comment
+                        // above), so this record's requester is always a
+                        // dependency.
+                        .fromRoot          = false,
                         .devOnly           = item.devOnly,
                         .depIndex          = dep_manifests.size() - 1,
                         .linkFlagsAdded    = std::move(linkFlagsAdded),
@@ -6760,6 +6910,56 @@ prepare_build(bool print_fingerprint,
                                         it->second.depIndex, {}, item.devOnly});
                 }
                 continue;
+            }
+            // SAME kind, possibly DIFFERENT reference: two `git` declarations
+            // of different rev/tag/branch, or two `path` declarations of
+            // different directories. Row 3 of the decision table (`version`
+            // vs `version` is handled above and never reaches here). Before
+            // this comparison existed, the second declaration's reference was
+            // never even read — the record kept no `path`/`gitRev`, so there
+            // was nothing to compare, and the winner was whichever request
+            // happened to be dequeued first (the #630 "accident of queue
+            // order").
+            if (sourceKind != "version") {
+                const std::string incomingRef =
+                    sourceRefOf(sourceKind, spec, item.resolveRoot, item.originalConstraint);
+                if (incomingRef != it->second.sourceRef) {
+                    const bool existingIsRoot = it->second.fromRoot;
+                    const bool incomingIsRoot = item.consumerDepIndex == kMainConsumer;
+                    if (incomingIsRoot && !existingIsRoot) {
+                        // See the identical comment in the kind-clash branch
+                        // above: unreachable under FIFO seeding, and refused
+                        // by name rather than silently swapped in.
+                        return std::unexpected(std::format(
+                            "internal: dependency '{}{}{}': the root's "
+                            "declaration arrived after '{}' had already "
+                            "resolved it. This is unreachable under "
+                            "first-in-first-out worklist seeding; please "
+                            "report this as an mcpp engine defect.",
+                            key.ns, key.ns.empty() ? "" : ".", key.shortName,
+                            it->second.requestedBy));
+                    }
+                    // The already-resolved record wins either way: it is the
+                    // root's (existingIsRoot) or it is simply the first one
+                    // dequeued (neither party is the root). Both are "the
+                    // first requester" in the sense row 3 states — the root
+                    // is dequeued before any transitive request under FIFO
+                    // seeding, so "the root wins" and "the first dequeued
+                    // wins" never disagree about WHICH record already sits in
+                    // `resolved`.
+                    mcpp::diag::warning("dependency/source-override", std::format(
+                        "'{}{}{}' is declared as {} '{}' (by '{}') and as {} "
+                        "'{}' (by '{}'); {} wins.",
+                        key.ns, key.ns.empty() ? "" : ".", key.shortName,
+                        sourceKind, it->second.sourceRef, it->second.requestedBy,
+                        sourceKind, incomingRef, item.requestedBy,
+                        existingIsRoot ? "the root's declaration"
+                                       : std::format("'{}', declared first",
+                                                     it->second.requestedBy)),
+                        std::format("declare '{}{}{}' in the root to choose "
+                                    "the other.",
+                            key.ns, key.ns.empty() ? "" : ".", key.shortName));
+                }
             }
             // Same key, same version (or compatible path/git) — already
             // processed; still record the dependency edge before skipping.
@@ -6943,6 +7143,7 @@ prepare_build(bool print_fingerprint,
                         + resolvedGitRev)),
                 };
             }
+            sourceCommit = resolvedGitRev;
             dep_root = gitRoot;
         }
         // (version-source: dep_root + manifest are loaded together via
@@ -7080,6 +7281,9 @@ prepare_build(bool print_fingerprint,
                 ? spec.version
                 : dep_manifests.back()->package.version,
             .sourceKind  = sourceKind,
+            .sourceRef   = sourceKind == "git"  ? sourceCommit
+                         : sourceKind == "path" ? dep_root.string()
+                         : std::string{},
         });
         const auto depPackageIndex = packages.size();
         packages.push_back(makePackageRoot(dep_root, *dep_manifests.back()));
@@ -7093,6 +7297,9 @@ prepare_build(bool print_fingerprint,
             .constraint        = sourceKind == "version" ? item.originalConstraint : "",
             .requestedBy       = item.requestedBy,
             .source            = sourceKind,
+            .sourceRef         = sourceRefOf(sourceKind, spec, item.resolveRoot,
+                                             item.originalConstraint),
+            .fromRoot          = item.consumerDepIndex == kMainConsumer,
             .devOnly           = item.devOnly,
             .depIndex          = dep_manifests.size() - 1,
             .linkFlagsAdded    = std::move(linkFlagsAdded),
@@ -8723,7 +8930,28 @@ prepare_build(bool print_fingerprint,
                                   ? dep_cache_identities[depIdx - 1].indexName
                                   : std::string(mcpp::pm::kDefaultNamespace);
                     key.packageName      = depName;
-                    key.version          = depPkg.manifest.package.version;
+                    // THE VERSION IDENTIFIES THE SOURCES ONLY FOR AN INDEX
+                    // PACKAGE. A `git` package is keyed by its commit and a
+                    // `path` package by a stamp of its tree, because both
+                    // change under an unchanged version and the store then
+                    // serves a binary built from sources that no longer exist
+                    // (#630, item 6; measured 2026-09-08 with examples/12).
+                    // The same rule applies to every upstream below.
+                    auto source_keyed_version = [&](std::size_t pkgIdx) {
+                        const auto& man = packages[pkgIdx].manifest.package;
+                        std::string v = man.version;
+                        if (pkgIdx >= 1 && pkgIdx - 1 < dep_cache_identities.size()) {
+                            const auto& id = dep_cache_identities[pkgIdx - 1];
+                            if (id.sourceKind == "git" && !id.sourceRef.empty())
+                                v += "+git." + id.sourceRef;
+                            else if (id.sourceKind == "path")
+                                v += "+path." + mcpp::build::tool_store::tree_stamp(
+                                    id.sourceRef.empty() ? packages[pkgIdx].root
+                                                         : std::filesystem::path(id.sourceRef));
+                        }
+                        return v;
+                    };
+                    key.version          = source_keyed_version(depIdx);
                     key.targetName       = toolName;
                     key.hostTriple       = mcpp::toolchain::triple::host_triple().str();
                     key.compilerIdentity = std::format("{}|{}|{}",
@@ -8741,7 +8969,7 @@ prepare_build(bool print_fingerprint,
                     for (auto up : dg::transitive_dependencies(dependencyEdges, depIdx))
                         key.upstreamKeys.push_back(std::format("{}@{}",
                             packages[up].manifest.package.name,
-                            packages[up].manifest.package.version));
+                            source_keyed_version(up)));
                     std::ranges::sort(key.upstreamKeys);
 
                     const auto cacheRoot = mcpp::home::cache_root();
@@ -8757,7 +8985,7 @@ prepare_build(bool print_fingerprint,
                     }
 
                     mcpp::ui::status("Building", std::format(
-                        "host tool {}:{} from {} v{} (once per package version × "
+                        "host tool {}:{} from {} v{} (once per package source and "
                         "host toolchain)", depName, toolName, depName,
                         depPkg.manifest.package.version));
 
@@ -9456,6 +9684,37 @@ prepare_build(bool print_fingerprint,
             // checked against and so the report can show the whole stack.
             in.compilerFamily  = std::string(tc->compiler_family());
             in.compilerVersion = tc->version;
+            // WHETHER THE PAYLOAD HAS A COMPILER RUNTIME FOR AN APPLE CROSS
+            // TARGET, read from the payload's own resource directory. Clang's
+            // Darwin driver adds `libclang_rt.<platform>.a` from there when
+            // the file exists and continues silently when it does not, and
+            // the official payload builds only the macOS archive (measured,
+            // 22.1.8: `lib/clang/22/lib/darwin/` holds `libclang_rt.osx.a` and
+            // no `ios` or `iossim`). The consequence without this line is
+            // `__isPlatformVersionAtLeast` undefined at link with nothing
+            // said earlier (mcpp#630). The engine never looks in Xcode for the
+            // archive: a compiler runtime the payload lacks is a graph
+            // package, as it is on the bare rows.
+            if (!tc->appleSdkRoot.empty()) {
+                if (auto tt = mcpp::toolchain::triple::parse(tc->targetTriple);
+                    tt && tt->is_ios()) {
+                    const std::string archive = std::format(
+                        "libclang_rt.{}.a", tt->is_ios_simulator() ? "iossim" : "ios");
+                    const auto payloadRoot =
+                        tc->binaryPath.parent_path().parent_path();
+                    bool found = false;
+                    std::error_code ec;
+                    for (auto const& ver : std::filesystem::directory_iterator(
+                             payloadRoot / "lib" / "clang", ec)) {
+                        if (std::filesystem::exists(
+                                ver.path() / "lib" / "darwin" / archive, ec)) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    in.payloadCompilerRuntimeAbsent = !found;
+                }
+            }
         }
         in.compilerRuntime = provider_of(tsd::CapLayer::CompilerRuntime);
         in.kernelAbi       = provider_of(tsd::CapLayer::KernelAbi);
@@ -9509,6 +9768,25 @@ prepare_build(bool print_fingerprint,
 
         resolvedTargetSide = tsd::resolve(in);
         targetSideResolved = true;
+
+        // REPORTED ONCE, NOT REFUSED. A program that never reaches an
+        // availability check links and runs without the archive; refusing it
+        // would trade a diagnosed hazard for a regression. The degradation
+        // names the platform, the file and the package that supplies it.
+        if (resolvedTargetSide.compilerRuntime.absent() && tc) {
+            auto tt = mcpp::toolchain::triple::parse(tc->targetTriple);
+            mcpp::diag::degraded("target/compiler-runtime", std::format(
+                "the toolchain payload carries no compiler runtime for {} "
+                "(no libclang_rt.{}.a under its lib/clang/*/lib/darwin), and no "
+                "package in the graph provides mcpp:compiler-runtime",
+                tc->targetTriple,
+                tt && tt->is_ios_simulator() ? "iossim" : "ios"),
+                "a program that reaches an availability check "
+                "(`__builtin_available`, or a system header that uses it) fails "
+                "at link with `__isPlatformVersionAtLeast` undefined",
+                "declare `llvm.compiler-rt-builtins` under the target's "
+                "[target.'cfg(os = \"ios\")'.dependencies]");
+        }
 
         // RECORDED ON THE TOOLCHAIN THE MOMENT IT IS KNOWN, because three
         // producers of a compile line need it and only one of them can see
@@ -10361,10 +10639,17 @@ prepare_build(bool print_fingerprint,
     // library would be describing something it does not have.
     for (auto& pkg : packages) {
         if (pkg.manifest.stdModule.empty()) continue;
+        // Either spelling of the C++ layer: `hosted-standard-library` is the
+        // one that predates the layer vocabulary, `mcpp:c++-abi=<impl>` the
+        // current one. A package written against a newer engine may carry
+        // only the second.
         const auto& provs = pkg.manifest.provides;
-        if (std::find(provs.begin(), provs.end(),
-                      std::string{"hosted-standard-library"}) == provs.end())
-            continue;
+        const bool declaresCxxLayer = std::any_of(
+            provs.begin(), provs.end(), [](const std::string& p) {
+                return p == "hosted-standard-library"
+                    || p.starts_with("mcpp:c++-abi=");
+            });
+        if (!declaresCxxLayer) continue;
         auto src = pkg.root / pkg.manifest.stdModule;
         if (!std::filesystem::exists(src)) {
             return std::unexpected(std::format(
@@ -10429,6 +10714,16 @@ prepare_build(bool print_fingerprint,
             // DWARF. Same function, not a second copy of the decision.
             for (auto& f : mcpp::toolchain::graph_runtime_compile_flags(*tc))
                 flags += " " + f;
+            // AND THE APPLE CROSS TARGET'S SDK, WHICH THE TOOLCHAIN RESOLUTION
+            // HAD ALREADY PUT ON THIS CHANNEL AND THIS ASSIGNMENT REPLACES.
+            // The module's C library is the SDK's on the iOS rows (the
+            // package supplies the C++ layer alone), and without the sysroot
+            // the precompile stops on `mbstate_t` inside libc++'s own
+            // headers. Measured on macos-15 with `llvm.libcxx` over
+            // `arm64-apple-ios18.0`: twenty "reference to unresolved using
+            // declaration" errors, every one a C library type.
+            if (!tc->appleSdkRoot.empty())
+                flags += " -isysroot " + mcpp::xlings::shq(tc->appleSdkRoot.string());
         }
         // Everything up to here says which machine the module is for; what
         // follows says where its headers are. The codegen step needs only the
@@ -10488,6 +10783,49 @@ prepare_build(bool print_fingerprint,
             flags += " " + mcpp::xlings::shq(f);
         tc->stdModuleFlags = flags;
         break;
+    }
+
+    // AN APPLE CROSS TARGET WITHOUT A GRAPH C++ RUNTIME LINKS THE SDK'S
+    // libc++ (the Mach-O cell in distribution.cppm), AND THE HEADERS FOLLOW
+    // THE RUNTIME. The payload's `std.cppm` and headers describe libc++ 22;
+    // the SDK's dylib is libc++ 19 (Xcode 16.4, measured), and Apple's SDKs
+    // ship no module sources of their own (no `usr/share/libc++/v1` on the
+    // macOS 15.5 and iOS 18.5 SDKs). So:
+    //
+    //   - a graph that does not import `std` takes the SDK's headers
+    //     (hostflags.cppm, `appleSdkCxxHeaders`): one libc++ on every line,
+    //     and the payload's module, unused, is withdrawn;
+    //   - a graph that imports `std` keeps the payload's module and headers
+    //     over the SDK's dylib. That pairing links until an inline path in
+    //     the newer headers names an export the older dylib lacks
+    //     (`__hash_memory`, `__atomic_notify_all_global_table`, measured),
+    //     and it is what every iOS program built before this release got.
+    //     It is REPORTED ONCE rather than refused: refusing would break a
+    //     program that built yesterday, and the report names the two lines
+    //     that make the hazard disappear.
+    if (tc && !tc->appleSdkRoot.empty() && targetSideResolved
+        && !resolvedTargetSide.cxx.fromGraph()) {
+        if (!needsStdModule) {
+            tc->appleSdkCxxHeaders = true;
+            tc->hasImportStd = false;
+            tc->stdModuleSource.clear();
+            tc->stdCompatSource.clear();
+        } else {
+            mcpp::diag::degraded("target/cxx-runtime", std::format(
+                "{} links the SDK's libc++ under the toolchain payload's "
+                "libc++ headers and std module, which are a different "
+                "release of the library", tc->targetTriple),
+                "the program links while no inline path in the newer headers "
+                "names an export the SDK's dylib lacks; `std::unordered_map` "
+                "over `std::string` and `std::atomic<T>::notify_all` are two "
+                "that do, and they fail at link with `__hash_memory` or "
+                "`__atomic_notify_all_global_table` undefined",
+                "declare the C++ standard library as a package, which brings "
+                "its headers, its module and its objects as one release: "
+                "[target.'cfg(os = \"ios\")'.dependencies] "
+                "llvm.libcxx = \"22.1.8.1\" (and "
+                "llvm.compiler-rt-builtins = \"22.1.8.5\" beside it)");
+        }
     }
 
     if (needsStdModule && !tc->hasImportStd) {
