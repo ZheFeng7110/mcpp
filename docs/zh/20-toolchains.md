@@ -614,7 +614,7 @@ C 库和 builtins 同一做法:
 
 ```toml
 [target.'cfg(os = "ios")'.dependencies]
-llvm.libcxx               = "22.1.8.1"   # libc++ 与 libc++abi 的源码,带 std 模块
+llvm.libcxx               = "22.1.8.2"   # libc++ 与 libc++abi 的源码,带 std 模块
 llvm.compiler-rt-builtins = "22.1.8.5"   # __isPlatformVersionAtLeast 与通用例程
 ```
 

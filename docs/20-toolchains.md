@@ -680,7 +680,7 @@ the C library and the builtins do on the bare-metal rows:
 
 ```toml
 [target.'cfg(os = "ios")'.dependencies]
-llvm.libcxx               = "22.1.8.1"   # libc++ and libc++abi as source, with the std module
+llvm.libcxx               = "22.1.8.2"   # libc++ and libc++abi as source, with the std module
 llvm.compiler-rt-builtins = "22.1.8.5"   # __isPlatformVersionAtLeast and the generic routines
 ```
 

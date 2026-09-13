@@ -911,3 +911,33 @@ openxlings/xim-pkgindex#836, mcpplibs/mcpp-index #408, #409, #410, #411,
 mcpp-community/mcpp-plugins#22 (0.9.2; its macOS CI launched the bundle with
 the resource under `Contents/Resources/` and ran the iOS simulator row over
 the two packages). The workspace bootstrap pin moved to 2026.9.13.2.
+
+## 15. The follow-up the package's own CI forced (2026-09-14)
+
+The review asked why `mcpplibs/libcxx` measured two rows and why its run
+was red. The run was red for a reason outside the package (its CI was
+pinned to a release that did not yet exist); the two rows were the real
+defect: the package carried no `[package] platforms` and its workflow
+measured what the design had been about rather than what the package
+claims. Widening the workflow to every claimed row found two engine gaps
+that the two rows had hidden:
+
+| gap | what the measurement showed | fix |
+|---|---|---|
+| the package std module had no prebuilt C library | on Linux the precompile read the runner's `/usr/include` rather than the payload's glibc, a host dependency no report showed; on macOS natively it stopped on `mbstate_t` | the module's command takes the tokens every unit gets (`host_compile_tokens`, the C++ layer marked as the graph's), appended after the package's own directories so libc++'s headers keep precedence; e2e 663 asserts the recorded command names the glibc payload |
+| an unset `ios_deployment_target` was an unversioned triple | `docs/20` promised the SDK's default; clang's default for `arm64-apple-ios` with no version refused thread-local storage, which libc++abi uses | the located SDK's version fills the slot (`xcrun --show-sdk-version`); `ci-macos-ios` asserts `LC_BUILD_VERSION minos` equals it |
+
+Both landed as mcpp 2026.9.14.1 (#633; 38 checks green, one by-design
+skip), released with the eight GitCode assets mirrored by `gtc` within two
+minutes of each appearing on GitHub and compared byte for byte,
+openxlings/xim-pkgindex#837, the bootstrap pin moved, and the sandbox
+script at 14 of 14 against the published engine. `llvm.libcxx` 22.1.8.2
+states `platforms = ["linux", "macos", "ios"]` and its CI is green on Linux
+over glibc, macOS natively, `aarch64-ios`, `aarch64-ios-sim` (run under the
+simulator) and `x86_64-ios-sim` under that engine. Windows is not claimed:
+libc++ over the MSVC runtime is a configuration the package does not carry,
+and a `workflow_dispatch` probe measures that row on request without being
+a gate. The package's first three CI corrections were its own (a report
+line asserted with one space, a `c-abi` line that the report does not
+print for a payload layer, and an example floor that a patch had not
+written), which is the same shape §14 records for the sandbox script.
