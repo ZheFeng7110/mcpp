@@ -880,3 +880,34 @@ The design's two refusals were withdrawn on review before landing: a graph
 that imports `std` on an Apple cross target without a package builds as it
 did yesterday and is reported once (§5.3), and a payload without a builtins
 archive is reported once rather than refused (§5.3, item 7).
+
+## 14. What the sandbox measured
+
+Run on 2026-09-14 in `xlings subos use v630 --sandbox`, with both tools set to
+the CN mirror, against mcpp 2026.9.13.2 installed from the published index
+(`xlings install mcpp@2026.9.13.2`, six minutes after the bump merged) and
+the packages resolved from the index by version:
+
+| section | claim | reading |
+|---|---|---|
+| 1 | `llvm.libcxx = "22.1.8.1"` on Linux over glibc: the report names the C++ layer as the graph's, `ldd` lists no libc++, the program prints `1-2-3` | ok, ok, ok |
+| 2 | `min_api_level` under `--strict` on a non-Android row prints no `unsupported key` | ok |
+| 3 | one identity, two git revisions: the override is reported, both revisions are named, the library is compiled against the root's revision | ok, ok, ok |
+| 4 | a path host tool: first build 41; an edit without a version bump reaches the consumer (42); the reversal reaches it (41) | ok, ok, ok |
+| 5 | `mcpp emit xpkg` with `cfg(linux)`: the linux block names the tool, the other two do not, no warning | ok, ok, ok |
+
+14 claims, 14 ok, 0 skipped. The first run reported two failures that were
+the script's own: it read the override warning by its diagnostic domain,
+which a warning does not render, and its section 4 wrote the tool's source
+to a relative path after changing directory, so the edit never happened. Both
+are the same shape as the CI assertions corrected in §13, and the record
+keeps them because a verification that fails for its own reasons reads
+exactly like one that found a defect.
+
+The release: mcpp-community/mcpp v2026.9.13.2 (release run 34764806249,
+four platforms, `publish-ecosystem` green after the macOS archive was mirrored
+by `gtc` locally and the eight GitCode assets compared byte for byte),
+openxlings/xim-pkgindex#836, mcpplibs/mcpp-index #408, #409, #410, #411,
+mcpp-community/mcpp-plugins#22 (0.9.2; its macOS CI launched the bundle with
+the resource under `Contents/Resources/` and ran the iOS simulator row over
+the two packages). The workspace bootstrap pin moved to 2026.9.13.2.
