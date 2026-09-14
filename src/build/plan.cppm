@@ -54,6 +54,9 @@ struct CompileUnit {
     // Unit came from a scan_overrides declaration — plan-vs-ddi
     // verification is mandatory for it (ninja_backend emits --expect-*).
     bool                            scanOverridden = false;
+    // The module declaration form the scanner read (mcpp.modgraph.graph).
+    // Stated as the unit's role by the build database.
+    mcpp::modgraph::ModuleDeclaration declaration = mcpp::modgraph::ModuleDeclaration::None;
     // This unit's outputs are already in the global cache: the backend emits
     // `stage_file` edges from the cache instead of a compile edge (and skips
     // the P1689 scan for it entirely). The unit itself stays in the plan so
@@ -1521,6 +1524,7 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
         }
         for (auto& req : u.requires_) cu.imports.push_back(req.logicalName);
         cu.scanOverridden = u.scanOverridden;
+        cu.declaration    = u.declaration;
         plan.compileUnits.push_back(std::move(cu));
     }
 
@@ -1915,28 +1919,16 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
             mcpp::modgraph::normalize_include_flags(projectRoot, main_cu.packageCflags);
             mcpp::modgraph::normalize_include_flags(projectRoot, main_cu.packageCxxflags);
 
-            // We didn't scan main.cpp earlier (it's not in scanner output unless globbed in).
-            // Best-effort: scan its imports here.
-            std::ifstream is(*lu.entryMain);
-            std::string line;
-            while (std::getline(is, line)) {
-                auto trim = [](std::string s) {
-                    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) s.erase(0, 1);
-                    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back())))  s.pop_back();
-                    return s;
-                };
-                line = trim(line);
-                if (line.starts_with("import ")) {
-                    std::string name;
-                    std::size_t i = 7;
-                    while (i < line.size() && (std::isalnum(static_cast<unsigned char>(line[i]))
-                                               || line[i] == '_' || line[i] == '.')) {
-                        name.push_back(line[i]);
-                        ++i;
-                    }
-                    if (!name.empty()) main_cu.imports.push_back(name);
-                }
-            }
+            // The entry is in the package scan only when a `sources` glob
+            // matched it; otherwise it is scanned here. The unit is built as one
+            // that provides nothing, so a declaration the scanner reads as
+            // providing a module is recorded as undecided rather than as a
+            // role the plan does not build.
+            const auto entry = mcpp::modgraph::scan_entry_file(
+                *lu.entryMain, main_cu.packageName, rootExtTable);
+            for (auto const& req : entry.requires_) main_cu.imports.push_back(req.logicalName);
+            main_cu.declaration = entry.provides ? mcpp::modgraph::ModuleDeclaration::Unknown
+                                                 : entry.declaration;
 
             // mcpp#240: the entry main may ALSO have been scanned (globbed into
             // [modules].sources — the near-universal `src/**/*.cpp`). When it

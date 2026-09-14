@@ -63,6 +63,16 @@ std::expected<SourceUnit, ScanError> scan_file(const std::filesystem::path& file
                                                const std::string&           packageName,
                                                const mcpp::ExtensionTable&  extTable);
 
+// Scan the entry source of a target that no `sources` glob matched: a
+// discovered test, or a `main` outside the globs. The unit is scan_file's when
+// scan_file accepts the file. Its refusals (an import inside `#if`, a header
+// unit, an extension without a role) were never applied to such a file and are
+// not applied here: a file it refuses yields the line-leading imports of its
+// code, with comments and raw strings removed, and the declaration form Unknown.
+SourceUnit scan_entry_file(const std::filesystem::path& file,
+                           const std::string&           packageName,
+                           const mcpp::ExtensionTable&  extTable);
+
 // Scan the entire package: collects all sources via manifest globs and returns a Graph.
 struct ScanResult {
     Graph                       graph;
@@ -916,6 +926,9 @@ std::expected<SourceUnit, ScanError> scan_file(const std::filesystem::path& file
                 }
                 u.provides          = ModuleId{name};
                 u.providesInterface = true;   // read from the keyword, not assumed
+                u.declaration       = name.find(':') != std::string::npos
+                    ? ModuleDeclaration::InterfacePartition
+                    : ModuleDeclaration::Interface;
             } else {
                 // A non-exporting `module …;` is TWO different declarations
                 // wearing one spelling, and they were treated as one:
@@ -947,8 +960,10 @@ std::expected<SourceUnit, ScanError> scan_file(const std::filesystem::path& file
                     }
                     u.provides = ModuleId{name};
                     u.providesInterface = false;
+                    u.declaration = ModuleDeclaration::ImplementationPartition;
                 } else if (!u.provides) {
                     u.requires_.push_back(ModuleId{name});
+                    u.declaration = ModuleDeclaration::Implementation;
                 }
             }
             // The module this TU belongs to, for resolving `import :part;`
@@ -997,6 +1012,34 @@ std::expected<SourceUnit, ScanError> scan_file(const std::filesystem::path& file
         }
     }
 
+    return u;
+}
+
+SourceUnit scan_entry_file(const std::filesystem::path& file,
+                           const std::string&           packageName,
+                           const mcpp::ExtensionTable&  extTable)
+{
+    if (auto scanned = scan_file(file, packageName, extTable)) return std::move(*scanned);
+
+    SourceUnit u;
+    u.path        = file;
+    u.packageName = packageName;
+    u.kind        = mcpp::classify(file, extTable);
+    u.declaration = ModuleDeclaration::Unknown;
+    std::ifstream is(file);
+    bool in_raw = false, in_block = false;
+    std::string raw_close, line;
+    while (std::getline(is, line)) {
+        const std::string code = strip_noncode(line, in_block, in_raw, raw_close);
+        std::string_view r = trim(code);
+        if (r.starts_with("export ") || r.starts_with("export\t")) r = trim(r.substr(6));
+        if (!r.starts_with("import ") && !r.starts_with("import\t")) continue;
+        r = trim(r.substr(6));
+        std::string name;
+        for (std::size_t i = 0; i < r.size() && is_module_name_char(r[i]); ++i)
+            name.push_back(r[i]);
+        if (!name.empty() && name.front() != ':') u.requires_.push_back(ModuleId{name});
+    }
     return u;
 }
 
@@ -1166,6 +1209,8 @@ void scan_one_into(ScanResult& result,
             u.relPath        = std::filesystem::relative(f, root);
             u.packageName    = qualifiedName;
             u.scanOverridden = true;
+            // The override names modules; it does not carry the declaration.
+            u.declaration    = ModuleDeclaration::Unknown;
             // A declared unit still gets its role from the same classifier —
             // scan_overrides overrides what was SCANNED, not what the file is.
             u.kind           = mcpp::classify(f, extTable);

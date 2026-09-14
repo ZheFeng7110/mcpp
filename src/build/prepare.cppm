@@ -146,9 +146,15 @@ inline void warn_unknown_xpkg_keys(const mcpp::manifest::Manifest& dm,
     }
 }
 
+// `stale`, when given, turns the function into a comparison: nothing is
+// created or written, and every declared file that is missing or differs from
+// its declared content is appended. A build that describes itself rather than
+// running (BuildOverrides::plan_only) reads the root package's generated files
+// this way, because they live in the source tree it promises not to write.
 std::expected<void, std::string>
 materialize_generated_files(const std::filesystem::path& root,
-                            const mcpp::manifest::Manifest& manifest)
+                            const mcpp::manifest::Manifest& manifest,
+                            std::vector<std::filesystem::path>* stale = nullptr)
 {
     for (auto const& [relPath, content] : manifest.buildConfig.generatedFiles) {
         if (relPath.empty()) {
@@ -176,13 +182,6 @@ materialize_generated_files(const std::filesystem::path& root,
         }
 
         auto out = root / relPath.lexically_normal();
-        std::error_code ec;
-        std::filesystem::create_directories(out.parent_path(), ec);
-        if (ec) {
-            return std::unexpected(std::format(
-                "cannot create directory for generated file '{}': {}",
-                out.string(), ec.message()));
-        }
 
         // Skip the write when the on-disk content is already identical: ninja
         // is mtime-driven, and an unconditional rewrite bumps the mtime every
@@ -202,7 +201,18 @@ materialize_generated_files(const std::filesystem::path& root,
                 }
             }
         }
+        if (stale) {
+            stale->push_back(out);
+            continue;
+        }
 
+        std::error_code ec;
+        std::filesystem::create_directories(out.parent_path(), ec);
+        if (ec) {
+            return std::unexpected(std::format(
+                "cannot create directory for generated file '{}': {}",
+                out.string(), ec.message()));
+        }
         std::ofstream os(out, std::ios::binary);
         if (!os) {
             return std::unexpected(std::format(
@@ -638,43 +648,6 @@ bool is_std_module(std::string_view name) {
     return name == "std" || name == "std.compat";
 }
 
-std::string trim_copy(std::string s) {
-    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front())))
-        s.erase(0, 1);
-    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back())))
-        s.pop_back();
-    return s;
-}
-
-bool source_file_imports_std(const std::filesystem::path& path) {
-    std::ifstream is(path);
-    if (!is) return false;
-
-    std::string line;
-    while (std::getline(is, line)) {
-        line = trim_copy(std::move(line));
-        std::size_t i = std::string::npos;
-        if (line.starts_with("import ")) {
-            i = 7;
-        } else if (line.starts_with("export import ")) {
-            i = 14;
-        }
-        if (i == std::string::npos) continue;
-        while (i < line.size() && std::isspace(static_cast<unsigned char>(line[i])))
-            ++i;
-
-        std::string name;
-        while (i < line.size()
-            && (std::isalnum(static_cast<unsigned char>(line[i]))
-                || line[i] == '_' || line[i] == '.' || line[i] == ':')) {
-            name.push_back(line[i]);
-            ++i;
-        }
-        if (is_std_module(name)) return true;
-    }
-    return false;
-}
-
 bool graph_or_targets_import_std(const mcpp::modgraph::Graph& graph,
                                  const mcpp::manifest::Manifest& manifest,
                                  const std::filesystem::path& projectRoot) {
@@ -686,10 +659,16 @@ bool graph_or_targets_import_std(const mcpp::modgraph::Graph& graph,
     }
 
     // Some target entry files can be added to the plan after the package scan.
-    // Check them here so std BMI setup matches what make_plan will compile.
+    // Check them here so std BMI setup matches what make_plan will compile: they
+    // are read by the same scan_entry_file make_plan reads them with.
+    const auto extTable = mcpp::extension_table_for(manifest.buildConfig.moduleExtensions,
+                                                    manifest.buildConfig.deviceExtensions);
     for (auto& t : manifest.targets) {
-        if (!t.main.empty() && source_file_imports_std(projectRoot / t.main))
-            return true;
+        if (t.main.empty()) continue;
+        const auto entry = mcpp::modgraph::scan_entry_file(projectRoot / t.main,
+                                                           manifest.package.name, extTable);
+        for (auto const& req : entry.requires_)
+            if (is_std_module(req.logicalName)) return true;
     }
     return false;
 }
@@ -838,6 +817,14 @@ export std::string_view cache_mode_name(CacheMode m) {
     }
 }
 
+// A condition a planning pass reports instead of acting on (plan_only): the
+// code is stable and the message is for people. Emitted as warning diagnostics
+// by the command that asked for the plan.
+export struct PlanNote {
+    std::string code;
+    std::string message;
+};
+
 export struct BuildContext {
     // THE PER-MACHINE JOB DEFAULT, carried so it is read once.
     //
@@ -901,6 +888,22 @@ export struct BuildContext {
     std::filesystem::path           outputDir;
     std::filesystem::path           stdBmi;
     std::filesystem::path           stdObject;
+    // plan_only: what the std module build WOULD be (sources are on the
+    // toolchain), set when the graph imports std. A build compiles it instead
+    // and leaves this empty.
+    std::optional<mcpp::toolchain::StdModuleDescription> stdModule;
+    // The packages this build read from an editable source tree: the root, and
+    // every package whose root is neither in a store nor in a hash-addressed git
+    // checkout (the same test depSourceRoots applies). `sources` are the
+    // package's source globs, relative to `root`. Read by the build database for
+    // the inputs it lists.
+    struct SourcePackage {
+        std::string                 name;
+        std::filesystem::path       root;
+        std::vector<std::string>    sources;
+    };
+    std::vector<SourcePackage>      sourcePackages;
+    std::vector<PlanNote>           planNotes;
     mcpp::build::BuildPlan          plan;
     // The scanned module graph. Only `mcpp pack` reads it — see the note at
     // the assignment for why the plan cannot answer its question.
@@ -1023,6 +1026,17 @@ export struct BuildOverrides {
     // only some would be worse than moving none — a half-redirected build
     // writes into the shared root anyway, just less visibly.
     std::filesystem::path work_dir;
+    // PLANNING TO DESCRIBE, NOT TO BUILD (`mcpp emit build-database`).
+    //
+    // With `work_dir` pointed outside the project, three things still reached
+    // it or ran a compiler, and this switch settles each: the std module is
+    // described (mcpp::toolchain::describe_std_module) instead of compiled; the
+    // root package's `[build] generated_files`, which are sources and live in
+    // the source tree, are compared instead of written, and a missing or stale
+    // one is recorded in BuildContext::planNotes; and mcpp.lock is READ from the
+    // project root, as the resolution input it is, while the lock this planning
+    // produces is written under `work_dir`. Build programs still run.
+    bool        plan_only = false;
     // #355 tool provisioning re-enters prepare_build for the tool package. A
     // tool package's own build.mcpp may legitimately want another tool (gRPC's
     // wants protoc), so the depth cannot be 1 — but an unbounded chain is a
@@ -2039,6 +2053,7 @@ prepare_build(bool print_fingerprint,
         std::error_code wdEc;
         std::filesystem::create_directories(workRoot, wdEc);
     }
+    std::vector<PlanNote> planNotes;
 
     if (m->package.sourceProvenance.empty()) {
         m->package.sourceProvenance =
@@ -2152,7 +2167,9 @@ prepare_build(bool print_fingerprint,
     std::map<std::string, mcpp::pm::LockedGitSource> gitLockAnchors;
     std::map<std::string, std::string> packageIdentityLockAnchors;
     {
-        auto lockPath = workRoot / "mcpp.lock";
+        // Read where the project keeps it. A planning pass that writes
+        // elsewhere (plan_only) still resolves against the project's lock.
+        auto lockPath = (overrides.plan_only ? *root : workRoot) / "mcpp.lock";
         if (std::filesystem::exists(lockPath)) {
             if (auto lock = mcpp::pm::load(lockPath); lock) {
                 for (auto const& p : lock->packages) {
@@ -4182,9 +4199,17 @@ prepare_build(bool print_fingerprint,
     // build.mcpp itself. (The per-dependency call sits in the dep resolution
     // loop below; the root manifest needs its own.)
     if (!m->buildConfig.generatedFiles.empty()) {
-        if (auto r = materialize_generated_files(*root, *m); !r) {
+        std::vector<std::filesystem::path> staleGenerated;
+        if (auto r = materialize_generated_files(
+                *root, *m, overrides.plan_only ? &staleGenerated : nullptr); !r) {
             return std::unexpected(r.error());
         }
+        for (auto const& path : staleGenerated)
+            planNotes.push_back({"MCPP_GENERATED_FILE_NOT_MATERIALIZED",
+                std::format("'{}' is declared in [build] generated_files and its "
+                            "content on disk differs from the declaration; this "
+                            "command does not write the project, and `mcpp build` "
+                            "writes it", path.string())});
     }
 
     // Canonical rendering of the resolved target (for the env contract).
@@ -6962,7 +6987,10 @@ prepare_build(bool print_fingerprint,
                     //   <root>/target/.mangled/<consumerPkg>/__self__/             ← rewritten consumer source
                     auto& consumerManifest = *dep_manifests[item.consumerDepIndex];
                     auto consumerRoot      = packages[item.consumerDepIndex + 1].root;
-                    auto stageBase         = *root / "target" / ".mangled"
+                    // Under the write root, not the source root: the stage
+                    // is build output, and BuildOverrides::work_dir promises
+                    // that everything the build writes moves with it.
+                    auto stageBase         = workRoot / "target" / ".mangled"
                                              / consumerManifest.package.name;
                     auto secStage          = stageBase
                                              / std::format("{}__{}", key.shortName, spec.version);
@@ -11366,6 +11394,7 @@ prepare_build(bool print_fingerprint,
     std::filesystem::path stdObjectPath;
     std::filesystem::path stdCompatBmiPath;
     std::filesystem::path stdCompatObjectPath;
+    std::optional<mcpp::toolchain::StdModuleDescription> describedStdModule;
     if (needsStdModule) {
         // The std BMI must be compiled with the SAME dialect set its
         // importers use (issue #210: -freflection gates libstdc++'s <meta> —
@@ -11380,33 +11409,52 @@ prepare_build(bool print_fingerprint,
         const auto stdCrt = mcpp::toolchain::msvc_crt_flag(
             stdDialect, mcpp::toolchain::msvc_wants_static_crt(
                             m->buildConfig.linkage, m->buildConfig.cxxRuntime));
-        auto sm = mcpp::toolchain::ensure_built(
-            *tc, m->package.standard, stdFlagAndDialect,
-            mcpp::platform::macos::deployment_target(
-                m->buildConfig.macosDeploymentTarget),
-            mcpp::toolchain::default_cache_root(), stdCrt);
-        if (!sm) {
-            // THE ONE CODE IN THE TAXONOMY THAT NOTHING WROTE.
-            //
-            // `Code::StdModulePrecompile` has existed, with a name and a
-            // comment, since the taxonomy was written; `grep` for it found the
-            // declaration and the `name()` arm and no third site. So every
-            // std-module refusal reported `other`, which is the bucket
-            // refusal.cppm defines as "a refusal that has not been given a code
-            // yet" -- a visible admission, and one nobody had cashed.
-            //
-            // Measured: `tests/matrix/expected.tsv` carried exactly ONE `other`
-            // row out of 176, `x86_64-windows-msvc x llvm@22.1.8` in graph mode,
-            // and `scan.sh` printed it under "无名拒绝" on every Windows run.
-            // The sentence was right and the classification was missing --
-            // the same shape `Code::HostToolToolchain` was added for.
-            refusal::record(refusal::Code::StdModulePrecompile);
-            return std::unexpected(sm.error().message);
+        if (overrides.plan_only) {
+            // Described, not compiled: the paths and commands are the ones
+            // ensure_built would use, from the one derivation in stdmod.cppm.
+            auto described = mcpp::toolchain::describe_std_module(
+                *tc, m->package.standard, stdFlagAndDialect,
+                mcpp::platform::macos::deployment_target(
+                    m->buildConfig.macosDeploymentTarget),
+                mcpp::toolchain::default_cache_root(), stdCrt);
+            if (!described) {
+                refusal::record(refusal::Code::StdModulePrecompile);
+                return std::unexpected(described.error().message);
+            }
+            stdBmiPath          = described->bmiPath;
+            stdObjectPath       = described->objectPath;
+            stdCompatBmiPath    = described->compatBmiPath;
+            stdCompatObjectPath = described->compatObjectPath;
+            describedStdModule  = std::move(*described);
+        } else {
+            auto sm = mcpp::toolchain::ensure_built(
+                *tc, m->package.standard, stdFlagAndDialect,
+                mcpp::platform::macos::deployment_target(
+                    m->buildConfig.macosDeploymentTarget),
+                mcpp::toolchain::default_cache_root(), stdCrt);
+            if (!sm) {
+                // THE ONE CODE IN THE TAXONOMY THAT NOTHING WROTE.
+                //
+                // `Code::StdModulePrecompile` has existed, with a name and a
+                // comment, since the taxonomy was written; `grep` for it found the
+                // declaration and the `name()` arm and no third site. So every
+                // std-module refusal reported `other`, which is the bucket
+                // refusal.cppm defines as "a refusal that has not been given a code
+                // yet" -- a visible admission, and one nobody had cashed.
+                //
+                // Measured: `tests/matrix/expected.tsv` carried exactly ONE `other`
+                // row out of 176, `x86_64-windows-msvc x llvm@22.1.8` in graph mode,
+                // and `scan.sh` printed it under "无名拒绝" on every Windows run.
+                // The sentence was right and the classification was missing --
+                // the same shape `Code::HostToolToolchain` was added for.
+                refusal::record(refusal::Code::StdModulePrecompile);
+                return std::unexpected(sm.error().message);
+            }
+            stdBmiPath = sm->bmiPath;
+            stdObjectPath = sm->objectPath;
+            stdCompatBmiPath = sm->compatBmiPath;
+            stdCompatObjectPath = sm->compatObjectPath;
         }
-        stdBmiPath = sm->bmiPath;
-        stdObjectPath = sm->objectPath;
-        stdCompatBmiPath = sm->compatBmiPath;
-        stdCompatObjectPath = sm->compatObjectPath;
     }
 
     if (print_fingerprint) {
@@ -11435,6 +11483,7 @@ prepare_build(bool print_fingerprint,
     ctx.outputDir  = target_dir(*tc, fp, workRoot);
     ctx.stdBmi     = stdBmiPath;
     ctx.stdObject  = stdObjectPath;
+    ctx.stdModule  = std::move(describedStdModule);
     // Every directory a package payload may legitimately have been INSTALLED
     // into. There is more than one: the global registry, plus the two
     // project-local data roots a custom git index installs into
@@ -11467,12 +11516,28 @@ prepare_build(bool print_fingerprint,
         std::vector<std::filesystem::path> owned = storeRoots;
         owned.push_back(mcpp::home::root());
         std::vector<std::filesystem::path> roots;
-        for (std::size_t i = 1; i < packages.size(); ++i) {
+        // The same enumeration answers a second reader: which packages were
+        // read from an editable tree, with their source globs (the build
+        // database lists them as the inputs that change the plan).
+        auto qualified = [](const mcpp::manifest::Manifest& pm) {
+            return pm.package.namespace_.empty()
+                ? pm.package.name
+                : pm.package.namespace_ + "." + pm.package.name;
+        };
+        for (std::size_t i = 0; i < packages.size(); ++i) {
             const auto& pkgRoot = packages[i].root;
             if (pkgRoot.empty()) continue;
-            if (mcpp::build::path_is_under_any(pkgRoot, owned)) continue;
+            if (i > 0 && mcpp::build::path_is_under_any(pkgRoot, owned)) continue;
             auto normalized = pkgRoot.lexically_normal();
-            if (normalized == root->lexically_normal()) continue;
+            const bool known = std::ranges::any_of(ctx.sourcePackages,
+                [&](const BuildContext::SourcePackage& sp) {
+                    return sp.root.lexically_normal() == normalized;
+                });
+            if (!known)
+                ctx.sourcePackages.push_back({qualified(packages[i].manifest),
+                                              normalized,
+                                              packages[i].manifest.modules.sources});
+            if (i == 0 || normalized == root->lexically_normal()) continue;
             if (std::find(roots.begin(), roots.end(), normalized) == roots.end())
                 roots.push_back(std::move(normalized));
         }
@@ -11830,7 +11895,10 @@ prepare_build(bool print_fingerprint,
     // moved in — an earlier assignment was silently overwritten by that move,
     // which produced a generated file that nothing ever passed to the driver.
     // Generated here rather than in compute_flags, which runs twice per build.
-    if (tc->compiler == mcpp::toolchain::CompilerId::GCC)
+    // A link input only: a plan that builds nothing (`plan_only`) neither reads
+    // it nor runs the driver to produce it, and its compile arguments are the
+    // same without it.
+    if (tc->compiler == mcpp::toolchain::CompilerId::GCC && !overrides.plan_only)
         ctx.plan.gccCleanSpecs = mcpp::toolchain::write_clean_link_specs(
             tc->binaryPath, ctx.outputDir);
 
@@ -13318,6 +13386,7 @@ prepare_build(bool print_fingerprint,
             lu.targetName));
     }
 
+    ctx.planNotes = std::move(planNotes);
     return ctx;
 }
 

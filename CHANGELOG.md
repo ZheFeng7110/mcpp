@@ -5,6 +5,63 @@
 
 ## [Unreleased]
 
+### `mcpp emit build-database`:不写工程目录的构建数据库(#636,2026.9.15.1)
+
+新命令按 `mcpp build --configure-only` 的方式、用相同的选择器规划,把计划打印为
+S1「C++ Build Database: IDE Profile」0.2.0(WG21 P2977R2 的一个 profile)文档,不写入
+工程目录;`--spec compile-commands` 改为打印 `compile_commands.json` 的条目,
+`--format json` 用 `mcpp.build-database` 信封包裹,`-o <file>` 原子写入文件。规则见
+SPEC-005(`docs/specs/build-database.md`)。
+
+- 文档满足 S1 等级 2:每个包一个集合,另有 `<包>:test` 与 `mcpp:std`;`visible-sets`
+  列出其余所有集合,因为引擎在一张模块图上解析 import;每个单元的 `arguments` 与
+  `compile_commands.json` 取自同一条记录;`ide.role` 取自扫描器读到的声明形式。
+- 规划写到 `$MCPP_HOME/cache/build-database/<key>`:`BuildOverrides::work_dir` 此前有
+  两处写入不跟随它(多版本改名的暂存目录、根包 `generated_files`),现已修正;标准库
+  模块只描述不编译(`describe_std_module`);`mcpp.lock` 从工程读取、从不写回,不一致时
+  给出 `MCPP_LOCK_WOULD_CHANGE` 警告。
+- 标准库模块单元的命令从 mcpp 实际运行的构建命令中还原,std 缓存目录的身份不变。
+- S1 的 SHOULD 字段取自计划:单元的 `arguments` 依次是驱动、集合的
+  `baseline-arguments`(集合内最长公共前缀)、单元的 `local-arguments` 与结尾的
+  `-c <source> -o <object>`;`private` 为 `false`;`config-files` 列出驱动在命令行之外
+  读取的文件(未被 `--no-default-config` 绕过的 clang `.cfg`,GCC 库目录中的 `specs`)。
+- 信封增加约定:失败时省略 `data`。`--protocol-version` 声明该命令的效应,不含
+  `write-project`。
+- 测试:单测 `BuildDatabase.*`、`Scanner.DeclarationFormIsRecordedAsRead`、
+  `CompileCommandsEmit.UnitInvocationsAreTheCompileDatabaseArguments`、
+  `WireGolden.NullDataIsOmitted`;e2e 688 以随仓的 S1 schema 校验输出,并以
+  `--configure-only` 作对照腿证明工程目录未被写入。
+
+### 内置 xlings 升至 2026.9.14.1(2026.9.15.1)
+
+此前没有 `install()` 的包在安装时得到的是整个下载目录,而不是它自己的归档:宿主机上
+openkal 0.8.0 的包目录因此多占 1.6 G 其他包的下载物。xlings 2026.9.14.1 让这类包在
+私有目录中解压自己的归档,并由 `xlings self doctor` 报告已被污染的包目录、`--fix`
+重装(openxlings/xlings#596)。已有的 registry 用
+`XLINGS_HOME=<registry> xlings self doctor --fix` 修复。`kXlingsVersion` 与
+`check_version_pins.sh` 列出的全部 pin 随之前移。
+
+### 未被 `sources` 匹配的目标入口由扫描器读取(2026.9.15.1)
+
+发现的测试与 glob 之外的 `main` 不在包扫描中,它们的 import 此前只按行首的 `import`
+读取(`make_plan` 与规划前的标准库检查各一份),注释与原始字符串中的 `import` 也被当作
+导入。以 S1 校验 lsp-mcpp 仓库自身的构建数据库时发现:其扫描器测试被规划为导入三个
+没有任何源文件提供的模块。现在两处都经 `scan_entry_file` 读取入口:扫描器接受的文件
+取扫描器的结果;扫描器拒绝的文件(`#if` 块中的 `import`、头文件单元)在这条路径上从未
+被拒绝,现在也不被拒绝,取其代码中行首的 import,声明形式为 `Unknown`。(单测
+`Scanner.AnEntrySourceIsReadByTheScanner`、`Scanner.AnEntrySourceTheScannerRefusesKeepsItsImports`,
+e2e 688 判据 K)
+
+### Windows 上不再每条命令都打印 "The system cannot find the path specified."(2026.9.15.1)
+
+vendored xlings 的版本探针以命令串 `<xlings> --version 2>/dev/null` 运行。Windows 上
+命令串交给 cmd.exe,它打不开 `/dev/null`:除首次外的每条命令都打印这句提示,xlings
+没有运行,探针返回空版本,于是 vendored xlings 从不按 pin 更新。`mcpp.platform.process`
+增加 `capture_stdout`:直接运行程序、只捕获标准输出、丢弃标准错误、标准输入为空,
+Windows 上重定向写 cmd.exe 自己的空设备;xlings 版本探针与另外四个带 POSIX 语法、
+Windows 可达的探针改用它。(单测 `CaptureStdout.*`、
+`XlingsVersionPin.ProbeReadsStandardOutputThroughTheLauncher`,e2e 687)
+
 ### 在已激活的 xlings subos 中运行时,registry 不再被重定向(2026.9.14.3)
 
 `xlings subos use <name>` 打开的 shell 导出 `XLINGS_ACTIVE_SUBOS`,xlings 解析 subos
