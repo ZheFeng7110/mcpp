@@ -147,7 +147,10 @@ Autotools/CMake. On Linux, mcpp passes `-Wl,-soname,<name>` to the linker and
 generates a `<name> -> lib<target>.so` alias in the output directory, so that
 downstream programs can load the library via its standard ABI name through
 `DT_NEEDED` or `dlopen()`. This field only applies to `kind = "shared"`, and the
-value must be a filename basename.
+value must be a filename basename. An ELF shared library that declares no
+`soname` records its output file name as its SONAME (2026.9.14.2+), which is
+the name its consumers already record in `DT_NEEDED`; bionic requires one from
+API level 23.
 
 Shared-library targets work on all three binary formats. ELF gets a `.so` with
 its `soname` and a `$ORIGIN` search path; Mach-O gets a `.dylib` whose install
@@ -440,6 +443,7 @@ whose C library is linked statically — which is the **default for musl** —
 | The package writes | mcpp reads it as |
 |---|---|
 | `[targets.<n>] kind = "shared"` | *must* be shared — something else in the process will `dlopen` it, so there may only be one copy (X11, a Vulkan loader) |
+| `[target.<sel>.targets.<n>] kind = "shared"` *(2026.9.14.2+)* | *must* be shared on the rows the selector matches, and either form elsewhere ([22 — The Target Side](22-target-side.md)) |
 | `ldflags` containing `-L` | *must* be static — the package ships prebuilt archives mcpp did not compile and cannot place inside a shared object it builds |
 | a packaged library (`mcpp pack`) | whichever legs it actually ships, from `[[runtime.artifacts]] role` |
 | anything else | either form |
@@ -447,6 +451,13 @@ whose C library is linked statically — which is the **default for musl** —
 `kind = "lib"` is **not** a constraint: it is the default value, and most
 packages write it without choosing anything. Absence of a statement is not a
 statement.
+
+A request the constraint refuses is linked in the form the package allows,
+with a warning that names the package's statement (`its manifest states
+[targets.fw] kind = "shared", ...`); `--strict` turns the warning into an
+error. `mcpp why deps` reports each dependency's form and the reason for it:
+`default`, `requested`, `package-kind`, `row-kind`, `packaged`, `no-sources`,
+`prebuilt-inputs`, `no-loader` or `static-libc` (2026.9.14.2+).
 
 A per-dependency `linkage` is honoured **only in the root project's**
 `[dependencies]`. A package deep in the graph does not get to decide how the
@@ -1434,6 +1445,24 @@ do`.
 
 Moved to [09 — Commands by Scenario](09-commands-by-scenario.md).
 
+### 2.17 `[test]` — Where Test Programs Are
+
+```toml
+[test]
+discover = ["tests/**/*.cpp"]    # the default
+```
+
+| Key | Type | Meaning |
+|---|---|---|
+| `discover` | array of globs | every file a glob matches is one test program; a glob beginning with `!` removes the files it matches; `[]` discovers none |
+
+The globs use the vocabulary of `[build] sources`. A test's name is its path
+relative to the fixed directory of the first glob that matched it, without the
+extension. Two files with one name are refused, naming both. A value that is not
+an array of non-empty strings is an error; any other key in `[test]` is a
+warning, and an error under `--strict`. [08 — Testing](08-testing.md) describes
+the test model.
+
 
 ## 3. Worked Examples
 
@@ -1495,7 +1524,7 @@ kind = "bin"
 | C standard | `c11` | `.c` files go through the C compiler automatically |
 | Static stdlib | `true` | Portable binary |
 | Headers | `include/` (if present) | Added to `-I` automatically |
-| Tests | `tests/**/*.cpp` | Discovered automatically by `mcpp test` |
+| Tests | `tests/**/*.cpp` | Discovered automatically by `mcpp test`; `[test] discover` replaces the set |
 | Dependency namespace | `mcpplibs` (default) | A bare selector means only this exact namespace |
 
 ### 4.1 Legacy `[language]` Compatibility Layer

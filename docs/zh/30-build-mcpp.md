@@ -213,6 +213,12 @@ for (auto a : {"-machine","virt","-nographic","-no-reboot","-kernel"})
 **只能有一个依赖提供 runner。** 两个板级支持包都声称知道怎么跑这个产物是配置
 错误;mcpp 会**同时点名两个**并报错,而不是把它们并成一个谁也不是的 argv。
 
+**在一个构建程序之内,每个名字的 token 组成一个 argv。** 每次 `mcpp::runner(tok)`
+调用追加到默认 runner,每次 `mcpp::runner(name, tok)` 调用追加到名为 `name` 的
+runner,按发出顺序,无论调用来自编译进这个程序的哪个 host module。要在两个 runner
+之间选择的程序,在发出任何一个之前完成选择。以打包格式命名的 runner 在
+`mcpp run --format <name>` 下抵达该格式的可分发物([41 —— 抵达一台设备](41-devices.md))。
+
 ### 问,而不是声明:`toolchain_dir` / `sysroot_dir`(2026.8.19.4+)
 
 ```cpp
@@ -255,6 +261,25 @@ crt/host_config.h:218: fatal error: features.h: No such file or directory
 
 **不是 `sysroot_dir()`。** 那个回答的是目标**档位**的问题,在宿主目标上为空,
 而宿主目标恰恰是这一对存在的场合。mcpp 不传某个开关时,对应的那个为空串。
+
+### 载荷的 pkg-config 视图:`pkg_config_libdir`(2026.9.14.2+)
+
+```cpp
+const char* dirs = mcpp::pkg_config_libdir();
+// <registry>/subos/default/usr/lib/pkgconfig:<registry>/subos/default/usr/share/pkgconfig
+```
+
+mcpp 安装的载荷的 pkg-config 搜索路径,以平台的路径列表分隔符连接。载荷配方把自己的
+`.pc` 文件声明进这个视图,因此由载荷提供的库连同它的整个 pkg-config 闭包都能解析:
+
+```cpp
+std::string cmd = std::string("PKG_CONFIG_LIBDIR=") + mcpp::pkg_config_libdir()
+                + " pkg-config --cflags --libs gtk4";
+```
+
+**这是访问器,不是环境默认值。** 构建程序的环境不携带 `PKG_CONFIG_LIBDIR`,因此
+指宿主自己 pkg-config 数据库的包照旧,指载荷的包自己写明。该值与链接模式以及解析出
+哪个工具链无关。
 
 ### 解析出的 C++ 标准库:`cxx_stdlib`(2026.9.6.3+)
 
@@ -607,12 +632,13 @@ mcpp 会写出 `<暂存树>.stage-manifest` —— 一个兄弟文件,永不是�
 已是最新。
 
 **这份 manifest 的第一行是 `closure = walked` 或 `closure = not-walked`。**
-`mcpp pack` 会先暂存程序本身与它声明过的运行期文件,再去问这台宿主机能不能解析该产物的
-依赖闭包 —— 所以这棵树可以在没有闭包的情况下存在:今天是一个 Mach-O 程序,或者在
-Windows 宿主上打包一个非 PE 产物。`--format tar` 与 `--format dir` 在这种情况下仍然让
-命令失败,因为归档本身就是闭包;一个被分发出去的格式无论如何都会拿到这棵树,manifest 上
-多出第二行 `reason = <原因>`,点名是哪种机制在这台宿主上不可用。需要闭包的提供方读这个
-字段,而不是从一个空的 `lib/` 里去猜测缺口。
+`mcpp pack` 会先暂存程序本身与它声明过的运行期文件,再解析该产物的依赖闭包 —— 所以这棵
+树可以在闭包不完整的情况下存在:闭包里有一个名字解析不到树能携带的文件(2026.9.14.2+),
+或者在 Windows 宿主上打包一个既非 PE 也非 Mach-O 的产物。`--format tar` 与
+`--format dir` 在这种情况下让命令失败,因为归档本身就是闭包;一个被分发出去的格式无论如何
+都会拿到这棵树,manifest 上多出第二行 `reason = <原因>`。头部之后的 `needs` 行给出每个
+被需要的名字以及满足它的东西([50 —— 机器输出](50-machine-output.md)),自行放置库的
+提供方读这些行,而不是从 `lib/` 里推断闭包。
 
 命令是 **argv 而不是 shell 字符串**(不假设存在 shell —— Windows 没有能依赖的那个),
 插值只有封闭的一组:

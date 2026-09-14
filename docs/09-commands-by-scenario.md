@@ -107,6 +107,22 @@ This scan runs only after a lookup has already failed, and its result reaches
 error text and search output only. A bare name never resolves across namespaces
 on the strength of it.
 
+## Another toolchain for one invocation
+
+`mcpp build`, `mcpp run`, `mcpp test` and `mcpp pack` take `--toolchain <spec>`,
+which selects the compiler for that invocation and writes nothing:
+
+```bash
+mcpp test --toolchain llvm@22.1.8
+mcpp run --toolchain gcc@16.1.0
+mcpp pack --toolchain llvm@22.1.8 --format dir
+```
+
+For that invocation the option takes the place of `[toolchain] default` in
+`mcpp.toml`, at the rank [20 — Toolchain Management](20-toolchains.md) gives
+`MCPP_TOOLCHAIN`. Each toolchain builds into its own output directory, and a
+recorded build is replayed only for the toolchain request that recorded it.
+
 ## Explaining a resolution
 
 `mcpp why` reports what a build would resolve, and builds nothing:
@@ -117,6 +133,27 @@ toolchain: gcc 16.1.0 (x86_64-linux-gnu)
   abi(libc)=glibc  cxxstdlib=libstdc++  arch=x86_64  os=linux  triple=x86_64-linux-gnu
   reason: [toolchain] in mcpp.toml if set, else platform-native default
 ```
+
+`mcpp why deps` lists the resolved dependency graph before the lines of
+`mcpp.lock` (2026.9.14.2+): every package, the key and the table each request
+was written with, and a library's link form with the reason for it. A `path`
+dependency, which the lock does not record, is listed too:
+
+```
+$ mcpp why deps
+dependency graph:
+  mcpplibs.app@0.1.0  (root)  path+/work/app
+  huxdemo.fw@0.1.0  path+/work/fw
+      requested by mcpplibs.app@0.1.0 as 'huxdemo.fw' in [dependencies]
+      requested by huxdemo.comp@0.1.0 as 'fw' in [dependencies]
+      linked static (default)
+```
+
+The same graph is recorded under `graph` in
+`target/<triple>/<fp>/resolution.json`, one entry per package with the root
+first: `package` (canonical identity, namespace, name, version, source),
+`root`, `requested_by` (`requester`, `key`, `table`), and, for a library,
+`link` (`form`, `reason`).
 
 The topic is `toolchain`, `runtime`, `deps` or `runners`, and all four report
 when none is named. `--target` and `--toolchain` turn the report into a query

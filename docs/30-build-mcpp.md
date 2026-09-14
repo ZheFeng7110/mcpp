@@ -243,6 +243,14 @@ both claiming to know how to run the artifact is a configuration error, and
 mcpp reports it naming both rather than merging them into an argv that is
 neither one's.
 
+**Within one build program, the tokens are one argv per name.** Every
+`mcpp::runner(tok)` call appends to the default runner, and every
+`mcpp::runner(name, tok)` call appends to the runner `name`, in emission order,
+whichever host module compiled into the program makes the call. A program that
+chooses between two runners chooses before it emits either. A runner named
+after a pack format reaches that format's distributable under `mcpp run
+--format <name>` ([41 — Reaching a Device](41-devices.md)).
+
 ### Asking instead of declaring: `toolchain_dir` / `sysroot_dir` (2026.8.19.4+)
 
 ```cpp
@@ -293,6 +301,28 @@ the first one sees.
 **Not `sysroot_dir()`.** That answers a question about the target's *tier*
 and is empty on a hosted target, which is exactly the case this pair exists
 for. Either of these two is empty when mcpp passes no such flag.
+
+### The payloads' pkg-config view: `pkg_config_libdir` (2026.9.14.2+)
+
+```cpp
+const char* dirs = mcpp::pkg_config_libdir();
+// <registry>/subos/default/usr/lib/pkgconfig:<registry>/subos/default/usr/share/pkgconfig
+```
+
+The pkg-config search path of the payloads mcpp installed, joined with the
+platform's path-list separator. A payload recipe declares its `.pc` files into
+this view, so a library a payload provides resolves with its whole pkg-config
+closure:
+
+```cpp
+std::string cmd = std::string("PKG_CONFIG_LIBDIR=") + mcpp::pkg_config_libdir()
+                + " pkg-config --cflags --libs gtk4";
+```
+
+**An accessor, not an environment default.** A build program's environment
+does not carry `PKG_CONFIG_LIBDIR`, so a package that means the host's own
+pkg-config database keeps it, and a package that means the payloads states so.
+The value does not depend on the link mode or on which toolchain resolved.
 
 ### The resolved C++ standard library: `cxx_stdlib` (2026.9.6.3+)
 
@@ -711,14 +741,15 @@ reported as up to date.
 
 **The manifest's first line is `closure = walked` or `closure = not-walked`.**
 `mcpp pack` stages the program and its declared runtime
-files before it asks whether this host can resolve the artifact's dependency
-closure, so the tree can exist without one — a Mach-O program today, or a
-non-PE artifact packed from a Windows host. `--format tar` and `--format dir`
-still fail the command in that case, since the archive IS the closure; a
-dispatched format receives the tree regardless, with a second manifest line,
-`reason = <why>`, naming the mechanism that was unavailable. A provider that
-needs the closure reads the field rather than inferring a gap from an empty
-`lib/`.
+files before it resolves the artifact's dependency closure, so the tree can
+exist without a complete one: a closure with a name that resolves to no file
+the tree can carry (2026.9.14.2+), or a non-PE, non-Mach-O artifact packed from
+a Windows host. `--format tar` and `--format dir` fail the command in that
+case, since the archive IS the closure; a dispatched format receives the tree
+regardless, with a second manifest line, `reason = <why>`. The `needs` lines
+that follow the header state each needed name and what satisfies it
+([50 — Machine Output](50-machine-output.md)), so a provider that places
+libraries itself reads them rather than inferring the closure from `lib/`.
 
 Commands are an **argv, not a shell string** (no shell is assumed — Windows has
 none to rely on), and the only interpolations are a closed set:

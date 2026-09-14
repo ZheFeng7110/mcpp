@@ -139,7 +139,9 @@ soname = "libmylib.so.1"  # 可选: Linux/ELF ABI 名称,运行时会生成同�
 `SOVERSION`/`SONAME`。在 Linux 上,mcpp 会向链接器传递
 `-Wl,-soname,<name>`,并在输出目录生成 `<name> -> lib<target>.so` alias,
 让下游程序可通过标准 ABI 名称 `DT_NEEDED` 或 `dlopen()` 加载该库。
-该字段只对 `kind = "shared"` 有效,值必须是文件名 basename。
+该字段只对 `kind = "shared"` 有效,值必须是文件名 basename。未声明 `soname`
+的 ELF 共享库以输出文件名作为 SONAME(2026.9.14.2+),这正是消费者已经记录在
+`DT_NEEDED` 中的名字;bionic 自 API level 23 起要求共享库带有 SONAME。
 
 共享库目标在三种二进制格式上都可用。ELF 产出带 `soname` 的 `.so` 与 `$ORIGIN`
 搜索路径;Mach-O 产出 install name 为 `@rpath/<file>` 的 `.dylib`,因此移动后
@@ -392,12 +394,19 @@ dependency_linkage = "shared"        # 按 profile 覆盖
 | 包写了 | mcpp 读作 |
 |---|---|
 | `[targets.<n>] kind = "shared"` | *必须* shared —— 进程里会有别人 `dlopen` 它,因此只能有一份(X11、Vulkan loader) |
+| `[target.<sel>.targets.<n>] kind = "shared"` *(2026.9.14.2+)* | 在选择器命中的行上*必须* shared,其余行两种形态都可以([22 —— 目标侧](22-target-side.md)) |
 | `ldflags` 里含 `-L` | *必须* static —— 包携带了 mcpp 没有编译的预构建归档,放不进 mcpp 自己构建的共享对象 |
 | 分发包(`mcpp pack`) | 它实际随包的那些腿,取自 `[[runtime.artifacts]] role` |
 | 其他 | 两种形态都可以 |
 
 `kind = "lib"` **不是**约束:它是默认值,大多数包写下它并没有做任何选择。
 **没有陈述不等于一条陈述。**
+
+约束拒绝的请求按包允许的形态链接,并给出一条点名包的陈述的警告
+(`its manifest states [targets.fw] kind = "shared", ...`);`--strict` 下该警告
+成为错误。`mcpp why deps` 报告每个依赖的形态及其原因:`default`、`requested`、
+`package-kind`、`row-kind`、`packaged`、`no-sources`、`prebuilt-inputs`、
+`no-loader` 或 `static-libc`(2026.9.14.2+)。
 
 依赖边上的 `linkage` 只在**根工程**的 `[dependencies]` 里生效。依赖图深处的包
 无权决定最终程序的布局;真正必须只有一份共享副本的包,应当在自己的 target 上
@@ -1236,6 +1245,22 @@ o.arg("./mkblob.sh").arg("blob.bin").arg("${mcpp.out_dir}/blob.o")
 
 已移入 [09 —— 按场景选命令](09-commands-by-scenario.md)。
 
+### 2.17 `[test]` —— 测试程序的位置
+
+```toml
+[test]
+discover = ["tests/**/*.cpp"]    # 默认值
+```
+
+| 键 | 类型 | 含义 |
+|---|---|---|
+| `discover` | glob 数组 | glob 匹配到的每个文件都是一个测试程序;以 `!` 开头的 glob 去掉它匹配到的文件;`[]` 不发现任何测试 |
+
+glob 使用 `[build] sources` 的词汇。测试的名字是它相对于第一个匹配它的 glob 的固定
+目录的路径,去掉扩展名。同名的两个文件会被拒绝,并点名两者。值不是非空字符串数组时
+报错;`[test]` 中的其他键给出警告,在 `--strict` 下为错误。测试模型见
+[08 —— 测试](08-testing.md)。
+
 
 ## 3. 实战示例
 
@@ -1296,7 +1321,7 @@ kind = "bin"
 | C 标准 | `c11` | `.c` 文件自动走 C 编译器 |
 | 静态 stdlib | `true` | 便携二进制 |
 | 头文件 | `include/`(如果存在） | 自动加到 `-I` |
-| 测试 | `tests/**/*.cpp` | `mcpp test` 自动发现 |
+| 测试 | `tests/**/*.cpp` | `mcpp test` 自动发现;`[test] discover` 替换这个集合 |
 | 依赖命名空间 | `mcpplibs`(默认) | 裸 selector 只表示该精确 ns |
 
 ### 4.1 旧 `[language]` 兼容层

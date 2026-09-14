@@ -364,6 +364,28 @@ layer_predicated_xlings_refusal(const mcpp::manifest::Manifest& m)
     return std::nullopt;
 }
 
+// Two declarations of one dependency, compared by the identity their keys
+// normalise to rather than by the keys themselves: `fw` and `mcpplibs.fw` are
+// one package under two map keys (`selector.stableMapKey`), and a comparison
+// of keys would leave both entries in the map for the resolver to see.
+bool same_dependency_identity(const mcpp::manifest::DependencySpec& a,
+                              const mcpp::manifest::DependencySpec& b) {
+    if (a.shortName.empty() || b.shortName.empty()) return false;
+    return a.namespace_ == b.namespace_ && a.shortName == b.shortName;
+}
+
+void replace_dependencies(
+    std::map<std::string, mcpp::manifest::DependencySpec>& into,
+    const std::map<std::string, mcpp::manifest::DependencySpec>& from)
+{
+    for (auto const& [key, spec] : from) {
+        std::erase_if(into, [&](auto const& entry) {
+            return entry.first == key || same_dependency_identity(entry.second, spec);
+        });
+        into[key] = spec;
+    }
+}
+
 export void merge_conditional_config(mcpp::manifest::Manifest& m,
                                     const cfgpred::Ctx& ctx)
 {
@@ -455,18 +477,34 @@ export void merge_conditional_config(mcpp::manifest::Manifest& m,
         // BuildInputs, so conditional sources are mirrored into it here.
         for (auto const& s : cc.inputs.sources)
             m.modules.sources.push_back(s);
-        // insert() keeps an existing unconditional entry: a conditional
-        // section adds a dependency, it never silently overrides one.
-        m.dependencies.insert(cc.dependencies.begin(), cc.dependencies.end());
-        m.devDependencies.insert(cc.devDependencies.begin(), cc.devDependencies.end());
-        m.buildDependencies.insert(cc.buildDependencies.begin(),
-                                   cc.buildDependencies.end());
+        // A matching conditional declaration of a dependency REPLACES the
+        // declaration of the same identity, and a later matching section
+        // replaces an earlier one: the rule every conditional scalar above
+        // follows (#634, A1). This used to be `insert()`, which kept the
+        // unconditional entry, so `linkage = "shared"` written for one row was
+        // dropped on that row without a word. No manifest among 509 scanned
+        // declared one dependency in both tables, so no build that worked
+        // changes; the declaring table rides on the spec (`declaredIn`) into
+        // the resolution record.
+        replace_dependencies(m.dependencies, cc.dependencies);
+        replace_dependencies(m.devDependencies, cc.devDependencies);
+        replace_dependencies(m.buildDependencies, cc.buildDependencies);
         // #359: `[target.<sel>.feature-deps.<feature>]`. The feature is
         // registered by the parser regardless of the predicate; only what it
         // pulls in is conditional.
-        for (auto const& [fname, deps] : cc.featureDeps) {
-            auto& dst = m.featureDeps[fname];
-            dst.insert(deps.begin(), deps.end());
+        for (auto const& [fname, deps] : cc.featureDeps)
+            replace_dependencies(m.featureDeps[fname], deps);
+        // `[target.<sel>.targets.<name>] kind`: the row's form of a library
+        // target, applied before resolution, so the link-form resolution
+        // reads it exactly as it reads `[targets.<name>] kind`. `load` has
+        // already refused a name that is not a library target.
+        for (auto const& [name, row] : cc.targetKinds) {
+            for (auto& t : m.targets) {
+                if (t.name != name) continue;
+                t.kind = row.kind;
+                t.kindDeclaredBy = row.statement;
+                t.kindFromRow = true;
+            }
         }
     }
 }
@@ -1245,8 +1283,18 @@ void fill_package_build_env(mcpp::build::BuildProgramEnv& e,
 
 void fill_target_build_env(mcpp::build::BuildProgramEnv& e,
                            const mcpp::manifest::Manifest& m,
-                           const mcpp::toolchain::Toolchain* tc)
+                           const mcpp::toolchain::Toolchain* tc,
+                           const mcpp::config::GlobalConfig* cfg)
 {
+    // The registry SubOS is where payloads are installed, whichever
+    // toolchain or link mode resolved, so this is set before the toolchain
+    // gate below.
+    if (cfg) {
+        const auto view = mcpp::xlings::paths::sysroot(mcpp::config::make_xlings_env(*cfg));
+        e.pkgConfigLibdir = (view / "usr" / "lib" / "pkgconfig").generic_string()
+            + mcpp::platform::env::path_list_separator()
+            + (view / "usr" / "share" / "pkgconfig").generic_string();
+    }
     e.toolchainDir  = (tc && !tc->binaryPath.empty())
         ? tc->binaryPath.parent_path().parent_path().string() : std::string{};
     e.targetSysroot = tc ? tc->targetSysrootRoot.string() : std::string{};
@@ -1505,6 +1553,25 @@ provision_xlings_addresses(const mcpp::config::GlobalConfig& cfg,
             if (needProvision) {
                 mcpp::ui::status("Provisioning",
                     std::format("{} ({})", label, join_deps(", ")));
+                // An address whose index a `[index.repos.<name>]` table
+                // redirects is installed from that source, and says so: an
+                // installation from a branch checkout must not read as one
+                // from the published index (#634, C4).
+                std::set<std::string> redirected;
+                for (auto const& d : declaredDeps) {
+                    const auto colon = d.find(':');
+                    if (colon == std::string::npos) continue;
+                    const auto index = d.substr(0, colon);
+                    for (auto const& r : cfg.indexRepos) {
+                        if (!r.fromConfig || r.name != index) continue;
+                        if (r.name == "mcpplibs" && r.url == mcpp::config::kMcpplibsIndexUrl)
+                            continue;
+                        if (redirected.insert(index).second)
+                            mcpp::ui::status("Index", std::format(
+                                "{} -> {} ([index.repos.{}] in config.toml)",
+                                r.name, r.url, r.name));
+                    }
+                }
                 // GLOBAL scope, and the scope is the whole point.
                 //
                 // The obvious alternative -- `install_packages` against
@@ -1709,6 +1776,10 @@ prepare_build(bool print_fingerprint,
     // developer directory can be switched between them -- and this repository
     // has a standing rule that a value crossing two sites is resolved at one.
     std::optional<std::filesystem::path> appleSdkLocated;
+    // The iOS floor was not written and was taken from the located SDK. The
+    // refusal of a dependency's platform floor names where the value came
+    // from, and after the fill below the manifest no longer says.
+    bool iosFloorFromSdk = false;
     // Non-empty when a target row's convention replaced a toolchain the user
     // had set with `mcpp toolchain default`. Reported on the status line,
     // because a substitution nobody is told about is a rule that can only be
@@ -2053,6 +2124,17 @@ prepare_build(bool print_fingerprint,
                 "condition it on the triple instead.",
                 cc.predicate));
         }
+        // The same reason holds for a row's library form: whether a package
+        // is linked shared is decided while the graph is resolved, before a
+        // layer has an answer.
+        if (cfgpred::uses_layer(cc.predicate) && !cc.targetKinds.empty()) {
+            m->schemaWarnings.push_back(std::format(
+                "[target.'{}'] conditions a target's kind on a target-side "
+                "layer (ignored). A layer is resolved from the dependency "
+                "graph, and a library's form is decided while that graph is "
+                "resolved; condition the kind on the triple instead.",
+                cc.predicate));
+        }
     }
 
     // Surface non-fatal manifest schema warnings (e.g. unsupported [targets.*]
@@ -2340,6 +2422,26 @@ prepare_build(bool print_fingerprint,
     // silently overrule one the user wrote down.
     auto tcOrigin = tcSpec.has_value() ? TcOrigin::ManifestToolchain
                                        : TcOrigin::None;
+    // `--toolchain` shares `ManifestToolchain`'s precedence and not its
+    // spelling: the messages that refuse a spec name where it was written, and
+    // a value from the command line credited to a manifest key sends the
+    // reader to a file that does not contain it.
+    bool tcFromCommandLine = false;
+    auto tcSpecSource = [&]() -> std::string {
+        if (tcOrigin == TcOrigin::ManifestToolchain && tcFromCommandLine)
+            return "--toolchain";
+        switch (tcOrigin) {
+            case TcOrigin::ManifestToolchain:
+                return std::format("[toolchain].{}", kCurrentPlatform);
+            case TcOrigin::TargetSection:
+                return std::format("[target.{}].toolchain", overrides.target_triple);
+            case TcOrigin::GlobalDefault:
+                return "the default toolchain (`mcpp toolchain default`)";
+            default:
+                return std::format("the toolchain mcpp chose ({})",
+                                   tc_origin_name(tcOrigin));
+        }
+    };
     // `--toolchain` (arriving as MCPP_TOOLCHAIN, the same side channel
     // `--offline` and `--jobs` use) beats everything, including the manifest.
     //
@@ -2354,6 +2456,7 @@ prepare_build(bool print_fingerprint,
     if (const char* tcEnv = std::getenv("MCPP_TOOLCHAIN"); tcEnv && *tcEnv) {
         tcSpec   = std::string(tcEnv);
         tcOrigin = TcOrigin::ManifestToolchain;
+        tcFromCommandLine = true;
     }
     if (!tcSpec.has_value()) {
         auto cfg = get_cfg();
@@ -2605,8 +2708,10 @@ prepare_build(bool print_fingerprint,
             // that the fingerprint slot, the effective triple and every
             // report read one value.
             if (appleSdkLocated && m->buildConfig.iosDeploymentTarget.empty()) {
-                if (auto v = mcpp::platform::macos::sdk_version(which))
+                if (auto v = mcpp::platform::macos::sdk_version(which)) {
                     m->buildConfig.iosDeploymentTarget = *v;
+                    iosFloorFromSdk = true;
+                }
             }
             if (!appleSdkLocated) {
                 // A CODE, BECAUSE THE MATRIX COMPARES REASONS AND NOT ONLY
@@ -3091,7 +3196,7 @@ prepare_build(bool print_fingerprint,
         // where it used to happen — somewhere else, saying something else.
         auto s = mcpp::toolchain::parse_toolchain_spec(*tcSpec);
         if (!s) return std::unexpected(std::format(
-            "[toolchain].{} = '{}': {}", kCurrentPlatform, *tcSpec, s.error()));
+            "{} = '{}': {}", tcSpecSource(), *tcSpec, s.error()));
         parsedSpec   = std::move(*s);
         tcOriginAxis = mcpp::toolchain::origin_of(*parsedSpec);
       }
@@ -3118,8 +3223,8 @@ prepare_build(bool print_fingerprint,
         auto spec = parsedSpec;
         if (spec->version.empty()) {
             return std::unexpected(std::format(
-                "[toolchain].{} = '{}' is invalid; expected '<pkg>@<version>'",
-                kCurrentPlatform, *tcSpec));
+                "{} = '{}' is invalid; expected '<pkg>@<version>'",
+                tcSpecSource(), *tcSpec));
         }
         // A `--target <triple>` build carries the (already canonical) triple
         // into the spec's target axis: the payload mapping then resolves the
@@ -4688,6 +4793,51 @@ prepare_build(bool print_fingerprint,
     };
     std::deque<WorkItem> worklist;
 
+    // #634, A2. A `path` or `git` dependency's identity is the one its manifest
+    // declares (SPEC-001 §1.2), and the key a consumer wrote is one way of
+    // reaching it. `identityBySource` maps a canonical source (the directory,
+    // or the repository and reference) to the identity resolved from it, so a
+    // second key over the same source finds that record without loading the
+    // manifest again. `declaringManifest` holds the manifest each such
+    // identity came from, and records whether that manifest named its
+    // namespace: one that does not takes the key's, so two keys over it would
+    // be two identities over one source.
+    struct DeclaringManifest {
+        std::string path;
+        bool        namespaceDeclared = false;
+    };
+    std::map<std::string, ResolvedKey> identityBySource;
+    std::map<ResolvedKey, DeclaringManifest> declaringManifest;
+    std::set<std::pair<std::string, std::string>> adoptionsReported;
+    auto qualifiedKey = [](const ResolvedKey& k) {
+        return k.ns.empty() ? k.shortName : std::format("{}.{}", k.ns, k.shortName);
+    };
+    // A root edge that adopted an identity states it on the root's own
+    // declaration too, which is what every later reader of the root manifest
+    // (the build banner, the resolution record) sees.
+    auto stateAdoptedIdentity = [&](const WorkItem& item, const ResolvedKey& declared) {
+        if (item.consumerDepIndex != kMainConsumer) return;
+        if (auto it = m->dependencies.find(item.name); it != m->dependencies.end()) {
+            it->second.namespace_ = declared.ns;
+            it->second.shortName = declared.shortName;
+        }
+    };
+    // One warning per declaring edge: each names a line someone can correct.
+    auto reportAdoption = [&](const std::string& requestedBy, const std::string& written,
+                              const ResolvedKey& normalised, const ResolvedKey& declared,
+                              const std::string& manifestPath) {
+        if (!adoptionsReported.emplace(requestedBy, written).second) return;
+        mcpp::diag::warning("dependency/identity", std::format(
+            "'{}' declares the dependency '{}', which names {}; the manifest "
+            "'{}' declares {}, and that identity is used.",
+            requestedBy, written, qualifiedKey(normalised), manifestPath,
+            qualifiedKey(declared)),
+            std::format("write '{}' in '{}' to state the identity the "
+                        "manifest declares.",
+                        qualifiedKey(declared), requestedBy));
+    };
+
+
     // Index routing — WHICH index answers for a namespace and how its
     // descriptors are read — lives in mcpp.pm.index_route, shared with the
     // `mcpp add` existence gate so the two cannot disagree about which
@@ -5359,7 +5509,7 @@ prepare_build(bool print_fingerprint,
             // version. Scoped: restored when this dependency's install returns,
             // compat retries below included.
             mcpp::build::BuildProgramEnv hookEnv;
-            fill_target_build_env(hookEnv, *m, tc ? &*tc : nullptr);
+            fill_target_build_env(hookEnv, *m, tc ? &*tc : nullptr, cfg_opt ? &*cfg_opt : nullptr);
             hookEnv.targetTriple = overrides.target_triple;
             // Six names, fixed by install_hook_env; one guard each.
             const auto hookVars = mcpp::build::install_hook_env(hookEnv);
@@ -5573,6 +5723,22 @@ prepare_build(bool print_fingerprint,
         bool buildOnly = false;
     };
     std::vector<DependencyEdge> dependencyEdges;
+    // #634, X: every request that reached a package, as the requester wrote
+    // it, for the `graph` section of resolution.json. Kept apart from
+    // `dependencyEdges`, which merges two requests of one consumer for one
+    // dependency into one edge; the record has to keep both keys, because two
+    // keys over one identity (A2) and the table a declaration came from (A1)
+    // are what it exists to show.
+    struct GraphRequest {
+        std::size_t consumerPackageIndex = 0;
+        std::size_t dependencyPackageIndex = 0;
+        std::string key;        // the dependency key as the requester wrote it
+        std::string table;      // `DependencySpec::declaredIn`
+    };
+    std::vector<GraphRequest> graphRequests;
+    // The link form each dependency took, and why (`linkage_form::Resolution`),
+    // by package index.
+    std::map<std::size_t, std::pair<std::string, std::string>> graphLinkForms;
     namespace dg = mcpp::build::dep_graph;
     // #355: consumer package index → (env var, absolute path) for each host
     // tool that consumer requested. Filled by the provisioning pass below;
@@ -6034,13 +6200,25 @@ prepare_build(bool print_fingerprint,
         [&](std::size_t consumerDepIndex,
             std::size_t dependencyPackageIndex,
             const mcpp::manifest::DependencySpec& spec,
-            bool buildOnly = false)
+            bool buildOnly,
+            const std::string& writtenKey)
     {
         const auto consumerPackageIndex = packageIndexForConsumer(consumerDepIndex);
         if (consumerPackageIndex >= packages.size()
             || dependencyPackageIndex >= packages.size()) {
             return;
         }
+        if (std::ranges::none_of(graphRequests, [&](const GraphRequest& r) {
+                return r.consumerPackageIndex == consumerPackageIndex
+                    && r.dependencyPackageIndex == dependencyPackageIndex
+                    && r.key == writtenKey && r.table == spec.declaredIn;
+            }))
+            graphRequests.push_back(GraphRequest{
+                .consumerPackageIndex = consumerPackageIndex,
+                .dependencyPackageIndex = dependencyPackageIndex,
+                .key = writtenKey,
+                .table = spec.declaredIn,
+            });
         const auto visibility = parseVisibility(spec.visibility);
         auto same = [&](const DependencyEdge& edge) {
             return edge.consumerPackageIndex == consumerPackageIndex
@@ -6141,7 +6319,9 @@ prepare_build(bool print_fingerprint,
                                  const std::string& flag) {
         auto absolute_path = [&](std::string_view raw) {
             std::filesystem::path p{std::string(raw)};
-            if (p.is_absolute() || raw.starts_with("$")) return p;
+            // A loader token stays as written; see the predicate.
+            if (p.is_absolute() || mcpp::build::is_loader_relative_search_path(raw))
+                return p;
             return depRoot / p;
         };
 
@@ -6540,6 +6720,34 @@ prepare_build(bool print_fingerprint,
         // branch below for the cache identity.
         std::string sourceCommit;
 
+        // A second key over a source that is already resolved takes the
+        // identity resolved there; its manifest is not loaded again.
+        if (sourceKind != "version") {
+            const auto source = sourceRefOf(sourceKind, spec, item.resolveRoot,
+                                            item.originalConstraint);
+            if (auto bySource = identityBySource.find(source);
+                bySource != identityBySource.end() && !(bySource->second == key)) {
+                const auto& existing = resolved.at(bySource->second);
+                const auto& declaring = declaringManifest.at(bySource->second);
+                if (!declaring.namespaceDeclared) {
+                    return std::unexpected(std::format(
+                        "one source is reached as two packages: '{}' names it {} "
+                        "and '{}' names it {}, and its manifest '{}' declares no "
+                        "namespace, so each key gives it its own identity and "
+                        "its modules would be compiled twice.\n"
+                        "       fix: declare `namespace` in '{}', or write the "
+                        "same key in both places.",
+                        existing.requestedBy, qualifiedKey(bySource->second),
+                        item.requestedBy, qualifiedKey(key),
+                        declaring.path, declaring.path));
+                }
+                reportAdoption(item.requestedBy, name, key, bySource->second,
+                               declaring.path);
+                key = bySource->second;
+                stateAdoptedIdentity(item, key);
+            }
+        }
+
         if (auto it = resolved.find(key); it != resolved.end()) {
             // A package is dev-only until some non-dev consumer wants it. Order
             // of arrival must not decide, so this is an AND over every request.
@@ -6641,7 +6849,7 @@ prepare_build(bool print_fingerprint,
                 if (it->second.depIndex + 1 < packages.size()) {
                     recordDependencyEdge(item.consumerDepIndex,
                                          it->second.depIndex + 1,
-                                         spec, item.buildOnly);
+                                         spec, item.buildOnly, name);
                 }
                 continue;
             }
@@ -6806,7 +7014,7 @@ prepare_build(bool print_fingerprint,
                     const auto depPackageIndex = packages.size();
                     packages.push_back(makePackageRoot(secStage, *dep_manifests.back()));
                     recordDependencyEdge(item.consumerDepIndex, depPackageIndex,
-                                         spec, item.buildOnly);
+                                         spec, item.buildOnly, name);
                     auto linkFlagsAdded = propagateLinkFlags(secStage, *dep_manifests.back());
 
                     ResolvedKey mangledKey{key.ns, mangledPackage};
@@ -6849,7 +7057,7 @@ prepare_build(bool print_fingerprint,
                     // no re-fetch needed; just record this consumer edge.
                     recordDependencyEdge(item.consumerDepIndex,
                                          it->second.depIndex + 1,
-                                         spec, item.buildOnly);
+                                         spec, item.buildOnly, name);
                     continue;
                 }
 
@@ -6907,7 +7115,7 @@ prepare_build(bool print_fingerprint,
                     makePackageRoot(newRoot, *dep_manifests[it->second.depIndex]);
                 recordDependencyEdge(item.consumerDepIndex,
                                      it->second.depIndex + 1,
-                                     spec, item.buildOnly);
+                                     spec, item.buildOnly, name);
 
                 it->second.version            = *merged;
                 it->second.linkFlagsAdded     = std::move(linkFlagsAdded);
@@ -6986,7 +7194,7 @@ prepare_build(bool print_fingerprint,
             if (it->second.depIndex + 1 < packages.size()) {
                 recordDependencyEdge(item.consumerDepIndex,
                                      it->second.depIndex + 1,
-                                     spec, item.buildOnly);
+                                     spec, item.buildOnly, name);
             }
             continue;
         }
@@ -7259,6 +7467,44 @@ prepare_build(bool print_fingerprint,
             }
         }
 
+        // The identity a `path` or `git` manifest declares is the package's,
+        // whatever key reached it (#634, A2). Before this, only the short name
+        // was compared, so `fw` reaching a manifest that declares `huxdemo.fw`
+        // resolved as `mcpplibs.fw` while every reader that builds a name from
+        // the manifest saw `huxdemo.fw`, and a second edge written
+        // `huxdemo.fw` put the same sources into the build twice.
+        const bool namespaceDeclared = !dep_manifest->package.namespace_.empty();
+        const std::string manifestPath = sourceKind == "version"
+            ? std::string{}
+            : (dep_root / "mcpp.toml").lexically_normal().generic_string();
+        if (sourceKind != "version" && namespaceDeclared) {
+            auto declaredName = mcpp::pm::compat::resolve_package_name(
+                dep_manifest->package.name, dep_manifest->package.namespace_);
+            ResolvedKey declared{ dep_manifest->package.namespace_,
+                                  declaredName.shortName };
+            if (!(declared == key)) {
+                reportAdoption(item.requestedBy, name, key, declared, manifestPath);
+                stateAdoptedIdentity(item, declared);
+                if (resolved.contains(declared)) {
+                    // Another source already resolved the declared identity,
+                    // and the rules for two declarations of one identity
+                    // decide (the #630 decision table, at the resolved-record
+                    // hit above). The edge is queued again stating that
+                    // identity, which sends it there.
+                    item.spec.namespace_ = declared.ns;
+                    item.spec.shortName = declared.shortName;
+                    item.spec.candidates = {{ .namespace_ = declared.ns,
+                                              .shortName = declared.shortName }};
+                    item.spec.namespaceOmitted = false;
+                    item.spec.legacyCandidateSearch = false;
+                    item.spec.legacyDottedKey = false;
+                    worklist.push_front(std::move(item));
+                    continue;
+                }
+                key = declared;
+            }
+        }
+
         // Stamp the identity with the resolver's exact coordinate and source.
         // A descriptor that omitted namespace inherits the coordinate that
         // answered it; otherwise two indices containing the same short name
@@ -7305,10 +7551,16 @@ prepare_build(bool print_fingerprint,
         const auto depPackageIndex = packages.size();
         packages.push_back(makePackageRoot(dep_root, *dep_manifests.back()));
         recordDependencyEdge(item.consumerDepIndex, depPackageIndex, spec,
-                             item.buildOnly);
+                             item.buildOnly, name);
 
         // Record this dep as resolved so future encounters of the same
         // (ns, name) hit the fast path (skip / merge / conflict).
+        if (sourceKind != "version") {
+            identityBySource.emplace(
+                sourceRefOf(sourceKind, spec, item.resolveRoot, item.originalConstraint),
+                key);
+            declaringManifest[key] = DeclaringManifest{ manifestPath, namespaceDeclared };
+        }
         resolved[key] = ResolvedRecord{
             .version           = sourceKind == "version" ? spec.version : "",
             .constraint        = sourceKind == "version" ? item.originalConstraint : "",
@@ -7803,6 +8055,48 @@ prepare_build(bool print_fingerprint,
     std::map<std::string, std::vector<std::string>> deviceSourcesByPackage;
     auto checkVersionFloors = [&]() -> std::optional<std::string> {
         std::map<std::string, std::pair<std::string, std::string>> facts;  // name -> (version, who)
+        // #634, A9: THE TARGET'S PLATFORM FLOOR IS A FACT THE ENGINE STATES,
+        // in the platform's own words. A dependency that needs Android API 23
+        // writes `android.api-level >= 23` as an ordinary `version-floor`
+        // requirement and is refused before compiling when the application
+        // targets less. The floor is not raised for it: the value is already
+        // inside the compiler's `--target` by now, and which devices an
+        // application installs on is the application's decision. A row that
+        // states no such fact (a desktop Linux build) leaves the requirement
+        // silent, so a requirement needs no selector. The engine's value is
+        // entered first, so a package stating the same name cannot replace it.
+        std::map<std::string, std::string> platformFactOrigin;   // name -> the key that sets it
+        if (tc) {
+            if (auto t = mcpp::toolchain::triple::parse(tc->targetTriple);
+                t && (t->is_android() || t->is_apple())) {
+                const auto value = min_platform_version(*m, *t, tc->binaryPath);
+                std::string name, origin;
+                if (t->is_android()) {
+                    auto row = m->targetOverrides.find(t->str());
+                    name = "android.api-level";
+                    origin = row != m->targetOverrides.end() && row->second.minApiLevel > 0
+                        ? std::format("[target.{}] min_api_level", t->str())
+                        : std::format("the toolchain's lowest supported level, because "
+                                      "[target.{}] min_api_level is not set", t->str());
+                } else if (t->is_ios()) {
+                    name = "ios.deployment-target";
+                    origin = iosFloorFromSdk
+                        ? std::string("the located SDK's version, because [build] "
+                                      "ios_deployment_target is not set")
+                        : std::string("[build] ios_deployment_target");
+                } else {
+                    name = "macos.deployment-target";
+                    origin = m->buildConfig.macosDeploymentTarget.empty()
+                        ? std::string("mcpp's default for macOS, because [build] "
+                                      "macos_deployment_target is not set")
+                        : std::string("[build] macos_deployment_target");
+                }
+                if (!value.empty()) {
+                    facts.emplace(name, std::pair{value, std::string{}});
+                    platformFactOrigin.emplace(name, std::move(origin));
+                }
+            }
+        }
         for (std::size_t pi = 0; pi < packages.size(); ++pi) {
             // The root's claims live in *m: its build program mutates
             // *m, and packages[0] is a snapshot taken before it ran.
@@ -7834,15 +8128,26 @@ prepare_build(bool print_fingerprint,
                                                         floor.version);
                 if (!met || *met) continue;
                 refusal::record(refusal::Code::VersionFloorUnmet);
+                if (auto origin = platformFactOrigin.find(floor.name);
+                    origin != platformFactOrigin.end())
+                    return std::format(
+                        "`{}` requires {} >= {}, and this build targets {}.\n"
+                        "         set by: {}\n"
+                        "       This is checked before anything is compiled "
+                        "because the failure it prevents is not:\n"
+                        "       a library that needs a newer platform links "
+                        "cleanly and fails on the device that lacks it.",
+                        who, floor.name, floor.version, it->second.first,
+                        origin->second);
                 return std::format(
-                    "`{}` requires {} >= {}, and this machine has {}.\n"
+                    "`{}` requires {} >= {}, and {} is stated as {}.\n"
                     "         stated by: {}\n"
                     "       This is checked before anything is compiled "
                     "because the failure it prevents is not:\n"
                     "       a build against too-new a runtime links "
                     "cleanly and fails at first use.",
-                    who, floor.name, floor.version, it->second.first,
-                    it->second.second);
+                    who, floor.name, floor.version, floor.name,
+                    it->second.first, it->second.second);
             }
         }
         return std::nullopt;
@@ -9196,7 +9501,7 @@ prepare_build(bool print_fingerprint,
             // library resolved, and the three answers that keep a board
             // package from naming a toolchain. One call, so a new answer
             // reaches every build program at once — see fill_target_build_env.
-            fill_target_build_env(bpEnv, *m, tc ? &*tc : nullptr);
+            fill_target_build_env(bpEnv, *m, tc ? &*tc : nullptr, cfg_opt ? &*cfg_opt : nullptr);
             bpEnv.toolsBin = projectSubosBin;
             bpEnv.profile      = effectiveProfile;
             bpEnv.accel        = resolvedAccel();
@@ -10238,7 +10543,7 @@ prepare_build(bool print_fingerprint,
         // C library, which compiler and which C++ standard library resolved,
         // and the three answers that keep a board package from naming a
         // toolchain. One call — see fill_target_build_env.
-        fill_target_build_env(bpEnv, *m, tc ? &*tc : nullptr);
+        fill_target_build_env(bpEnv, *m, tc ? &*tc : nullptr, cfg_opt ? &*cfg_opt : nullptr);
         bpEnv.toolsBin = projectSubosBin;
         bpEnv.profile      = effectiveProfile;
         bpEnv.accel        = resolvedAccel();
@@ -10281,11 +10586,62 @@ prepare_build(bool print_fingerprint,
         // snapshot. Anything past this index is a `mcpp::deploy()` residue
         // that needs the same mirror the flag/source tails get below.
         const auto rdeployN = m->runtimeConfig.linkIntent.deploy.size();
+        // What the dependencies supplied as runners, before the root's program
+        // speaks. The root's emissions are appended to the same slots, so a
+        // name both supply becomes one argv joining the two (#634, §9 item 8,
+        // measured: `run-A.sh run-B.sh <artifact>`).
+        const auto runnerBeforeRoot = bcRoot.runner;
+        const auto namedBeforeRoot  = bcRoot.namedRunners;
         if (auto bp = mcpp::build::run_build_program(
                 *m, *root, host->first, host->second,
                 m->cppStandard, bpEnv);
             !bp) {
             return std::unexpected(bp.error());
+        }
+        // THE SAME RULE THE DEPENDENCIES ARE HELD TO, WITH THE ROOT AS A PARTY.
+        // Two suppliers of one runner are refused naming both, and the
+        // manifest is the way to choose: a `[target.<triple>]` runner the
+        // project writes outranks every supplied one where the runner is
+        // looked up, so a name the manifest declares is not refused here.
+        {
+            const auto rowKey = [&]() -> std::string {
+                if (!tc) return {};
+                auto t = mcpp::toolchain::triple::parse(tc->targetTriple);
+                return t ? t->str() : tc->targetTriple;
+            }();
+            const auto row = m->targetOverrides.find(rowKey);
+            const auto manifestNames = [&](std::string_view name) {
+                if (row == m->targetOverrides.end()) return false;
+                if (name.empty()) return !row->second.runner.empty();
+                return row->second.namedRunners.contains(std::string(name));
+            };
+            if (!runnerProvider.empty() && !runnerBeforeRoot.empty()
+                && bcRoot.runner.size() > runnerBeforeRoot.size()
+                && !manifestNames({})) {
+                return std::unexpected(std::format(
+                    "the dependency '{}' and this project's build program both "
+                    "supply the runner for this target, and the two would be "
+                    "joined into one argv.\n"
+                    "       Drop one of them, or state the runner in "
+                    "[target.{}].runner.",
+                    runnerProvider, rowKey));
+            }
+            for (auto const& [name, nr] : bcRoot.namedRunners) {
+                auto before = namedBeforeRoot.find(name);
+                auto who = namedRunnerProvider.find(name);
+                if (before == namedBeforeRoot.end() || before->second.argv.empty()
+                    || who == namedRunnerProvider.end() || who->second.empty())
+                    continue;
+                if (nr.argv.size() <= before->second.argv.size()) continue;
+                if (manifestNames(name)) continue;
+                return std::unexpected(std::format(
+                    "the dependency '{}' and this project's build program both "
+                    "supply a runner named '{}' for this target, and the two "
+                    "would be joined into one argv.\n"
+                    "       Drop one of them, or state it in "
+                    "[target.{}.runners].{}.",
+                    who->second, name, rowKey, name));
+            }
         }
         auto& pkg0 = packages[0];
         // Compile-visible tail → privateBuild: the shared fold (same owner
@@ -11329,8 +11685,12 @@ prepare_build(bool print_fingerprint,
             }
             std::vector<mcpp::manifest::Target*> libraryTargets;
             for (auto& t : pkg.targets) {
-                if (t.kind == mcpp::manifest::Target::SharedLibrary)
+                if (t.kind == mcpp::manifest::Target::SharedLibrary
+                    && !facts.declaredShared) {
                     facts.declaredShared = true;
+                    facts.declaredSharedBy = t.kindDeclaredBy;
+                    facts.declaredSharedByRow = t.kindFromRow;
+                }
                 if (t.kind == mcpp::manifest::Target::Library)
                     libraryTargets.push_back(&t);
             }
@@ -11350,6 +11710,11 @@ prepare_build(bool print_fingerprint,
             }
             auto allowed = lf::admissible(facts, targetFacts);
             auto answer  = lf::resolve(facts, allowed, request);
+            // Recorded for a package that has a library to link; a package of
+            // programs or rules has no form to report.
+            if (facts.isDistribution || facts.declaredShared || !libraryTargets.empty())
+                graphLinkForms[i] = { std::string(lf::to_string(answer.linkage)),
+                                      answer.reason };
 
             if (!answer.diagnostic.empty())
                 mcpp::diag::degraded("build/dependency-linkage", answer.diagnostic,
@@ -12819,6 +13184,39 @@ prepare_build(bool print_fingerprint,
             contracts[std::string(mcpp::build::dist::to_string(
                           static_cast<mcpp::build::dist::Role>(i)))] =
                 std::string(mcpp::build::dist::to_string(roleFlags.contractByRole[i]));
+        }
+
+        // #634, X: the resolved dependency graph. One entry per package, the
+        // root first: its identity as `runtime` records identities, every
+        // request that reached it with the key as written and the table that
+        // declared it, and for a library the link form with its reason. It is
+        // what `mcpp why deps` prints, and what a test of a resolution rule
+        // reads instead of a warning's wording.
+        {
+            nlohmann::json graphPackages = nlohmann::json::array();
+            for (std::size_t i = 0; i < packages.size(); ++i) {
+                nlohmann::json entry = {
+                    {"package", package_json(
+                        mcpp::manifest::package_id(packages[i].manifest.package))},
+                    {"root", i == 0},
+                };
+                nlohmann::json requests = nlohmann::json::array();
+                for (auto const& r : graphRequests) {
+                    if (r.dependencyPackageIndex != i) continue;
+                    requests.push_back({
+                        {"requester", mcpp::manifest::package_id(
+                            packages[r.consumerPackageIndex].manifest.package).canonical()},
+                        {"key", r.key},
+                        {"table", r.table},
+                    });
+                }
+                entry["requested_by"] = std::move(requests);
+                if (auto form = graphLinkForms.find(i); form != graphLinkForms.end())
+                    entry["link"] = { {"form", form->second.first},
+                                      {"reason", form->second.second} };
+                graphPackages.push_back(std::move(entry));
+            }
+            j["graph"] = { {"packages", std::move(graphPackages)} };
         }
 
         j["runtime"] = {

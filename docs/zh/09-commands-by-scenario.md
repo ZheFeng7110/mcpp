@@ -90,6 +90,21 @@ $ mcpp search imgui
 这次扫描只在查找已经失败之后进行,结果只进入错误文本与 search 输出。裸名不会因此跨
 命名空间解析。
 
+## 为一次调用换一个工具链
+
+`mcpp build`、`mcpp run`、`mcpp test` 与 `mcpp pack` 接受 `--toolchain <spec>`,
+它为这一次调用选择编译器,不写入任何东西:
+
+```bash
+mcpp test --toolchain llvm@22.1.8
+mcpp run --toolchain gcc@16.1.0
+mcpp pack --toolchain llvm@22.1.8 --format dir
+```
+
+对这一次调用,这个选项取代 `mcpp.toml` 中的 `[toolchain] default`,其优先级即
+[20 —— 工具链管理](20-toolchains.md) 给 `MCPP_TOOLCHAIN` 的那一级。每个工具链构建到
+它自己的输出目录,一次记录下来的构建只为记录它的那个工具链请求重放。
+
 ## 解释一次解析
 
 `mcpp why` 报告一次构建会解析出什么,并且不构建任何东西:
@@ -100,6 +115,24 @@ toolchain: gcc 16.1.0 (x86_64-linux-gnu)
   abi(libc)=glibc  cxxstdlib=libstdc++  arch=x86_64  os=linux  triple=x86_64-linux-gnu
   reason: [toolchain] in mcpp.toml if set, else platform-native default
 ```
+
+`mcpp why deps` 在 `mcpp.lock` 的各行之前列出解析出的依赖图(2026.9.14.2+):每个包、
+每条请求书写时用的键与所在的表,以及库的链接形态与其原因。锁文件不记录的 `path`
+依赖同样列出:
+
+```
+$ mcpp why deps
+dependency graph:
+  mcpplibs.app@0.1.0  (root)  path+/work/app
+  huxdemo.fw@0.1.0  path+/work/fw
+      requested by mcpplibs.app@0.1.0 as 'huxdemo.fw' in [dependencies]
+      requested by huxdemo.comp@0.1.0 as 'fw' in [dependencies]
+      linked static (default)
+```
+
+同一张图记录在 `target/<triple>/<fp>/resolution.json` 的 `graph` 下,每个包一条,
+根在最前:`package`(规范身份、命名空间、名字、版本、来源)、`root`、
+`requested_by`(`requester`、`key`、`table`),库还有 `link`(`form`、`reason`)。
 
 话题是 `toolchain`、`runtime`、`deps` 或 `runners`,不给话题时四者全报。`--target` 与
 `--toolchain` 把报告变成对当前目录并不使用的那一对的查询,目标矩阵正是这样逐格提问的。
