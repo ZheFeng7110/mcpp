@@ -199,15 +199,52 @@ struct Target {
     // constrains a package instead of saying that a form "is not available".
     std::string                 kindDeclaredBy;
     bool                        kindFromRow = false;
+    // `linkage = "static" | "shared"` (#642 E1): the form a library target
+    // takes when the consumer says nothing, stated by `[targets.<n>]` or by a
+    // row. A DEFAULT, not a constraint: `kind = "shared"` removes the static
+    // form from what a consumer may choose, while this only answers the
+    // question the consumer's own `linkage` answers when the consumer does
+    // not. Empty when not stated. The statement is kept for the information
+    // line that names it when a consumer overrides the default.
+    std::string                 linkageDefault;
+    std::string                 linkageDeclaredBy;
 };
 
-// One `[target.<sel>.targets.<name>] kind` statement: the form a row gives a
+// One `[target.<sel>.targets.<name>]` statement: the form a row gives a
 // library target, and the manifest line that gives it, which the link-form
-// resolution names when it has to refuse a request against it.
+// resolution names when it has to refuse a request against it. A row states
+// either `kind` (a constraint) or `linkage` (a default); `linkage` is empty
+// when the row states `kind`.
 struct RowTargetKind {
     Target::Kind kind = Target::Library;
+    std::string  linkage;
     std::string  statement;
 };
+
+// Why a `linkage` statement cannot stand, or an empty string when it can.
+// `statementHead` is the table that states it (`[targets.fw]`). One wording for
+// `[targets.<n>]` and its row form, which both parse the key.
+inline std::string library_linkage_problem(std::string_view statementHead,
+                                           std::string_view value,
+                                           Target::Kind kind) {
+    if (value != "static" && value != "shared")
+        return std::format(
+            "{} linkage = \"{}\": the default form of a library is `static` or "
+            "`shared`", statementHead, value);
+    if (kind == Target::SharedLibrary)
+        return std::format(
+            "{} states both `kind = \"shared\"` and `linkage = \"{}\"`. "
+            "`kind = \"shared\"` constrains the package to the shared form and "
+            "leaves no default to state; write `kind = \"lib\"` with "
+            "`linkage = \"shared\"` to make the shared form a default that a "
+            "consumer's `linkage` may override", statementHead, value);
+    if (kind != Target::Library)
+        return std::format(
+            "{} linkage = \"{}\": a program target has no link form for a "
+            "consumer to choose, and `linkage` applies to a library target",
+            statementHead, value);
+    return {};
+}
 
 // `DependencySpec` and `kDefaultNamespace` have moved to mcpp.pm.dep_spec.
 // Aliases at the top of this file keep `mcpp::manifest::DependencySpec`
@@ -2011,6 +2048,33 @@ std::filesystem::path resolve_lib_root_path(const Manifest& manifest);
 // Lib-root convention only applies when this returns true.
 bool has_lib_target(const Manifest& manifest);
 
+// Does this package supply the C++ layer, the standard library itself?
+//
+// Either spelling of the layer: `hosted-standard-library` predates the layer
+// vocabulary, `mcpp:c++-abi=<impl>` is the current one, and a package written
+// against a newer engine may carry only the second. One predicate, because the
+// std module adoption and the per-unit standard below must agree about which
+// package is the standard library.
+bool provides_cxx_layer(const Manifest& manifest);
+
+// The level a C++-layer provider compiles its own implementation units at.
+//
+// A MODULE GRAPH HAS ONE STANDARD, AND A STANDARD LIBRARY'S SOURCES ARE THE ONE
+// EXCEPTION THAT IS SAFE. The one-standard rule protects BMIs; a translation
+// unit that neither provides nor imports a module reads and writes none, so
+// compiling it at another level cannot split one. A standard library is, in
+// addition, built at its own level and consumed at every other: upstream
+// compiles libc++ at C++23 and supports consumers from C++03 on, and libc++
+// 22's sources do not compile at C++20 (`std::string::resize_and_overwrite`).
+// An ordinary library has no such contract, since a header whose declarations
+// depend on `__cplusplus` would make its objects and its consumers' disagree,
+// so the exception is scoped to the packages this predicate names.
+//
+// A value only when the package provides the C++ layer AND wrote `standard`;
+// a provider that states nothing is compiled at the graph's level, as before.
+std::optional<CppStandardConfig> cxx_layer_implementation_standard(
+    const Manifest& manifest);
+
 
 
 } // namespace mcpp::manifest
@@ -2262,6 +2326,21 @@ std::filesystem::path resolve_lib_root_path(const Manifest& manifest) {
     std::string tail = manifest.package.name;
     if (auto p = tail.rfind('.'); p != std::string::npos) tail = tail.substr(p + 1);
     return std::filesystem::path("src") / (tail + ".cppm");
+}
+
+bool provides_cxx_layer(const Manifest& manifest) {
+    return std::ranges::any_of(manifest.provides, [](const std::string& p) {
+        return p == "hosted-standard-library" || p.starts_with("mcpp:c++-abi=");
+    });
+}
+
+std::optional<CppStandardConfig> cxx_layer_implementation_standard(
+    const Manifest& manifest) {
+    if (!manifest.package.standardDeclared) return std::nullopt;
+    if (!provides_cxx_layer(manifest)) return std::nullopt;
+    auto level = normalize_cpp_standard(manifest.package.standard);
+    if (!level) return std::nullopt;
+    return *level;
 }
 
 

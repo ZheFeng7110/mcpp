@@ -508,12 +508,27 @@ export void merge_conditional_config(mcpp::manifest::Manifest& m,
         // target, applied before resolution, so the link-form resolution
         // reads it exactly as it reads `[targets.<name>] kind`. `load` has
         // already refused a name that is not a library target.
+        //
+        // `linkage` (#642 E1) is the row's default form, and a row's statement
+        // REPLACES the statement it follows, whichever of the two each one is:
+        // a default after `kind = "shared"` returns the target to the library
+        // form a consumer may choose from, and a `kind` after a default clears
+        // the default. Last matching section wins, as for every conditional
+        // scalar.
         for (auto const& [name, row] : cc.targetKinds) {
             for (auto& t : m.targets) {
                 if (t.name != name) continue;
-                t.kind = row.kind;
                 t.kindDeclaredBy = row.statement;
                 t.kindFromRow = true;
+                if (!row.linkage.empty()) {
+                    t.kind = mcpp::manifest::Target::Library;
+                    t.linkageDefault = row.linkage;
+                    t.linkageDeclaredBy = row.statement;
+                } else {
+                    t.kind = row.kind;
+                    t.linkageDefault.clear();
+                    t.linkageDeclaredBy.clear();
+                }
             }
         }
     }
@@ -2144,10 +2159,11 @@ prepare_build(bool print_fingerprint,
         // layer has an answer.
         if (cfgpred::uses_layer(cc.predicate) && !cc.targetKinds.empty()) {
             m->schemaWarnings.push_back(std::format(
-                "[target.'{}'] conditions a target's kind on a target-side "
-                "layer (ignored). A layer is resolved from the dependency "
-                "graph, and a library's form is decided while that graph is "
-                "resolved; condition the kind on the triple instead.",
+                "[target.'{}'] conditions a target's kind or linkage on a "
+                "target-side layer (ignored). A layer is resolved from the "
+                "dependency graph, and a library's form is decided while that "
+                "graph is resolved; condition the statement on the triple "
+                "instead.",
                 cc.predicate));
         }
     }
@@ -5764,6 +5780,18 @@ prepare_build(bool print_fingerprint,
     // The link form each dependency took, and why (`linkage_form::Resolution`),
     // by package index.
     std::map<std::size_t, std::pair<std::string, std::string>> graphLinkForms;
+    // The link form each dependency takes and the facts it was decided from,
+    // by package index. COMPUTED ONCE, before the root build program runs, so
+    // that program can read the answer (#642 E2); APPLIED after the scan, where
+    // it always was. Every reader below reads this, never a second resolution.
+    struct DependencyLinkForm {
+        mcpp::build::linkage_form::PackageFacts facts;
+        mcpp::build::linkage_form::Resolution   answer;
+        // The package has a library form to report: a package of programs or
+        // rules has none, and is neither recorded nor offered to a program.
+        bool recorded = false;
+    };
+    std::map<std::size_t, DependencyLinkForm> dependencyLinkForms;
     namespace dg = mcpp::build::dep_graph;
     // #355: consumer package index → (env var, absolute path) for each host
     // tool that consumer requested. Filled by the provisioning pass below;
@@ -5981,7 +6009,12 @@ prepare_build(bool print_fingerprint,
         }
     };
 
-    auto fillDepDirs = [&](mcpp::build::BuildProgramEnv& e, std::size_t consumer) {
+    // `linkForms` (#642 E2): when given, each dependency that has a resolved
+    // library form is also offered under exactly the names its directory is,
+    // so `dep_linkage(n)` answers for every `n` that `dep_dir(n)` answers for.
+    // Only the root's program passes it; see the root call site for why.
+    auto fillDepDirs = [&](mcpp::build::BuildProgramEnv& e, std::size_t consumer,
+                           const std::map<std::size_t, std::string>* linkForms = nullptr) {
         if (consumer >= provisionGraph.visible.size()) return;
         auto bind = bareBindingsFor(consumer);
         for (auto const& [tail, b] : bind) {
@@ -5993,12 +6026,30 @@ prepare_build(bool print_fingerprint,
             if (pr.provider >= packages.size()) continue;
             auto const& depPkg = packages[pr.provider];
             auto const& canon  = depPkg.manifest.package.name;
+            const std::string* form = nullptr;
+            if (linkForms)
+                if (auto f = linkForms->find(pr.provider); f != linkForms->end())
+                    form = &f->second;
             e.depDirs.emplace_back(canon, depPkg.root);
+            if (form) e.depLinkages.emplace_back(canon, *form);
+            // AND THE SPELLING THE CONSUMER'S MANIFEST USES. A package that
+            // writes `namespace = "ns"` and `name = "fw"` is a dependency named
+            // `ns.fw`, and `dep_dir("ns.fw")` read nothing while the reference
+            // above promised the canonical spelling (#642: the framework's rule
+            // asks `dep_linkage("huxerui.huxerui")`). The qualified name is
+            // unique in the graph, so it needs no binding check.
+            if (auto qualified = mcpp::build::qualified_package_name(depPkg.manifest);
+                qualified != canon) {
+                e.depDirs.emplace_back(qualified, depPkg.root);
+                if (form) e.depLinkages.emplace_back(qualified, *form);
+            }
             auto tail = prov::tail_of(canon);
             if (tail == canon) continue;
             auto it = bind.find(tail);
-            if (it != bind.end() && it->second.owner == canon)
+            if (it != bind.end() && it->second.owner == canon) {
                 e.depDirs.emplace_back(tail, depPkg.root);
+                if (form) e.depLinkages.emplace_back(tail, *form);
+            }
         }
     };
 
@@ -7721,7 +7772,8 @@ prepare_build(bool print_fingerprint,
         //      downloaded, and it is literally the same two functions
         //      `toolchain_set_default` calls;
         //   2. the vocabulary's own pins — the version this ecosystem ships for
-        //      that family, already written down once per row. Deriving it from
+        //      that family's payload, already written down once per row
+        //      (`pinned_versions_for`). Deriving it from
         //      there rather than from a fresh constant means the answer moves
         //      when the ecosystem moves, with nobody having to remember a
         //      second place.
@@ -7752,17 +7804,10 @@ prepare_build(bool print_fingerprint,
                     return std::format("{}@{}", family, *picked);
             }
 
-            std::vector<std::string> fromVocabulary;
-            for (auto const& row : mcpp::toolchain::triple::known_targets()) {
-                if (row.pin.empty()) continue;
-                auto p = mcpp::toolchain::parse_toolchain_spec(
-                    std::string(row.pin));
-                if (!p || p->version.empty()) continue;
-                if (mcpp::toolchain::family_name(p->family) != family) continue;
-                fromVocabulary.push_back(p->version);
-            }
+            // Matched by the payload a pin names, not by its family: the NDK
+            // and emsdk pins are llvm-family pins of other payloads (#641).
             if (auto picked = mcpp::toolchain::resolve_version_match(
-                    "", std::move(fromVocabulary)))
+                    "", mcpp::toolchain::pinned_versions_for(*spec)))
                 return std::format("{}@{}", family, *picked);
 
             // Neither source has one. Saying which family and which two places
@@ -9355,8 +9400,13 @@ prepare_build(bool print_fingerprint,
                     // Hashed rather than random so a re-run reuses its own
                     // scratch (ninja stays incremental if the publish step
                     // never got to delete it).
-                    sub.work_dir     = entry / std::format("build-{}",
-                        mcpp::toolchain::hash_string(workRoot.string()));
+                    //
+                    // Beside the entries rather than inside one: every
+                    // directory name of the entry is repeated in each object
+                    // path the sub-build writes, and on Windows those paths
+                    // crossed the 260-character limit (mcpp#641, item 3).
+                    sub.work_dir     = mcpp::build::tool_store::scratch_dir(
+                        cacheRoot, entry, workRoot);
                     sub.target_triple = "";            // HOST — the whole point
                     sub.profile       = "release";
                     sub.cache_mode    = overrides.cache_mode;
@@ -9797,6 +9847,10 @@ prepare_build(bool print_fingerprint,
     }
 
     mcpp::targetside::TargetSide resolvedTargetSide;
+    // The package that supplies the C++ layer when the graph does, as an index
+    // into `packages`. Recorded where the provider is found so that the check
+    // after planning (#641) reads the same package the resolution chose.
+    std::optional<std::size_t> cxxLayerProviderIndex;
     // Whether the block below ran at all. `resolvedTargetSide` is default
     // constructed, so "no layer resolved" and "resolution has not happened"
     // read identically off its members — and the layer-conditional pass must
@@ -10197,8 +10251,11 @@ prepare_build(bool print_fingerprint,
             auto note_layer = [&](tsd::CapLayer which, const tsd::Layer& resolved) {
                 if (!resolved.fromGraph()) return;
                 auto it = byLayer.find(static_cast<int>(which));
-                if (it != byLayer.end() && !it->second.empty())
+                if (it != byLayer.end() && !it->second.empty()) {
                     layerProviderIndices.insert(it->second.front().index);
+                    if (which == tsd::CapLayer::CxxAbi)
+                        cxxLayerProviderIndex = it->second.front().index;
+                }
             };
             note_layer(tsd::CapLayer::CompilerRuntime, resolvedTargetSide.compilerRuntime);
             note_layer(tsd::CapLayer::KernelAbi,       resolvedTargetSide.kernelAbi);
@@ -10538,6 +10595,118 @@ prepare_build(bool print_fingerprint,
         }
     }
 
+    // ── #519: which FORM does each dependency take in this build ────────────
+    //
+    // The decision itself lives in `mcpp.build.linkage_form`, which is a pure,
+    // table-driven function with no filesystem and no manifest knowledge. What
+    // happens here is only the two halves that need this scope: collecting the
+    // facts, and MATERIALISING the answer.
+    //
+    // COMPUTED HERE, APPLIED AFTER THE SCAN (#642 E2). A build program that
+    // generates a loader entry, or `dllimport` definitions, needs the form a
+    // dependency takes, and the root's program runs next, before the scan.
+    // Every input is final at this point: the requests are the root manifest's,
+    // which no directive changes; the target facts are resolved; each
+    // dependency's own build program has run, so its `ldflags` are complete;
+    // and the layer-conditional sections above have been folded. What the scan
+    // used to contribute, whether a package has sources of its own, is read
+    // from the scanner's own selection (`package_source_files`), so the two
+    // cannot disagree. The answers are stored in `dependencyLinkForms`; the
+    // application after the scan and the root program's environment both read
+    // them, and nothing resolves a second time.
+    {
+        namespace lf = mcpp::build::linkage_form;
+
+        lf::Request request;
+        if (auto parsed = lf::parse(m->buildConfig.dependencyLinkage))
+            request.whole = *parsed;
+        request.wholeIsExplicit = !m->buildConfig.dependencyLinkage.empty();
+        // ONLY THE ROOT MANIFEST'S EDGES. See DependencySpec::linkage — a
+        // package deep in the graph imposing a whole-image layout on its
+        // consumer is a supply-chain property, not a convenience.
+        for (auto const& [depName, spec] : m->dependencies) {
+            if (spec.linkage.empty()) continue;
+            if (auto parsed = lf::parse(spec.linkage)) {
+                request.perPackage[depName] = *parsed;
+                auto shortKey = spec.shortName.empty() ? depName : spec.shortName;
+                request.perPackage.emplace(shortKey, *parsed);
+            }
+        }
+
+        lf::TargetFacts targetFacts;
+        if (auto t = mcpp::toolchain::triple::parse(tc->targetTriple))
+            targetFacts.hasLoader = !t->is_freestanding();
+        // The libc axis. Spelled exactly as `compute_flags` spells it, because
+        // the two must agree about what `-static` means: an image linked that
+        // way has no interpreter, so no shared object can ever be loaded into
+        // it. Two keys with `linkage` in the name, and they are NOT independent.
+        targetFacts.fullStaticLibc =
+            m->buildConfig.linkage == "static"
+            && mcpp::toolchain::target_supports_full_static(
+                   tc->targetTriple, mcpp::platform::supports_full_static);
+
+        for (std::size_t i = 1; i < packages.size(); ++i) {
+            auto const& pkg = packages[i].manifest;
+            const std::string fq = pkg.package.namespace_.empty()
+                ? pkg.package.name
+                : std::format("{}.{}", pkg.package.namespace_, pkg.package.name);
+
+            lf::PackageFacts facts;
+            facts.label = std::format("{}@{}", fq, pkg.package.version);
+            facts.hasSources = !mcpp::modgraph::package_source_files(
+                packages[i].root, pkg).empty();
+            facts.carriesForeignLinkInputs =
+                lf::carries_foreign_link_inputs(pkg.buildConfig.ldflags);
+            facts.isDistribution = mcpp::pack::is_distribution_package(pkg);
+            for (auto const& artifact : pkg.runtimeConfig.artifacts) {
+                if (artifact.role == "static-library") facts.shipsStatic = true;
+                if (artifact.role == "shared-library") facts.shipsShared = true;
+            }
+            bool hasLibraryTarget = false;
+            for (auto const& t : pkg.targets) {
+                if (t.kind == mcpp::manifest::Target::SharedLibrary
+                    && !facts.declaredShared) {
+                    facts.declaredShared = true;
+                    facts.declaredSharedBy = t.kindDeclaredBy;
+                    facts.declaredSharedByRow = t.kindFromRow;
+                }
+                if (t.kind == mcpp::manifest::Target::Library) {
+                    hasLibraryTarget = true;
+                    // One package, one form: the first library target that
+                    // states a default speaks for the package, as the first
+                    // `kind = "shared"` does for the constraint.
+                    if (!facts.defaultLinkage && !t.linkageDefault.empty()) {
+                        facts.defaultLinkage = lf::parse(t.linkageDefault);
+                        facts.defaultDeclaredBy = t.linkageDeclaredBy;
+                    }
+                }
+            }
+
+            // A consumer addresses a dependency by whatever it wrote in
+            // `[dependencies]` — the fully-qualified name or the bare one —
+            // while every message wants the version too. Rather than swapping
+            // the label to whichever spelling matches (which drops the version
+            // from every refusal), make the request answer to the descriptive
+            // label as well.
+            for (auto const& key : { fq, pkg.package.name }) {
+                if (auto it = request.perPackage.find(key);
+                    it != request.perPackage.end()) {
+                    request.perPackage.emplace(facts.label, it->second);
+                    break;
+                }
+            }
+            auto allowed = lf::admissible(facts, targetFacts);
+            DependencyLinkForm form;
+            form.answer   = lf::resolve(facts, allowed, request);
+            // Recorded for a package that has a library to link; a package of
+            // programs or rules has no form to report.
+            form.recorded = facts.isDistribution || facts.declaredShared
+                         || hasLibraryTarget;
+            form.facts    = std::move(facts);
+            dependencyLinkForms.emplace(i, std::move(form));
+        }
+    }
+
     // ── L3: ROOT build.mcpp (moved after dependency resolution, design §3.1
     // item 4) ────────────────────────────────────────────────────────────────
     // Runs HERE — after dep resolution + feature activation (so the contract
@@ -10596,7 +10765,23 @@ prepare_build(bool print_fingerprint,
         // across the move for feature-identical builds.
         bpEnv.features     = feature_closure(*m, parse_feature_request(overrides.features));
         // mcpp#241 (root): consumer index 0, same owner as the dep loop.
-        fillDepDirs(bpEnv, 0);
+        //
+        // AND THE LINK FORM OF EACH DEPENDENCY (#642 E2), to this program only.
+        // The root decides every dependency's form, and when this program runs
+        // every input of that decision is final: the requests are the root
+        // manifest's, and each dependency's own program has already run. A
+        // DEPENDENCY's program is not offered the forms. It runs in discovery
+        // order, before the programs of packages discovered after it, and those
+        // programs supply facts the answer depends on (a `-L` they add makes a
+        // package static-only), so the value it could be given would be a guess.
+        {
+            std::map<std::size_t, std::string> rootLinkForms;
+            for (auto const& [idx, form] : dependencyLinkForms)
+                if (form.recorded)
+                    rootLinkForms.emplace(idx, std::string(
+                        mcpp::build::linkage_form::to_string(form.answer.linkage)));
+            fillDepDirs(bpEnv, 0, &rootLinkForms);
+        }
         fillXpkgDirs(bpEnv, *m, 0);
         // #355: the host tools the ROOT package requested (consumer index 0).
         if (auto tit = toolEnvByConsumer.find(0u); tit != toolEnvByConsumer.end())
@@ -10915,6 +11100,13 @@ prepare_build(bool print_fingerprint,
         for (std::size_t i = 1; i < packages.size(); ++i) {
             auto const& pkg = packages[i];
             if (!pkg.manifest.package.standardDeclared) continue;
+            // A C++-layer provider's declaration IS applied, to every unit of
+            // it that neither provides nor imports a module (`make_plan`), so
+            // "is not applied" would be false for exactly the package whose
+            // sources need the level. Its module units stay at the graph's
+            // level, as every module unit does.
+            if (mcpp::manifest::cxx_layer_implementation_standard(pkg.manifest))
+                continue;
             // The scope gate. A package whose root is under a store directory
             // arrived from an index and its declaration was written by a
             // descriptor generator, not by the person reading this diagnostic.
@@ -11040,17 +11232,11 @@ prepare_build(bool print_fingerprint,
     // library would be describing something it does not have.
     for (auto& pkg : packages) {
         if (pkg.manifest.stdModule.empty()) continue;
-        // Either spelling of the C++ layer: `hosted-standard-library` is the
-        // one that predates the layer vocabulary, `mcpp:c++-abi=<impl>` the
-        // current one. A package written against a newer engine may carry
-        // only the second.
-        const auto& provs = pkg.manifest.provides;
-        const bool declaresCxxLayer = std::any_of(
-            provs.begin(), provs.end(), [](const std::string& p) {
-                return p == "hosted-standard-library"
-                    || p.starts_with("mcpp:c++-abi=");
-            });
-        if (!declaresCxxLayer) continue;
+        // Either spelling of the C++ layer (see `provides_cxx_layer`). The
+        // same predicate decides which package's implementation units keep
+        // their own standard in `make_plan`, so the two cannot name different
+        // packages as the standard library.
+        if (!mcpp::manifest::provides_cxx_layer(pkg.manifest)) continue;
         auto src = pkg.root / pkg.manifest.stdModule;
         if (!std::filesystem::exists(src)) {
             return std::unexpected(std::format(
@@ -11673,12 +11859,9 @@ prepare_build(bool print_fingerprint,
         }
     }
 
-    // ── #519: which FORM does each dependency take in this build ────────────
+    // ── #519: the form each dependency takes, APPLIED ──────────────────────
     //
-    // The decision itself lives in `mcpp.build.linkage_form`, which is a pure,
-    // table-driven function with no filesystem and no manifest knowledge. What
-    // happens here is only the two halves that need this scope: collecting the
-    // facts, and MATERIALISING the answer.
+    // The answers were computed before the root build program (see there).
     //
     // MATERIALISED AS A TARGET KIND, on purpose. A dependency resolved to
     // the shared form becomes an ordinary `SharedLibrary` target, so every
@@ -11690,21 +11873,6 @@ prepare_build(bool print_fingerprint,
     {
         namespace lf = mcpp::build::linkage_form;
 
-        lf::Request request;
-        if (auto parsed = lf::parse(m->buildConfig.dependencyLinkage))
-            request.whole = *parsed;
-        request.wholeIsExplicit = !m->buildConfig.dependencyLinkage.empty();
-        // ONLY THE ROOT MANIFEST'S EDGES. See DependencySpec::linkage — a
-        // package deep in the graph imposing a whole-image layout on its
-        // consumer is a supply-chain property, not a convenience.
-        for (auto const& [depName, spec] : m->dependencies) {
-            if (spec.linkage.empty()) continue;
-            if (auto parsed = lf::parse(spec.linkage)) {
-                request.perPackage[depName] = *parsed;
-                auto shortKey = spec.shortName.empty() ? depName : spec.shortName;
-                request.perPackage.emplace(shortKey, *parsed);
-            }
-        }
         // A non-root edge that writes the key gets its request IGNORED, and
         // says so — a silently dropped knob is how a knob becomes decoration.
         for (std::size_t i = 1; i < packages.size(); ++i)
@@ -11715,69 +11883,10 @@ prepare_build(bool print_fingerprint,
                         "the root project decides link forms, so this is ignored",
                         packages[i].manifest.package.name, depName, spec.linkage));
 
-        lf::TargetFacts targetFacts;
-        if (auto t = mcpp::toolchain::triple::parse(tc->targetTriple))
-            targetFacts.hasLoader = !t->is_freestanding();
-        // The libc axis. Spelled exactly as `compute_flags` spells it, because
-        // the two must agree about what `-static` means: an image linked that
-        // way has no interpreter, so no shared object can ever be loaded into
-        // it. Two keys with `linkage` in the name, and they are NOT independent.
-        targetFacts.fullStaticLibc =
-            m->buildConfig.linkage == "static"
-            && mcpp::toolchain::target_supports_full_static(
-                   tc->targetTriple, mcpp::platform::supports_full_static);
-
-        std::set<std::string> packagesWithSources;
-        for (auto const& unit : scan.graph.units)
-            packagesWithSources.insert(unit.packageName);
-
-        for (std::size_t i = 1; i < packages.size(); ++i) {
-            auto& pkg = packages[i].manifest;
-            const std::string fq = pkg.package.namespace_.empty()
-                ? pkg.package.name
-                : std::format("{}.{}", pkg.package.namespace_, pkg.package.name);
-
-            lf::PackageFacts facts;
-            facts.label = std::format("{}@{}", fq, pkg.package.version);
-            facts.hasSources = packagesWithSources.contains(fq)
-                            || packagesWithSources.contains(pkg.package.name);
-            facts.carriesForeignLinkInputs =
-                lf::carries_foreign_link_inputs(pkg.buildConfig.ldflags);
-            facts.isDistribution = mcpp::pack::is_distribution_package(pkg);
-            for (auto const& artifact : pkg.runtimeConfig.artifacts) {
-                if (artifact.role == "static-library") facts.shipsStatic = true;
-                if (artifact.role == "shared-library") facts.shipsShared = true;
-            }
-            std::vector<mcpp::manifest::Target*> libraryTargets;
-            for (auto& t : pkg.targets) {
-                if (t.kind == mcpp::manifest::Target::SharedLibrary
-                    && !facts.declaredShared) {
-                    facts.declaredShared = true;
-                    facts.declaredSharedBy = t.kindDeclaredBy;
-                    facts.declaredSharedByRow = t.kindFromRow;
-                }
-                if (t.kind == mcpp::manifest::Target::Library)
-                    libraryTargets.push_back(&t);
-            }
-
-            // A consumer addresses a dependency by whatever it wrote in
-            // `[dependencies]` — the fully-qualified name or the bare one —
-            // while every message wants the version too. Rather than swapping
-            // the label to whichever spelling matches (which drops the version
-            // from every refusal), make the request answer to the descriptive
-            // label as well.
-            for (auto const& key : { fq, pkg.package.name }) {
-                if (auto it = request.perPackage.find(key);
-                    it != request.perPackage.end()) {
-                    request.perPackage.emplace(facts.label, it->second);
-                    break;
-                }
-            }
-            auto allowed = lf::admissible(facts, targetFacts);
-            auto answer  = lf::resolve(facts, allowed, request);
-            // Recorded for a package that has a library to link; a package of
-            // programs or rules has no form to report.
-            if (facts.isDistribution || facts.declaredShared || !libraryTargets.empty())
+        for (auto const& [i, form] : dependencyLinkForms) {
+            auto const& answer = form.answer;
+            auto const& facts  = form.facts;
+            if (form.recorded)
                 graphLinkForms[i] = { std::string(lf::to_string(answer.linkage)),
                                       answer.reason };
 
@@ -11785,6 +11894,11 @@ prepare_build(bool print_fingerprint,
                 mcpp::diag::degraded("build/dependency-linkage", answer.diagnostic,
                     "this dependency is linked in the other form, which changes "
                     "whether its code travels inside the images that use it");
+            // An explicit request honoured against the package's own default
+            // (#642 E1): the build did what was asked, so this is information,
+            // and it names both statements.
+            if (!answer.note.empty())
+                mcpp::ui::info("Linkage", answer.note);
 
             if (answer.linkage != lf::DepLinkage::Shared) continue;
             if (facts.isDistribution) continue;   // nothing here to build
@@ -11797,8 +11911,9 @@ prepare_build(bool print_fingerprint,
             // on Linux rather than joined by it — but "unreachable today" is
             // how the last few of these got in.)
             if (facts.declaredShared) continue;
-            for (auto* t : libraryTargets)
-                t->kind = mcpp::manifest::Target::SharedLibrary;
+            for (auto& t : packages[i].manifest.targets)
+                if (t.kind == mcpp::manifest::Target::Library)
+                    t.kind = mcpp::manifest::Target::SharedLibrary;
         }
     }
 
@@ -11812,6 +11927,109 @@ prepare_build(bool print_fingerprint,
     // that function does depends on it: the flag assembly that does reads the
     // plan, and every reader of `compute_flags` runs after this line.
     ctx.plan.targetSide = resolvedTargetSide;
+
+    // A DEPENDENCY'S C++ SHARED LIBRARY OVER A C++ RUNTIME THAT IS A PACKAGE
+    // (#641, item 5).
+    //
+    // The runtime package is linked like every other static package: its
+    // objects go into the program. A dependency's shared library is linked from
+    // its own package's objects, and `-nostdlib++` withholds the driver's
+    // runtime, so the library has no C++ runtime at all. A private copy does
+    // not come for free either: `llvm.libcxx` compiles its classes with hidden
+    // visibility, so no image resolves against another's copy, and each image
+    // then holds its own type information for the library's classes. Measured
+    // on x86_64 Linux, an exception of `std::runtime_error` thrown in such a
+    // library is not caught by that type in the program; libc++ documents the
+    // same identity split for hidden types on arm64 Apple.
+    //
+    // So the private copy is linked only when the manifest states it for
+    // shared libraries (`cxx_runtime = { shared = "self-contained" }`, the key
+    // that already means a private runtime in each shared library for the
+    // payload's runtime), and every other case is refused here, before
+    // anything compiles. Each build this refuses failed at link before.
+    if (resolvedTargetSide.cxx.fromGraph() && cxxLayerProviderIndex
+        && *cxxLayerProviderIndex < packages.size()) {
+        namespace dist = mcpp::build::dist;
+        auto const& provider = packages[*cxxLayerProviderIndex].manifest;
+        const auto providerName = mcpp::build::qualified_package_name(provider);
+        auto const& bc = ctx.plan.manifest.buildConfig;
+        const auto format = dist::format_for(
+            tc->targetTriple,
+            mcpp::platform::is_windows ? dist::Format::Pe
+            : mcpp::platform::is_macos ? dist::Format::MachO
+                                       : dist::Format::Elf);
+        const bool privateCopy =
+            dist::stated_shared_library_contract(bc.cxxRuntime, bc.cxxRuntimeShared,
+                                                 bc.staticStdlib, format)
+            == dist::Contract::SelfContained;
+        // A refused library, and the statement that makes it shared when its
+        // own package makes it so: an edge's `linkage = "static"` cannot change
+        // a form the package constrains (`declaredShared`), so that remedy is
+        // offered only where a request or the package's default decided.
+        struct Refused { std::string name; std::string statedBy; };
+        std::vector<Refused> withoutRuntime;
+        const auto runtimeObjects = mcpp::build::package_link_objects(ctx.plan, providerName);
+        for (auto& lu : ctx.plan.linkUnits) {
+            if (lu.kind != mcpp::build::LinkUnit::SharedLibrary || !lu.dependencyOwned)
+                continue;
+            if (!mcpp::build::link_unit_holds_cxx(ctx.plan, lu)) continue;
+            if (privateCopy) {
+                for (auto const& o : runtimeObjects)
+                    if (std::ranges::find(lu.objects, o) == lu.objects.end())
+                        lu.objects.push_back(o);
+                continue;
+            }
+            Refused r{ lu.targetName, {} };
+            for (auto const& [i, form] : dependencyLinkForms) {
+                if (!form.facts.declaredShared || i >= packages.size()) continue;
+                for (auto const& t : packages[i].manifest.targets)
+                    if (t.name == lu.targetName)
+                        r.statedBy = form.facts.declaredSharedBy.empty()
+                            ? std::string("its manifest declares a shared library target")
+                            : form.facts.declaredSharedBy;
+            }
+            withoutRuntime.push_back(std::move(r));
+        }
+        if (!withoutRuntime.empty()) {
+            std::string names, constrained;
+            bool anyRequested = false;
+            for (auto const& r : withoutRuntime) {
+                names += (names.empty() ? "'" : ", '") + r.name + "'";
+                if (r.statedBy.empty()) anyRequested = true;
+                else constrained += std::format(
+                    "       '{}' states its form itself ({}), so its edge cannot "
+                    "link it static.\n", r.name, r.statedBy);
+            }
+            const std::string staticRemedy = anyRequested
+                ? "       Link the dependency static, on its edge in [dependencies]:\n"
+                  "\n"
+                  "           <name> = { ..., linkage = \"static\" }\n"
+                  "\n"
+                  "       or give each shared library a private copy of the runtime:\n"
+                : "       Give each shared library a private copy of the runtime:\n";
+            refusal::record(refusal::Code::SharedLibraryCxxRuntime);
+            return std::unexpected(std::format(
+                "{} {} linked as a shared library, and this graph's C++ runtime is "
+                "the package '{}@{}', whose objects are linked into the program.\n"
+                "       A shared library built here would have no C++ runtime: the "
+                "package compiles its runtime\n"
+                "       with hidden visibility, so one image cannot use another "
+                "image's copy.\n"
+                "{}{}"
+                "\n"
+                "           [build]\n"
+                "           cxx_runtime = {{ shared = \"self-contained\" }}\n"
+                "\n"
+                "       With a private copy, an exception of a standard library class "
+                "thrown in the shared\n"
+                "       library is not caught by that class in the program, because "
+                "each copy has its own\n"
+                "       type information.",
+                names, withoutRuntime.size() == 1 ? "is" : "are",
+                providerName, provider.package.version, constrained, staticRemedy));
+        }
+    }
+
     // The module graph outlives the plan for one consumer: `mcpp pack`, which
     // has to know which units are INTERFACE (published as source) and which
     // are implementation (published only as an object). The plan flattens that

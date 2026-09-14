@@ -884,7 +884,8 @@ The running program receives the build context as `MCPP_*` variables
 | `MCPP_MANIFEST_DIR` | `mcpp::manifest_dir()` | the package root (= CWD) |
 | `MCPP_FEATURE_<NAME>` | `mcpp::has_feature("name")` | set to `1` per active feature (same `<NAME>` sanitization as the `MCPP_FEATURE_` compile macro) |
 | `MCPP_FEATURES` | — | comma-separated active feature list |
-| `MCPP_DEP_<NAME>_DIR` | `mcpp::dep_dir("name")` | the resolved install dir of each declared dependency (canonical **and** namespace-stripped name spellings; same `<NAME>` sanitization as `MCPP_FEATURE_`). Received by dependencies' build.mcpp **and** the root project's (the root runs after dependency resolution, 0.0.100+) |
+| `MCPP_DEP_<NAME>_DIR` | `mcpp::dep_dir("name")` | the resolved install dir of each declared dependency (the qualified `namespace.name`, the canonical name, **and** the namespace-stripped spelling when it is unambiguous; same `<NAME>` sanitization as `MCPP_FEATURE_`). Received by dependencies' build.mcpp **and** the root project's (the root runs after dependency resolution, 0.0.100+) |
+| `MCPP_DEP_<NAME>_LINKAGE` *(2026.9.15.2+)* | `mcpp::dep_linkage("name")` | the link form each dependency takes in this build, `static` or `shared`, under the names `MCPP_DEP_<NAME>_DIR` uses; empty for a dependency with no library form. The value is the resolution that decides what is linked, so a generated loader entry or `dllimport` declaration follows it. Received by the **root project's** build.mcpp only: the root decides every dependency's form, and a dependency's program runs before packages discovered after it, whose programs supply facts the answer depends on, so `dep_linkage` is always empty there |
 
 These values are folded into the re-run key **unconditionally** — changing the
 target, profile, or feature set re-runs the program without any
@@ -1170,6 +1171,20 @@ before this rule the key held the version alone and a change to the emitter
 left `mcpp run` printing the previous answer until the version was bumped.
 Entries accumulate as a tree is edited; `mcpp cache clean` empties the store,
 which lives at `<mcpp cache dir>/tool/<index>/<name>@<version>[+<source>]/`.
+
+**The paths a tool build writes are bounded (2026.9.15.2+).** The sub-build
+runs in `<mcpp cache dir>/tool/.build/<hash>/`, a directory named by the entry
+and the consuming project rather than nested inside the entry, and it is
+removed once the binary is published. A source that a build program selects
+from outside its own package, such as a file under a dependency's root named
+with `mcpp::source`, is compiled to
+`obj/<package>/__pkg/<owning package>/<path inside that package>`, or to
+`obj/<package>/__ext/<hash of its directory>/` when no package contains it, so
+its address does not grow with the distance between the two packages. On
+Windows, the engine's own build steps (`dyndep`, `stage`, the BMI edges,
+`coff-def` and check stamps) open their files through extended-length paths.
+Before these changes a tool's scan output reached 271 characters on a Windows
+runner and could not be read (#641).
 
 The action's own tracking is separate from the store's key. An action that
 declares the tool among its inputs re-runs when that file's bytes change,

@@ -274,6 +274,35 @@ package describes a library it does not supply.
 The `[package]` spelling of these three keys remains accepted and is not
 conditional.
 
+### The Standard Library's Own Language Level (mcpp 2026.9.15.2+)
+
+A module graph is compiled at one standard, the root package's
+([07 — Workspace](07-workspace.md) §4.2). A package that provides the C++
+layer (`hosted-standard-library` or `mcpp:c++-abi=<impl>`) is the one
+exception: when it states `[package] standard`, each of its C++ translation
+units that neither provides nor imports a module is compiled at exactly that
+level, whatever the graph's level is.
+
+```toml
+[package]
+standard = "c++23"
+provides = ["hosted-standard-library", "mcpp:c++-abi=libc++"]
+```
+
+A standard library is built at its own level and consumed at every other:
+libc++ is compiled at C++23 upstream, and libc++ 22's sources do not compile at
+C++20. The exception is safe because the units it covers read and write no
+BMI; the package's module units, the `std` and `std.compat` modules included,
+stay at the graph's level, so no module is split. The level is appended to
+each covered unit's own flags and therefore reaches the compile command, the
+dependency scan, `compile_commands.json` and `mcpp emit build-database` alike.
+A provider that does not state `standard` is compiled at the graph's level.
+
+The exception is not extended to other packages. A header whose declarations
+depend on `__cplusplus` would make an ordinary library's objects and its
+consumers' disagree without a diagnostic, and a standard library is the kind of
+package whose interface is designed to be consumed at a different level.
+
 ### Adaptation To The Resolved Target Side
 
 A package supplying a layer frequently supports several implementations of the
@@ -691,15 +720,21 @@ application on the desktop rows and must be one shared library on Android
 states it once, in its own manifest; every consumer keeps one unconditional
 dependency line.
 
-- `kind` is the only key, and it chooses between the two library forms, `lib`
-  and `shared`. A name that is not a library target of the package (declared
-  or inferred), a program target, or another kind is refused.
+- A row states `kind`, which chooses between the two library forms, `lib`
+  and `shared`, or *(2026.9.15.2+)* `linkage`, which states the library's
+  default form on those rows without constraining it; the two in one row are
+  refused, and a later matching statement replaces an earlier one, including
+  the unconditional table's. A name that is not a library target of the package
+  (declared or inferred), a program target, or another kind is refused.
 - On a matching row the package is constrained to the shared form exactly as
   `[targets.<name>] kind = "shared"` constrains it (`dependency_linkage` in
   [04 — mcpp.toml](04-mcpp-toml.md)): a consumer that writes no `linkage`
   receives the shared library, and a consumer that writes `linkage =
   "static"` receives a warning naming this line, which `--strict` turns into
-  an error. `mcpp why deps` reports the form with the reason `row-kind`.
+  an error. `mcpp why deps` reports the form with the reason `row-kind`. A
+  row's `linkage = "shared"` gives a silent consumer the shared library with the
+  reason `package-default`, and honours a consumer's `linkage = "static"` with an
+  information line instead of a warning.
 - A selector that names a target-side layer cannot carry it; the table is
   reported and ignored, because a library's form is decided while the graph
   that answers the layer is resolved.

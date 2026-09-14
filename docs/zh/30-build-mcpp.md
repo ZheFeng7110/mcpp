@@ -760,7 +760,8 @@ mcpp 会把它自己构建时用的**同一份** std 模块暂存过来,缓存�
 | `MCPP_MANIFEST_DIR` | `mcpp::manifest_dir()` | 包根(= CWD) |
 | `MCPP_FEATURE_<NAME>` | `mcpp::has_feature("name")` | 每个活跃 feature 置 `1`(`<NAME>` 消毒规则与 `MCPP_FEATURE_` 编译宏一致) |
 | `MCPP_FEATURES` | — | 活跃 feature 逗号列表 |
-| `MCPP_DEP_<NAME>_DIR` | `mcpp::dep_dir("name")` | 每个已声明依赖解析后的安装目录(canonical 名与去命名空间短名两种拼写都可用;`<NAME>` 消毒规则同 `MCPP_FEATURE_`)。依赖包的 build.mcpp **和**根工程的 build.mcpp 都能拿到(根工程的 build.mcpp 在依赖解析之后运行,0.0.100+) |
+| `MCPP_DEP_<NAME>_DIR` | `mcpp::dep_dir("name")` | 每个已声明依赖解析后的安装目录(限定名 `namespace.name`、canonical 名,以及无歧义时的去命名空间短名,都可用;`<NAME>` 消毒规则同 `MCPP_FEATURE_`)。依赖包的 build.mcpp **和**根工程的 build.mcpp 都能拿到(根工程的 build.mcpp 在依赖解析之后运行,0.0.100+) |
+| `MCPP_DEP_<NAME>_LINKAGE` *(2026.9.15.2+)* | `mcpp::dep_linkage("name")` | 每个依赖在本次构建中的链接形态,`static` 或 `shared`,名字与 `MCPP_DEP_<NAME>_DIR` 相同;没有库形态的依赖为空。该值就是决定链接内容的那次解析,生成的加载入口或 `dllimport` 声明因此与之一致。只有**根工程**的 build.mcpp 能拿到:根工程决定每个依赖的形态,而依赖包的程序运行在发现顺序更靠后的包之前,那些包的程序提供了答案所依赖的事实,所以在那里 `dep_linkage` 总是为空 |
 
 这些契约值**无条件**折入重跑键——换 target、换 profile、开关 feature 都会触发重跑,
 不需要任何 `rerun-if-env-changed` 声明。
@@ -983,6 +984,16 @@ grpc     = { version = "1.83.0", tools = ["grpc_cpp_plugin"] }
 上实测;此前这个键只有版本,改动 emitter 之后 `mcpp run` 打印的是上一次的答案,直到
 版本被抬高。树被编辑时条目会累积;`mcpp cache clean` 清空 store,路径是
 `<mcpp cache dir>/tool/<index>/<name>@<version>[+<source>]/`。
+
+**工具构建写出的路径长度有界(2026.9.15.2+)。** 子构建在
+`<mcpp cache dir>/tool/.build/<hash>/` 中进行,这个目录由条目与消费工程命名,不嵌套在
+条目之内,二进制发布后即被删除。构建程序从自身包之外选入的源文件(例如用
+`mcpp::source` 选入依赖根下的文件)编译到
+`obj/<包>/__pkg/<所属包>/<在该包内的路径>`;没有任何包包含它时,编译到
+`obj/<包>/__ext/<其目录的哈希>/`。因此地址不随两个包之间的距离增长。在 Windows 上,
+引擎自己的构建步骤(`dyndep`、`stage`、BMI 相关的边、`coff-def` 与检查戳)以
+extended-length 路径打开文件。在这些改动之前,一个工具的扫描产物在 Windows runner
+上达到 271 个字符而无法读取(#641)。
 
 action 自己的跟踪与 store 的键是两回事。把工具列进 action 输入的规则,会在那个文件的
 字节变化时重跑 —— 实测直接覆盖 store 里的二进制,产物随之改变。
