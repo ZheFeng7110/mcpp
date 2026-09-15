@@ -381,7 +381,7 @@ int run(int argc, char** argv) {
             .option(cl::Option("release").help("Shorthand for --profile release"))
             .option(cl::Option("dev").help("Shorthand for --profile dev (-O0 -g)"))
             .option(cl::Option("features").takes_value().value_name("LIST")
-                .help("Activate root-package features (comma-separated)"))
+                .help("Activate root-package features, and a dependency's as <dependency>/<feature> (comma-separated)"))
             .option(cl::Option("cap").takes_value().value_name("LIST")
                 .help("Pin capability providers (e.g. blas=openblas,lapack=mkl)"))
             .option(cl::Option("strict")
@@ -511,7 +511,7 @@ int run(int argc, char** argv) {
             .option(cl::Option("profile").takes_value().value_name("NAME")
                 .help("Build profile for the test build: dev (default) | release | dist | <[profile.*] name>"))
             .option(cl::Option("features").takes_value().value_name("LIST")
-                .help("Activate root-package features for the test build (comma-separated)"))
+                .help("Activate root-package features, and a dependency's as <dependency>/<feature>, for the test build (comma-separated)"))
             .option(cl::Option("cap").takes_value().value_name("LIST")
                 .help("Pin capability providers (e.g. blas=openblas,lapack=mkl)"))
             .option(cl::Option("strict")
@@ -548,6 +548,8 @@ int run(int argc, char** argv) {
                 .help("Ask about this target instead of the project's default"))
             .option(cl::Option("toolchain").takes_value()
                 .help("Ask about this toolchain, e.g. llvm@22.1.8"))
+            .option(cl::Option("features").takes_value().value_name("LIST")
+                .help("Resolve with these features, as `build --features` does (root features and <dependency>/<feature>)"))
             .option(cl::Option("format").takes_value().value_name("json")
                 .help("Machine-readable output (enveloped; see docs/50-machine-output.md)"))
             .action(wrap_rc(cmd_why)))
@@ -620,10 +622,18 @@ int run(int argc, char** argv) {
             // this only replaces the "dev" fallback every other command uses.
             .option(cl::Option("profile").takes_value()
                 .help("Build profile (default: [build] default-profile, else release)"))
+            // The shorthands `build` and `run` take, with their precedence:
+            // `--profile` wins over either (#649 E9).
+            .option(cl::Option("release").help("Shorthand for --profile release"))
+            .option(cl::Option("dev").help("Shorthand for --profile dev"))
             .option(cl::Option("toolchain").takes_value().value_name("SPEC")
                 .help("Build with this toolchain for one invocation, e.g. llvm@22.1.8"))
             .option(cl::Option("features").takes_value().value_name("LIST")
-                .help("Activate root-package features for every build pass of the pack (comma-separated)"))
+                .help("Activate root-package features, and a dependency's as <dependency>/<feature>, for every build pass of the pack (comma-separated)"))
+            // `--format` names the PACKAGE format here, so machine output is
+            // asked for the way `mcpp test` asks for it (docs/50 §3).
+            .option(cl::Option("message-format").takes_value().value_name("FMT")
+                .help("Output format: human (default) | json (one mcpp.pack envelope on stdout; narration on stderr)"))
             .option(cl::Option("no-strip")
                 .help("Ship the artifacts as built (default: strip debug info)"))
             .option(cl::Option("debug-symbols").takes_value().value_name("DIR")
@@ -678,7 +688,7 @@ int run(int argc, char** argv) {
                 .option(cl::Option("release").help("Shorthand for --profile release"))
                 .option(cl::Option("dev").help("Shorthand for --profile dev"))
                 .option(cl::Option("features").takes_value().value_name("LIST")
-                    .help("Activate root-package features (comma-separated)"))
+                    .help("Activate root-package features, and a dependency's as <dependency>/<feature> (comma-separated)"))
                 .option(cl::Option("cap").takes_value().value_name("LIST")
                     .help("Pin capability providers (e.g. blas=openblas,lapack=mkl)"))
                 .option(cl::Option("strict")
@@ -1075,6 +1085,11 @@ int run(int argc, char** argv) {
             {"emit build-database", {Effect::InitMcppHome, Effect::ReadProject,
                                      Effect::Network, Effect::WriteGlobalCache,
                                      Effect::ExecBuildScript}},
+            // A build, then a package under `target/dist`: the build's
+            // declaration plus `write-project`.
+            {"pack",           {Effect::InitMcppHome, Effect::ReadProject,
+                                Effect::WriteProject, Effect::Network,
+                                Effect::WriteGlobalCache, Effect::ExecBuildScript}},
         };
     };
 

@@ -21,6 +21,7 @@ import mcpp.build.schedule.detach_codegen;
 import mcpp.build.test_targets;
 import mcpp.build.build_database;
 import mcpp.build.build_program;
+import mcpp.build.refusal;          // offline-download-required (#648 A1)
 import mcpp.dyndep;
 import mcpp.home;
 import mcpp.hooks;
@@ -94,6 +95,13 @@ int run_build_with_hooks(mcpp::build::BuildContext& ctx, bool verbose,
 // The build selectors, read once for every command that plans a build: `mcpp
 // build` and `mcpp emit build-database` select the same plan from the same
 // flags, so the database describes the build the same flags would run.
+// The profile the selectors name; see `mcpp::build::profile_override_from_flags`.
+std::string profile_from_selectors(const mcpplibs::cmdline::ParsedArgs& parsed) {
+    return mcpp::build::profile_override_from_flags(
+        parsed.value("profile").value_or(""),
+        parsed.is_flag_set("release"), parsed.is_flag_set("dev"));
+}
+
 mcpp::build::BuildOverrides overrides_from_selectors(
         const mcpplibs::cmdline::ParsedArgs& parsed) {
     mcpp::build::BuildOverrides ov;
@@ -109,9 +117,7 @@ mcpp::build::BuildOverrides overrides_from_selectors(
     // Profile selection precedence: --profile NAME > --release / --dev > the
     // project default ([build].default-profile) > "release", resolved in
     // prepare_build. --release/--dev are shorthands only.
-    if (auto pr = parsed.value("profile")) ov.profile = *pr;
-    else if (parsed.is_flag_set("release")) ov.profile = "release";
-    else if (parsed.is_flag_set("dev"))     ov.profile = "dev";
+    ov.profile = profile_from_selectors(parsed);
     if (auto fs = parsed.value("features")) ov.features = *fs;
     if (auto cp = parsed.value("cap")) ov.capabilities = *cp;
     ov.strict = parsed.is_flag_set("strict");
@@ -372,7 +378,20 @@ export int cmd_emit_build_database(const mcpplibs::cmdline::ParsedArgs& parsed) 
             testDiscovery.push_back(std::move(discovery));
         }
     }
-    if (planError) return failed("MCPP_BUILD_DATABASE_PLAN_FAILED", *planError);
+    // An offline plan that needs a download is not a defect of the project, and
+    // a client that plans offline by default (an editor) has to tell the two
+    // apart without reading the message (#648 A1). The code is taken only while
+    // the run is offline, so a refusal recorded on a path that recovered cannot
+    // relabel an unrelated failure.
+    if (planError) {
+        const bool offline = mcpp::platform::env::offline_mode()
+                          || mcpp::platform::env::no_auto_install();
+        if (mcpp::build::refusal::take()
+                == mcpp::build::refusal::Code::OfflineDownloadRequired
+            && offline)
+            return failed("MCPP_OFFLINE_DOWNLOAD_REQUIRED", *planError);
+        return failed("MCPP_BUILD_DATABASE_PLAN_FAILED", *planError);
+    }
 
     // The lock this planning produced, against the project's. The project's is
     // never written; a difference is reported.
@@ -472,11 +491,9 @@ export int cmd_run(const mcpplibs::cmdline::ParsedArgs& parsed,
     if (auto rn = parsed.value("runner")) runner_name = *rn;
     // The same two axes `build` and `test` take, read the same way. `--release`
     // and `--dev` are the shorthands the other verbs already accept.
-    std::string features, profile;
+    std::string features;
     if (auto fs = parsed.value("features")) features = *fs;
-    if (auto pr = parsed.value("profile"))  profile  = *pr;
-    if (parsed.is_flag_set("release"))      profile  = "release";
-    if (parsed.is_flag_set("dev"))          profile  = "dev";
+    const std::string profile = profile_from_selectors(parsed);
     // The device axis, read exactly as `build` reads it: `--no-accel` is an
     // explicit choice and not the absence of `--accel`, so it travels as the
     // same sentinel. Without this a project's CPU-only variant could be built
@@ -506,7 +523,7 @@ export int cmd_test(const mcpplibs::cmdline::ParsedArgs& parsed,
     // granularity for sanitizers / contract evaluation semantics). Post-`--`
     // args go to each test binary.
     mcpp::build::BuildOverrides ov;
-    if (auto pr = parsed.value("profile"))  ov.profile  = *pr;
+    ov.profile = profile_from_selectors(parsed);
     if (auto fs = parsed.value("features")) ov.features = *fs;
     if (auto cp = parsed.value("cap")) ov.capabilities = *cp;
     ov.strict = parsed.is_flag_set("strict");

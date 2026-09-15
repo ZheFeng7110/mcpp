@@ -95,6 +95,13 @@ mcpp <command> --format json
 streaming case and is **not** accepted — asking for it is an error, not a
 silent fallback.
 
+A command whose `--format` already names its **product** asks for machine
+output with `--message-format json` instead, as `mcpp test` does. `mcpp pack
+--format` names the package format (`tar`, `dir`, `msi`), so its report is
+`mcpp pack --message-format json` (2026.9.16.1+). The shape follows the kind:
+`mcpp test` streams a record per test because tests finish over time, and
+`mcpp pack` prints one envelope because a pack has one result.
+
 ### Unsupported values and unknown options
 
 Both go to **stderr** with **exit code 2**, and write nothing to stdout:
@@ -168,6 +175,12 @@ cannot separate the harmless from the thing a gate exists for:
 
 Most gates care about `exec-build-script` and `write-project`, and can ignore
 `init-mcpp-home` — mcpp setting itself up is not the workspace acting.
+
+The table above is what a command **may** do. The `effects` of an envelope are
+what the run **did**, and `network` is observed rather than declared: it is
+listed whenever the run started an index refresh, an install or a git remote
+operation, including one that failed or was stopped by its bound, and never
+for a run under `--offline`.
 
 ## 5. `--json` is not `--format json`
 
@@ -395,6 +408,10 @@ a program classifying the outcome reads `reason`:
 | `host-module-missing` | `build.mcpp` imports a module no dependency supplies as a host module |
 | `tool-version-conflict` | two declarations name one xlings package at versions that cannot both hold |
 | `shared-library-cxx-runtime` | a dependency's C++ shared library in a graph whose C++ runtime is a package, with no private copy stated |
+| `offline-download-required` | the run is offline and the plan needs a download: a toolchain, a package, a git revision or the package index *(2026.9.16.1+)* |
+| `package-cycle` | the dependency graph contains a cycle of packages; the message names its edges *(2026.9.16.1+)* |
+| `program-cxx-runtime-split` | a program or test that states a self-contained C++ runtime loads a C++ shared library of the build that couples to a shared one *(2026.9.16.1+)* |
+| `static-package-in-two-images` | a static package several images of the build reach, on a target where an image cannot use another image's copy *(2026.9.16.1+)* |
 | `other` | a refusal whose branch has not been given a token yet |
 
 **Exit 0 whenever the question was answered, including "refused".** "Would
@@ -430,8 +447,13 @@ no-write guarantee and the `watch` rules are
 [SPEC-005](specs/build-database.md).
 
 A failure omits `data` and exits 1, with the diagnostic code
-`MCPP_BUILD_DATABASE_NO_PROJECT` outside a project or
-`MCPP_BUILD_DATABASE_PLAN_FAILED` when planning fails. Warnings leave the
+`MCPP_BUILD_DATABASE_NO_PROJECT` outside a project,
+`MCPP_OFFLINE_DOWNLOAD_REQUIRED` when an offline plan (`--offline`,
+`MCPP_OFFLINE`, `MCPP_NO_AUTO_INSTALL`) needs something that has to be
+downloaded (a toolchain, a package, a git revision or the package index; the
+message names the first one), or `MCPP_BUILD_DATABASE_PLAN_FAILED` when planning
+fails for any other reason. The first of the three is not a defect of the
+project: one run without `--offline` removes it. Warnings leave the
 document in place:
 
 | code | |
@@ -443,6 +465,28 @@ document in place:
 `--protocol-version` declares `init-mcpp-home`, `read-project`, `network`,
 `write-global-cache` and `exec-build-script` for the command, and never
 `write-project`.
+
+### `mcpp.pack` — the products of a pack *(mcpp 2026.9.16.1+)*
+
+```
+mcpp pack [target] [--format <f>] [--target <triple>...] --message-format json
+```
+
+The envelope is printed once, after the command finishes; every human line goes
+to stderr, including what the build programs and tools the pack starts print.
+`data` is:
+
+| field | |
+|---|---|
+| `artifacts` | one record per produced artifact: `path` (absolute), `type` (`file` or `directory`), `format` (the `--format` value, `tar` when omitted) and `targets` (the canonical triple of each leg that went into it). A dispatched format reports the terminal outputs of the actions the request introduced; a several-`--target` Android pack reports one artifact whose `targets` lists every leg |
+| `stage` | the tree the artifact was made from: `dir`, `manifest` (the stage manifest below) and `closure` (`walked` or `not-walked`); `null` for a library package and when no tree was staged |
+
+A failure omits `data`, exits with the command's exit status and carries the
+diagnostic code `MCPP_PACK_FAILED`; the reason is on stderr. The per-run
+`effects` are `read-project`, `write-project` and `write-global-cache`, with
+`exec-build-script` when a build program ran. `--protocol-version` declares
+`init-mcpp-home`, `read-project`, `write-project`, `network`,
+`write-global-cache` and `exec-build-script` for `pack`.
 
 ### `mcpp test --message-format json` — the test stream
 

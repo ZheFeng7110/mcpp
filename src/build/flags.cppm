@@ -139,6 +139,42 @@ std::string render_link_intent_flags(
 
 CompileFlags compute_flags(const BuildPlan& plan);
 
+// ── Which link line a (host, target) pair takes (#647 E3) ─────────────────
+//
+// THE HOST DOES NOT DECIDE THIS ALONE. Three of the link branches describe a
+// link on this machine's own platform family: `link.exe` for the MSVC dialect,
+// `-fuse-ld=lld` without a payload model for a PE, and the Apple SDK line
+// (`-isysroot`, the deployment floor) for a Mach-O. They used to be selected by
+// `if constexpr` on the HOST, which was the same question while each host built
+// only for its own family. An Android row built on a macOS host is the first
+// target that separated them, and the Apple line it received had no
+// `--target`, so `-fuse-ld=lld` selected `ld64.lld` for an ELF object:
+//
+//     ld64.lld: error: unknown argument '-soname'
+//
+// The generic branch is the one that consumes `link_toolchain_flags`, where
+// the target is named. Every target a host branch does not describe takes it.
+//
+// ONE EXCEPTION IS KEPT, AND IT IS STATED BY ITS INPUT. On a Windows host a
+// non-PE target whose driver is NOT told its target by a flag (a canadian GCC
+// cross, which names its target by its own prefix) keeps the PE-host line it
+// has always had: nothing on that line is wrong for such a driver, and the
+// cross build that uses it is verified in CI. A target named by `--target`
+// (an SDK such as the NDK, or a retargetable clang) is exactly the case the
+// host line cannot serve.
+enum class LinkHost  { Linux, MacOS, Windows };
+enum class LinkShape { MsvcLinkExe, PeLld, AppleSdk, Generic };
+
+LinkShape link_shape(LinkHost host, mcpp::build::dist::Format targetFormat,
+                     bool msvcDialect, bool targetNamedByFlag);
+
+// The host this binary was built for, in `link_shape`'s vocabulary.
+constexpr LinkHost current_link_host() {
+    return mcpp::platform::is_windows            ? LinkHost::Windows
+         : mcpp::platform::needs_explicit_libcxx ? LinkHost::MacOS
+                                                 : LinkHost::Linux;
+}
+
 // The kind → role map. One line of policy, in one place: a test binary runs on
 // the build machine and is then thrown away; an archive embeds no runtime at
 // all; everything else leaves this machine. Backends ask this, never the kind.
@@ -422,6 +458,23 @@ std::string render_link_intent_flags(
         }
     }
     return out;
+}
+
+LinkShape link_shape(LinkHost host, mcpp::build::dist::Format targetFormat,
+                     bool msvcDialect, bool targetNamedByFlag) {
+    using mcpp::build::dist::Format;
+    switch (host) {
+        case LinkHost::Windows:
+            if (msvcDialect)                return LinkShape::MsvcLinkExe;
+            if (targetFormat == Format::Pe) return LinkShape::PeLld;
+            return targetNamedByFlag ? LinkShape::Generic : LinkShape::PeLld;
+        case LinkHost::MacOS:
+            return targetFormat == Format::MachO ? LinkShape::AppleSdk
+                                                 : LinkShape::Generic;
+        case LinkHost::Linux:
+            return LinkShape::Generic;
+    }
+    return LinkShape::Generic;
 }
 
 CompileFlags compute_flags(const BuildPlan& plan) {
@@ -760,6 +813,18 @@ CompileFlags compute_flags(const BuildPlan& plan) {
     // is only assemblable by its own x86_64-w64-mingw32-as.
     bool isMuslTc  = mcpp::toolchain::is_musl_target(plan.toolchain);
     bool isMingwTc = mcpp::toolchain::is_mingw_target(plan.toolchain);
+    // The object format the TARGET produces, derived once: the runtime contract
+    // table and the link-line shape both read it (#647 E3). Target-keyed, with
+    // the host's format only as the fallback for a triple that names none; a
+    // MinGW toolchain is a PE whatever its triple spelling says.
+    const mcpp::build::dist::Format targetObjectFormat =
+        isMingwTc ? mcpp::build::dist::Format::Pe
+                  : mcpp::build::dist::format_for(plan.toolchain.targetTriple,
+                        mcpp::platform::needs_explicit_libcxx
+                            ? mcpp::build::dist::Format::MachO
+                        : mcpp::platform::is_windows
+                            ? mcpp::build::dist::Format::Pe
+                            : mcpp::build::dist::Format::Elf);
     const auto linkIntentFlavor = [&] {
         if (isMingwTc) return LinkIntentFlavor::PeGnu;
         if (isMsvcDialect) return LinkIntentFlavor::PeMsvc;
@@ -1044,41 +1109,33 @@ CompileFlags compute_flags(const BuildPlan& plan) {
         // table because it recognises a mingw toolchain by more than its
         // triple; everything after it is `dist::format_for`, which is where
         // the question is answered and where it is tested.
-        const dist::Format format =
-            isMingwTc ? dist::Format::Pe
-                      : dist::format_for(plan.toolchain.targetTriple,
-                            mcpp::platform::needs_explicit_libcxx
-                                ? dist::Format::MachO
-                            : mcpp::platform::is_windows
-                                ? dist::Format::Pe
-                                : dist::Format::Elf);
+        const dist::Format format = targetObjectFormat;
 
         // `static_stdlib` is a faithful alias of the two ends of the contract:
         // its documented meaning has always been exactly self-contained vs the
         // dynamic system runtime. An explicit `cxx_runtime` wins.
         //
-        // The role defaults come from `dist::default_contract` rather than
-        // being spelled again here. They were spelled again here, and that
-        // second derivation is why `default_contract` sat with no caller while
-        // this file quietly disagreed with it about shared libraries.
-        const dist::Contract base =
-            dist::parse_contract(bc.cxxRuntime).value_or(
-                bc.staticStdlib
-                    ? dist::default_contract(dist::Role::Distributable, format)
-                    : dist::Contract::HostCoupled);
-        const dist::Contract testsContract =
-            dist::parse_contract(bc.cxxRuntimeTests).value_or(base);
-        // A project-wide statement (`cxx_runtime = "…"` or `static_stdlib =
-        // false`) applies to shared libraries too — a human said what the
-        // whole project promises. Only when nobody said anything does the
-        // role's own default apply, which is the case that changes on ELF.
-        // The statement is read by `stated_shared_library_contract`, which the
-        // refusal of a C++ shared library over a graph runtime reads too (#641).
-        const bool projectWideExplicit = !bc.cxxRuntime.empty() || !bc.staticStdlib;
-        const dist::Contract sharedContract =
-            dist::stated_shared_library_contract(bc.cxxRuntime, bc.cxxRuntimeShared,
-                                                 bc.staticStdlib, format)
-                .value_or(dist::default_contract(dist::Role::SharedLibrary, format));
+        // Every role's contract comes from `dist::role_contracts`, the one
+        // derivation the refusal of a split runtime reads as well. The role
+        // defaults were spelled here once, and that second derivation is why
+        // `default_contract` sat with no caller while this file quietly
+        // disagreed with it about shared libraries. A project-wide statement
+        // (`cxx_runtime = "..."` or `static_stdlib = false`) applies to shared
+        // libraries too; only when nobody said anything does a role's own
+        // default apply, and on ELF a program or test that loads a C++ shared
+        // library of this build takes that library's contract (#646 F3a).
+        const dist::CxxSharedLoad cxxSharedLoad{
+            .program = mcpp::build::image_loads_cxx_shared_library(plan, LinkUnit::Binary),
+            .tests   = mcpp::build::image_loads_cxx_shared_library(plan, LinkUnit::TestBinary),
+        };
+        const dist::RoleContracts contracts = dist::role_contracts(
+            dist::ContractStatement{
+                .cxxRuntime       = bc.cxxRuntime,
+                .cxxRuntimeTests  = bc.cxxRuntimeTests,
+                .cxxRuntimeShared = bc.cxxRuntimeShared,
+                .staticStdlib     = bc.staticStdlib,
+            },
+            format, cxxSharedLoad);
 
         // Archive lookup, directory half. LLVM lays these out either directly
         // under lib/ (the macOS packages) or under lib/<llvm-triple>/ (the
@@ -1134,6 +1191,9 @@ CompileFlags compute_flags(const BuildPlan& plan) {
         // ignoring a role override.
         mi.msvcStaticCrt  = mcpp::toolchain::msvc_wants_static_crt(
                                 bc.linkage, bc.cxxRuntime);
+        // The model is emitted only for the `msvc` dialect (above); clang on
+        // the MSVC ABI receives none and links the static CRT (#649 E10).
+        mi.msvcCrtModelEmitted = isMsvcDialect;
         mi.mingw          = isMingwTc;
         mi.macosFloor     = !macosDeploymentTarget.empty();
         // READ from the one value prepare resolved. The SDK being located for
@@ -1233,9 +1293,10 @@ CompileFlags compute_flags(const BuildPlan& plan) {
         };
 
         const bool wantsArchives =
-            (base == dist::Contract::SelfContained
-             || testsContract == dist::Contract::SelfContained
-             || sharedContract == dist::Contract::SelfContained)
+            (contracts.program == dist::Contract::SelfContained
+             || contracts.tests == dist::Contract::SelfContained
+             || contracts.intermediate == dist::Contract::SelfContained
+             || contracts.shared == dist::Contract::SelfContained)
             && caps.stdlib_id == "libc++";
         // THE ARCHIVES A LINKER SCRIPT OPENS, by file name.
         //
@@ -1317,9 +1378,9 @@ CompileFlags compute_flags(const BuildPlan& plan) {
 
         // "Explicit" = a human wrote it down. `static_stdlib = false` counts:
         // nobody sets a flag to its default to get non-default behavior.
-        const bool explicitBase   = projectWideExplicit;
-        const bool explicitTests  = explicitBase || !bc.cxxRuntimeTests.empty();
-        const bool explicitShared = explicitBase || !bc.cxxRuntimeShared.empty();
+        const bool explicitBase   = contracts.programStated;
+        const bool explicitTests  = contracts.testsStated;
+        const bool explicitShared = contracts.sharedStated;
 
         // Report a role's degradation only if this build HAS that role.
         //
@@ -1337,10 +1398,10 @@ CompileFlags compute_flags(const BuildPlan& plan) {
         bool wantsToolchainRuntime = false;
 
         for (auto [role, requested, wasAsked] : {
-                 std::tuple{dist::Role::Distributable, base,           explicitBase},
-                 std::tuple{dist::Role::Test,          testsContract,  explicitTests},
-                 std::tuple{dist::Role::Intermediate,  base,           explicitBase},
-                 std::tuple{dist::Role::SharedLibrary, sharedContract, explicitShared}}) {
+                 std::tuple{dist::Role::Distributable, contracts.program,      explicitBase},
+                 std::tuple{dist::Role::Test,          contracts.tests,        explicitTests},
+                 std::tuple{dist::Role::Intermediate,  contracts.intermediate, explicitBase},
+                 std::tuple{dist::Role::SharedLibrary, contracts.shared,       explicitShared}}) {
             mi.role            = role;
             mi.requested       = requested;
             mi.explicitRequest = wasAsked;
@@ -1568,8 +1629,13 @@ CompileFlags compute_flags(const BuildPlan& plan) {
     // survives a replacement. Declared here rather than inside either, because
     // the ordering between them is the whole point.
     std::string platformAnchor;
-    if constexpr (mcpp::platform::is_windows) {
-        if (isMsvcDialect) {
+    // WHICH BRANCH, asked of the host AND the target (see `link_shape`). The
+    // format is `targetObjectFormat`, the one the contract table reads.
+    const LinkShape linkShape = link_shape(current_link_host(), targetObjectFormat,
+                                           isMsvcDialect,
+                                           !plan.toolchain.crossTargetFlag.empty());
+    if (linkShape == LinkShape::MsvcLinkExe || linkShape == LinkShape::PeLld) {
+        if (linkShape == LinkShape::MsvcLinkExe) {
             // Native cl.exe: link.exe does the link (SeparateLinker). Search
             // paths for dependency runtime import libs via /LIBPATH; user
             // ldflags pass through verbatim; GNU link_extra (-flto/-s) does
@@ -1634,7 +1700,7 @@ CompileFlags compute_flags(const BuildPlan& plan) {
         f.ld = std::format("{} -fuse-ld=lld{}{}{}", full_static, link_intent_ld,
                            user_ldflags, link_extra);
         f.ldC = f.ld;   // no C++ runtime token on this line
-    } else if constexpr (mcpp::platform::needs_explicit_libcxx) {
+    } else if (linkShape == LinkShape::AppleSdk) {
         // macOS. The C++ runtime itself is decided by the contract table above
         // (dist::Format::MachO) and rides unit_ldflags; what is left here is
         // the rest of the macOS link:
@@ -1794,10 +1860,10 @@ CompileFlags compute_flags(const BuildPlan& plan) {
 
     // ── The target side comes from the graph, so the HOST's link is wrong ──
     //
-    // THE THREE BRANCHES ABOVE ARE SHAPED BY THIS MACHINE, NOT BY THE
-    // TARGET. `if constexpr (is_windows)` / `needs_explicit_libcxx` / else is a
-    // question about where mcpp itself was built, and each answer describes a
-    // link on that machine: an SDK path, a deployment target, a loader search
+    // THE BRANCHES ABOVE DESCRIBE A LINK AGAINST A PAYLOAD. `link_shape` now
+    // routes a target outside the host's own family to the generic branch, but
+    // the Apple and PE lines still describe the host platform's payload, and
+    // each answer describes a link there: an SDK path, a deployment target, a loader search
     // path, this host's `libatomic`. Every one of them is right when the target
     // is the host or is served by a payload, and wrong when the C library, the
     // C++ runtime and the platform are packages in the dependency graph.

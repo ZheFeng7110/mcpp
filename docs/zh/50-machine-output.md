@@ -77,6 +77,11 @@ mcpp <命令> --format json
 目前只支持 `json`。`ndjson` 保留给未来真正需要流式的场景,**现在不接受** —— 请求它是
 错误,不是静默回落。
 
+`--format` 已经表示其**产物**的命令改用 `--message-format json` 请求机器输出,与
+`mcpp test` 一致。`mcpp pack --format` 表示包格式(`tar`、`dir`、`msi`),因此它的报告是
+`mcpp pack --message-format json`(2026.9.16.1+)。形状随 kind 而定:测试随时间陆续完成,
+所以 `mcpp test` 每个测试一条流式记录;一次打包只有一个结果,所以 `mcpp pack` 输出一个信封。
+
 ### 不支持的值 / 未知选项
 
 两者都走 **stderr**、退出码 **2**,且**不往 stdout 写任何东西**:
@@ -144,6 +149,10 @@ mcpp --protocol-version
 
 多数门只在乎 `exec-build-script` 与 `write-project`,可以忽略 `init-mcpp-home` ——
 mcpp 给自己做初始化不是工作区在动作。
+
+上表是命令**可能**做的事。信封里的 `effects` 是这次运行**做了**的事,其中 `network`
+按观测记录而不是按声明:本次运行启动过索引刷新、安装或 git 远程操作时即列出,包括失败
+的或被期限终止的那一次;在 `--offline` 下运行时从不列出。
 
 ## 5. `--json` 不等于 `--format json`
 
@@ -348,6 +357,10 @@ mcpp why toolchain [--target <triple>] [--toolchain <spec>] --format json
 | `host-module-missing` | `build.mcpp` 导入了没有任何依赖以 host module 形式提供的模块 |
 | `tool-version-conflict` | 两处声明把同一个 xlings 包定在不能同时成立的版本上 |
 | `shared-library-cxx-runtime` | C++ 运行时来自图中的包,而依赖的 C++ 共享库没有声明私有副本 |
+| `offline-download-required` | 本次运行离线,而规划需要下载:工具链、包、git 修订或包索引 *(2026.9.16.1+)* |
+| `package-cycle` | 依赖图中存在包的环;消息列出环上的边 *(2026.9.16.1+)* |
+| `program-cxx-runtime-split` | 声明了自含 C++ 运行时的程序或测试,加载了本次构建中耦合到共享运行时的 C++ 共享库 *(2026.9.16.1+)* |
+| `static-package-in-two-images` | 一个静态包被本次构建的多个映像到达,而在该目标上一个映像不能使用另一个映像里的副本 *(2026.9.16.1+)* |
 | `other` | 一处还没有被命名的拒绝分支 |
 
 **只要问题被回答了就退 0,包括答案是「拒绝」。** 「它能不能构建,不能的话
@@ -378,8 +391,11 @@ mcpp emit build-database [--spec s1|compile-commands] --format json
 不带 `--format` 时命令只输出文档;`-o <file>` 把原本输出的内容写入 `<file>`。文档的
 内容、不写工程目录的保证与 `watch` 的规则见 [SPEC-005](../specs/build-database.md)。
 
-失败时省略 `data` 并以 1 退出:不在工程中时诊断码为 `MCPP_BUILD_DATABASE_NO_PROJECT`,
-规划失败时为 `MCPP_BUILD_DATABASE_PLAN_FAILED`。警告不影响文档:
+失败时省略 `data` 并以 1 退出:不在工程中时诊断码为 `MCPP_BUILD_DATABASE_NO_PROJECT`;
+离线规划(`--offline`、`MCPP_OFFLINE`、`MCPP_NO_AUTO_INSTALL`)需要下载某样东西(工具链、
+包、git 修订或包索引,消息指出第一个)时为 `MCPP_OFFLINE_DOWNLOAD_REQUIRED`;其他原因的
+规划失败为 `MCPP_BUILD_DATABASE_PLAN_FAILED`。第一种不是工程的缺陷,不带 `--offline`
+运行一次即可消除。警告不影响文档:
 
 | 诊断码 | |
 |---|---|
@@ -389,6 +405,25 @@ mcpp emit build-database [--spec s1|compile-commands] --format json
 
 `--protocol-version` 为这条命令声明 `init-mcpp-home`、`read-project`、`network`、
 `write-global-cache` 与 `exec-build-script`,从不声明 `write-project`。
+
+### `mcpp.pack` —— 一次打包的产物 *(mcpp 2026.9.16.1+)*
+
+```
+mcpp pack [target] [--format <f>] [--target <triple>...] --message-format json
+```
+
+信封在命令结束后输出一次;所有给人读的行都走 stderr,包括打包启动的构建程序与工具的输出。
+`data` 为:
+
+| 字段 | |
+|---|---|
+| `artifacts` | 每个产物一条记录:`path`(绝对路径)、`type`(`file` 或 `directory`)、`format`(`--format` 取值,省略时为 `tar`)与 `targets`(进入该产物的每条腿的规范三元组)。分派格式报告本次请求引入的 action 的终端输出;多 `--target` 的 Android 打包报告一个产物,其 `targets` 列出每条腿 |
+| `stage` | 产物所来自的那棵树:`dir`、`manifest`(即下文的暂存清单)与 `closure`(`walked` 或 `not-walked`);库包以及未暂存任何树时为 `null` |
+
+失败时省略 `data`,以命令自身的退出码退出,并带诊断码 `MCPP_PACK_FAILED`;原因在 stderr 上。
+每次运行的 `effects` 为 `read-project`、`write-project` 与 `write-global-cache`,有构建程序运行时
+再加 `exec-build-script`。`--protocol-version` 为 `pack` 声明 `init-mcpp-home`、
+`read-project`、`write-project`、`network`、`write-global-cache` 与 `exec-build-script`。
 
 ### `mcpp test --message-format json` —— 测试流
 

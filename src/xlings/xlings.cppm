@@ -470,6 +470,9 @@ struct SeedRepo {
     std::string url;
     std::string artifact;   // artifact source base, e.g. https://github.com/xlings-res/mcpp-index
     std::string source;     // "auto" | "artifact" | "git"
+    // Non-empty: `artifact` is written as the region object
+    // {"GLOBAL": artifact, "CN": artifactCn} (xlings #377).
+    std::string artifactCn;
 };
 
 void seed_xlings_json(const Env& env,
@@ -521,6 +524,36 @@ std::optional<std::filesystem::path> find_sandbox_nasm(const Env& env);
 // imports this module — the reverse would be a cycle.
 inline constexpr std::int64_t kIndexRefreshDebounceSeconds = 120;
 
+// ─── Bounds on the xlings children mcpp starts (#648 A3) ───────────────
+//
+// Every xlings invocation on the planning path runs through
+// `run_streaming_bounded`: the child owns a process group (a job object on
+// Windows) that dies with mcpp, and it is bounded. Before, an `xlings update`
+// on a connection that never answered held `emit build-database` for eleven
+// minutes, and outlived the mcpp its caller had killed.
+//
+// Which bound fits depends on what the child says while it works:
+//   - the index refresh prints little and is small: a TOTAL bound, configured
+//     by `[index] refresh_timeout`. A timed-out refresh is a failed refresh,
+//     which the build already survives when the local index can answer;
+//   - an install through the NDJSON interface emits a heartbeat after five
+//     seconds of silence (xlings interface.cpp), so no output for
+//     kInterfaceIdleTimeout means the xlings process itself is wedged, while a
+//     slow download that makes progress is never cut short: an IDLE bound;
+//   - a direct `xlings install -y` has its output sent to the null device, so
+//     only a total bound can apply, and it is generous: a toolchain archive on a
+//     slow link is not a hang;
+//   - a local command (the one-time sandbox init) gets a total bound.
+inline constexpr std::chrono::seconds kDefaultIndexRefreshTimeout{120};
+inline constexpr std::chrono::seconds kInterfaceIdleTimeout{300};
+inline constexpr std::chrono::seconds kDirectInstallTimeout{3 * 3600};
+inline constexpr std::chrono::seconds kLocalCommandTimeout{600};
+
+// Set once from `[index] refresh_timeout` when the configuration is loaded;
+// zero or negative restores the default.
+void set_index_refresh_timeout(std::chrono::seconds timeout);
+std::chrono::seconds index_refresh_timeout();
+
 // Check whether the default mcpplibs index data exists and is fresh
 // (within ttlSeconds).
 // Returns true if index is present and fresh, false otherwise.
@@ -547,14 +580,12 @@ int update_index(const Env& env, bool quiet = false);
 // when no update is needed.
 void ensure_index_fresh(const Env& env, std::int64_t ttlSeconds, bool quiet = false);
 
-// Ensure xlings' official xim index is present and fresh.
-void ensure_official_index_fresh(const Env& env, std::int64_t ttlSeconds, bool quiet = false);
-
-// Ensure a specific package file exists in xlings' official xim index.
-void ensure_official_package_index_fresh(const Env& env,
-                                         std::string_view packageName,
-                                         std::int64_t ttlSeconds,
-                                         bool quiet = false);
+// Whether xlings' official xim index on disk carries a descriptor for
+// `packageName`. Offline and read-only. Whether a miss may refresh the index is
+// not decided here: that is mcpp.pm.refresh_policy's `decide_for_miss`, so
+// `[index] auto_refresh`, `--offline` and the debounce apply to it as they do
+// to every other refresh (mcpp-community/mcpp#648 A5).
+bool official_package_present(const Env& env, std::string_view packageName);
 
 // ─── Index status (read-only, offline) ──────────────────────────────
 // Snapshot of a local index directory — computed without touching the
@@ -1417,8 +1448,13 @@ call(const Env& env, std::string_view capability,
     mcpp::log::verbose("xlings",
         std::format("interface {} exec: {}", capability, cmd));
 
+    // An install reaches the network; the query capabilities read local state.
+    if (capability == "install_packages" || capability == "update_packages")
+        mcpp::platform::env::note_network_access();
+
     CallResult result;
-    int rc = mcpp::platform::process::run_streaming(cmd,
+    bool timedOut = false;
+    int rc = mcpp::platform::process::run_streaming_bounded(cmd,
         [&](std::string_view line) {
             if (line.empty()) return;
 
@@ -1443,7 +1479,16 @@ call(const Env& env, std::string_view capability,
                     if (handler) handler->on_result(e);
                 }
             }, *ev);
-        });
+        },
+        std::chrono::milliseconds{0},
+        std::chrono::duration_cast<std::chrono::milliseconds>(kInterfaceIdleTimeout),
+        &timedOut);
+    if (timedOut) {
+        result.exitCode = result.exitCode != 0 ? result.exitCode : 124;
+        result.stderrTail.push_back(std::format(
+            "xlings interface {} wrote nothing for {} seconds (not even its "
+            "heartbeat) and was stopped", capability, kInterfaceIdleTimeout.count()));
+    }
     if (rc != 0 && result.exitCode == 0) result.exitCode = rc;
     if (result.exitCode != 0) {
         // Error-level lines only, the last 20: enough to name a rejection, and
@@ -1522,10 +1567,19 @@ int install_with_progress(const Env& env, std::string_view target,
         // Only when interactive (not quiet, stderr/stdout is a TTY).
         const bool showSpinner = !quiet && mcpp::platform::terminal::is_tty();
 
+        mcpp::platform::env::note_network_access();
         std::atomic<bool> done{false};
-        int directRaw = 0;
+        int directRc = 0;
         std::thread worker([&] {
-            directRaw = std::system(directCmd.c_str());
+            bool timedOut = false;
+            directRc = mcpp::platform::process::run_streaming_bounded(
+                directCmd, [](std::string_view) {},
+                std::chrono::duration_cast<std::chrono::milliseconds>(kDirectInstallTimeout),
+                std::chrono::milliseconds{0}, &timedOut);
+            if (timedOut)
+                mcpp::log::warn("xlings", std::format(
+                    "`xlings install {}` did not finish within {} hours and was stopped",
+                    target, kDirectInstallTimeout.count() / 3600));
             done.store(true, std::memory_order_release);
         });
 
@@ -1552,7 +1606,6 @@ int install_with_progress(const Env& env, std::string_view target,
         }
 
         worker.join();
-        int directRc = mcpp::platform::process::extract_exit_code(directRaw);
         if (directRc == 0) return 0;
     }
 
@@ -1617,7 +1670,17 @@ int install_with_progress(const Env& env, std::string_view target,
         if (!prog.files.empty()) cb(prog);
     };
 
-    int closeRc = mcpp::platform::process::run_streaming(cmd, handle_line);
+    bool idleTimedOut = false;
+    int closeRc = mcpp::platform::process::run_streaming_bounded(
+        cmd, handle_line, std::chrono::milliseconds{0},
+        std::chrono::duration_cast<std::chrono::milliseconds>(kInterfaceIdleTimeout),
+        &idleTimedOut);
+    if (idleTimedOut) {
+        mcpp::log::warn("xlings", std::format(
+            "xlings interface install_packages wrote nothing for {} seconds and was stopped",
+            kInterfaceIdleTimeout.count()));
+        return resultExitCode > 0 ? resultExitCode : 124;
+    }
     return (resultExitCode != -1) ? resultExitCode : closeRc;
 }
 
@@ -1629,12 +1692,19 @@ int install_direct(const Env& env, std::string_view target, bool quiet) {
         cmd += " ";
         cmd += std::string(mcpp::platform::shell::silent_redirect);
     }
-    if constexpr (mcpp::platform::is_windows) {
-        cmd += " <NUL";
-    } else {
-        cmd += " </dev/null";
-    }
-    return mcpp::platform::process::extract_exit_code(std::system(cmd.c_str()));
+    mcpp::platform::env::note_network_access();
+    bool timedOut = false;
+    // The streaming runner seals stdin itself. Lines are passed through as the
+    // inherited terminal showed them before, unless the caller asked for quiet.
+    int rc = mcpp::platform::process::run_streaming_bounded(cmd,
+        [quiet](std::string_view line) { if (!quiet) std::println("{}", line); },
+        std::chrono::duration_cast<std::chrono::milliseconds>(kDirectInstallTimeout),
+        std::chrono::milliseconds{0}, &timedOut);
+    if (timedOut)
+        mcpp::log::warn("xlings", std::format(
+            "`xlings install {}` did not finish within {} hours and was stopped",
+            target, kDirectInstallTimeout.count() / 3600));
+    return rc;
 }
 
 // ─── Sandbox lifecycle ──────────────────────────────────────────────
@@ -1651,7 +1721,11 @@ void seed_xlings_json(const Env& env,
         json += std::format("    {{ \"name\": \"{}\", \"url\": \"{}\"",
                             json_escape(repos[i].name),
                             json_escape(repos[i].url));
-        if (!repos[i].artifact.empty())
+        if (!repos[i].artifact.empty() && !repos[i].artifactCn.empty())
+            json += std::format(", \"artifact\": {{ \"GLOBAL\": \"{}\", \"CN\": \"{}\" }}",
+                                json_escape(repos[i].artifact),
+                                json_escape(repos[i].artifactCn));
+        else if (!repos[i].artifact.empty())
             json += std::format(", \"artifact\": \"{}\"",
                                 json_escape(repos[i].artifact));
         if (!repos[i].source.empty())
@@ -1721,7 +1795,11 @@ void ensure_init(const Env& env, bool quiet) {
     ScopedInvocationEnv scope(globalEnv);   // #614
     std::string cmd = build_command_prefix(globalEnv) + " self init "
         + std::string(mcpp::platform::shell::silent_redirect);
-    int rc = mcpp::platform::process::run_silent(cmd);
+    bool initTimedOut = false;
+    int rc = mcpp::platform::process::run_streaming_bounded(
+        cmd, [](std::string_view) {},
+        std::chrono::duration_cast<std::chrono::milliseconds>(kLocalCommandTimeout),
+        std::chrono::milliseconds{0}, &initTimedOut);
     if (rc != 0 && !quiet) {
         std::println(stderr,
             "warning: `xlings self init` failed for sandbox at '{}'",
@@ -1879,6 +1957,20 @@ int update_index_unguarded(const Env& env, bool quiet);
 // back — the refresh itself was the thing that broke the machine. See
 // mcpp.pm.index_snapshot for why the shape is archive/judge/restore rather
 // than the stage-and-swap the original design assumed.
+namespace {
+std::atomic<long long> g_index_refresh_timeout_s{kDefaultIndexRefreshTimeout.count()};
+}
+
+void set_index_refresh_timeout(std::chrono::seconds timeout) {
+    g_index_refresh_timeout_s.store(
+        timeout.count() > 0 ? timeout.count() : kDefaultIndexRefreshTimeout.count(),
+        std::memory_order_relaxed);
+}
+
+std::chrono::seconds index_refresh_timeout() {
+    return std::chrono::seconds{g_index_refresh_timeout_s.load(std::memory_order_relaxed)};
+}
+
 int update_index(const Env& env, bool quiet) {
     namespace snap = mcpp::pm::index_snapshot;
     const auto dataRoot = paths::index_data(env);
@@ -1944,6 +2036,7 @@ int update_index_unguarded(const Env& env, bool quiet) {
     }
 
     std::string cmd = build_command_prefix(env) + " update 2>&1";
+    mcpp::platform::env::note_network_access();
     // The index sync is a network git operation; a single transient blip (DNS,
     // TLS reset, a mirror hiccup) otherwise fails a cold `mcpp self env` /
     // first-run init outright (e.g. CI's index/sandbox bootstrap). Retry with
@@ -1951,12 +2044,28 @@ int update_index_unguarded(const Env& env, bool quiet) {
     // added latency in steady state; only a genuine failure pays the backoff.
     constexpr int kMaxAttempts = 3;
     int rc = 0;
+    const auto refreshBound = index_refresh_timeout();
     for (int attempt = 1; attempt <= kMaxAttempts; ++attempt) {
-        rc = mcpp::platform::process::run_streaming(cmd,
+        bool timedOut = false;
+        rc = mcpp::platform::process::run_streaming_bounded(cmd,
             [quiet](std::string_view line) {
                 if (!quiet) std::println("{}", line);
-            });
-        if (rc == 0) { mark_known_indexes_refreshed(env); return 0; }
+            },
+            std::chrono::duration_cast<std::chrono::milliseconds>(refreshBound),
+            std::chrono::milliseconds{0}, &timedOut);
+        if (rc == 0 && !timedOut) { mark_known_indexes_refreshed(env); return 0; }
+        // A refresh that exceeded its bound is not retried: the retries exist for
+        // a transient failure that ends, and a connection that never answers
+        // would only be waited on three times. The caller treats the refresh as
+        // failed and resolves from the local index, as it does for any failure.
+        if (timedOut) {
+            std::println(stderr,
+                "warning: the package index refresh did not finish within {} seconds and was "
+                "stopped; continuing with the local index "
+                "(the bound is [index] refresh_timeout in mcpp's config.toml)",
+                refreshBound.count());
+            return rc != 0 ? rc : 124;
+        }
         if (attempt < kMaxAttempts) {
             int delay = attempt * 2;  // 2s, then 4s
             mcpp::log::verbose("index", std::format(
@@ -1978,43 +2087,10 @@ void ensure_index_fresh(const Env& env, std::int64_t ttlSeconds, bool quiet) {
     update_index(env, /*quiet=*/true);
 }
 
-void ensure_official_index_fresh(const Env& env, std::int64_t ttlSeconds, bool quiet) {
-    if (is_official_index_fresh(env, ttlSeconds)) return;
-    if (!quiet)
-        print_status("Updating", "package index (auto-refresh)");
-    update_index(env, /*quiet=*/true);
-}
-
-void ensure_official_package_index_fresh(const Env& env,
-                                         std::string_view packageName,
-                                         [[maybe_unused]] std::int64_t ttlSeconds,
-                                         bool quiet) {
-    // Offline-first, miss-triggered. We do NOT auto-update just because a TTL
-    // expired — that runs a network `xlings update` (git-syncs several index
-    // repos) that stalls for minutes on slow/blocked networks (the Termux
-    // first-run / build hang). But fully offline is too strict: if a requested
-    // dependency is NOT in the local index, we DO refresh once to discover it.
-    //
-    //   present locally  → use as-is, zero network (the common build case).
-    //   missing locally  → refresh once to try to fetch it.
-    //
-    // Routine, deps-already-present refresh stays the user's explicit
-    // `mcpp index update` / `xlings update`.
+bool official_package_present(const Env& env, std::string_view packageName) {
     auto pkg = official_package_file(env, packageName);
-    if (!pkg.empty() && std::filesystem::exists(pkg)) return;
-
-    // The package is missing locally. Refresh once — but guard against a build
-    // that resolves several genuinely-absent packages re-running the heavy
-    // `xlings update` per package: if the index was refreshed moments ago and
-    // the package is STILL missing, upstream simply lacks it; re-pulling won't
-    // help. (A package added upstream before this run lands in that one pull.)
-    if (is_official_index_fresh(env, kIndexRefreshDebounceSeconds)) return;
-
-    if (!quiet)
-        print_status("Refreshing",
-            std::format("package index — `{}` not found locally (one-time)",
-                        packageName));
-    update_index(env, /*quiet=*/quiet);
+    std::error_code ec;
+    return !pkg.empty() && std::filesystem::exists(pkg, ec);
 }
 
 } // namespace mcpp::xlings

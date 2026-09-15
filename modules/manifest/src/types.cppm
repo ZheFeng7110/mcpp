@@ -1978,11 +1978,29 @@ struct Manifest {
     bool                        usesModules    = true;   // refined by scanner
     bool                        usesImportStd  = true;   // refined by scanner
     std::vector<std::string>    inferredNotes;           // for `Inferred ...` banner
+    // `targets` was inferred from the source tree (no `[targets]` table), not
+    // declared. A consumer treats a package whose DECLARED targets are all
+    // programs as a tool provider that contributes nothing to its own graph
+    // (#649 E6); a package that declared nothing keeps the older reading, so an
+    // inferred `bin` from `src/main.cpp` is not taken as that statement.
+    bool                        targetsInferred = false;
 
     // Non-fatal schema warnings collected during parse (e.g. unsupported keys
     // under [targets.<name>]). The caller (prepare_build) prints these and, under
     // --strict, escalates them to errors — mirroring the feature/platform path.
     std::vector<std::string>    schemaWarnings;
+
+    // `[package.metadata]`, as a JSON object text; empty when the manifest has
+    // none (#647 E1).
+    //
+    // THE ENGINE DOES NOT INTERPRET IT. The table belongs to whoever reads it
+    // (`[package.metadata.<tool>]`), and it travels to the root build program
+    // verbatim in the graph document (`mcpp::graph_file()`). A path in it is
+    // resolved by that reader against the package's manifest directory, which
+    // the document states beside it, because only the reader knows which
+    // values are paths. Kept as text so this module's interface names no JSON
+    // type.
+    std::string                 packageMetadataJson;
 };
 
 struct ManifestError {
