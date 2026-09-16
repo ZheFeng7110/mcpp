@@ -19,9 +19,22 @@ concurrency:
 
 jobs:
   macos-xlings-llvm:
-    name: macOS ARM64 — xlings LLVM end-to-end
-    runs-on: macos-15
-    timeout-minutes: 30
+    name: macOS ARM64 — xlings LLVM end-to-end (${{ matrix.image }})
+    # Two images: macos-15, the image every other macOS job uses, and macOS 27,
+    # the newest macOS release. The newest release is where a change of the SDK,
+    # the system libc++ headers or the loader first shows; the packaged binaries
+    # carry minos=14.0, and ci-fresh-install covers that floor.
+    #
+    # GitHub serves macOS 27 under the preview label `xcode-27` (macOS 27.0 with
+    # Xcode 27, actions/runner-images#14404); there is no `macos-27` label, and
+    # a job naming one waits for a runner that never comes. The "System info"
+    # step prints the OS the label delivered.
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [macos-15, xcode-27]
+    runs-on: ${{ matrix.image }}
+    timeout-minutes: 45
     # NOTE: no MCPP_VERBOSE here — keep this job's output shape identical to
     # ci-macos-e2e.yml, which asserts mcpp's default quiet output (48/53).
     steps:
@@ -31,10 +44,18 @@ jobs:
         run: |
           uname -a
           sw_vers
+          # `xcode-27` names an Xcode, not an OS, and the image changed its base
+          # OS once already; the leg exists for macOS 27, so it says so or fails.
+          if [ "${{ matrix.image }}" = xcode-27 ]; then
+            major=$(sw_vers -productVersion | cut -d. -f1)
+            [ "$major" = 27 ] || { echo "::error::xcode-27 delivered macOS $(sw_vers -productVersion), not 27"; exit 1; }
+          fi
           xcrun --show-sdk-path
           echo "SDK: $(xcrun --show-sdk-version)"
 
       - uses: ./.github/actions/setup-macos-llvm
+        with:
+          image: ${{ matrix.image }}
 
       - name: Inspect LLVM package structure
         run: |
@@ -51,6 +72,15 @@ jobs:
           echo "=== Module manifest ==="
           "$CXX" -print-library-module-manifest-path 2>/dev/null || echo "(not available)"
 
+      # THE TWO FLOATING MACROS mcpp STATES FOR AN APPLE TARGET
+      # (src/toolchain/hostflags.cppm, apple_float_macro_words). The macOS 27
+      # SDK leaves INFINITY and NAN to <float.h> once modules are on, and clang
+      # 22's header does not supply them in a -std=c++23 compile, so these raw
+      # compiles state them the way mcpp does. Unquoted words with no spaces, so
+      # plain word splitting of the variable is exact.
+      - name: The floating macros mcpp states for an Apple target
+        run: echo 'APPLE_FLOAT_MACROS=-DINFINITY=HUGE_VALF -DNAN=__builtin_nanf("0x7fc00000")' >> "$GITHUB_ENV"
+
       - name: Test — non-module C++23 compilation
         run: |
           WORK=$(mktemp -d)
@@ -63,7 +93,7 @@ jobs:
               return 0;
           }
           EOF
-          "$CXX" -std=c++23 -o hello main.cpp
+          "$CXX" -std=c++23 $APPLE_FLOAT_MACROS -o hello main.cpp
           ./hello
 
       - name: Test — import std (two-stage module compilation)
@@ -82,11 +112,11 @@ jobs:
 
           echo "=== Step 1: Precompile std module ==="
           mkdir -p pcm.cache
-          "$CXX" -std=c++23 -Wno-reserved-module-identifier \
+          "$CXX" -std=c++23 $APPLE_FLOAT_MACROS -Wno-reserved-module-identifier \
             --precompile "$STD_CPPM" -o pcm.cache/std.pcm
 
           echo "=== Step 2: Compile std.pcm → std.o ==="
-          "$CXX" -std=c++23 -Wno-reserved-module-identifier \
+          "$CXX" -std=c++23 $APPLE_FLOAT_MACROS -Wno-reserved-module-identifier \
             pcm.cache/std.pcm -c -o std.o
 
           echo "=== Step 3: Compile main.cpp with import std ==="
@@ -97,7 +127,7 @@ jobs:
               return 0;
           }
           EOF
-          "$CXX" -std=c++23 -fmodule-file=std=pcm.cache/std.pcm -c main.cpp -o main.o
+          "$CXX" -std=c++23 $APPLE_FLOAT_MACROS -fmodule-file=std=pcm.cache/std.pcm -c main.cpp -o main.o
 
           echo "=== Step 4: Link ==="
           "$CXX" main.o std.o -o hello_modules
@@ -120,16 +150,16 @@ jobs:
 
           mkdir -p pcm.cache
           # Build std first
-          "$CXX" -std=c++23 -Wno-reserved-module-identifier \
+          "$CXX" -std=c++23 $APPLE_FLOAT_MACROS -Wno-reserved-module-identifier \
             --precompile "$STD_CPPM" -o pcm.cache/std.pcm
-          "$CXX" -std=c++23 -Wno-reserved-module-identifier \
+          "$CXX" -std=c++23 $APPLE_FLOAT_MACROS -Wno-reserved-module-identifier \
             pcm.cache/std.pcm -c -o std.o
 
           # Build std.compat (depends on std)
-          "$CXX" -std=c++23 -Wno-reserved-module-identifier \
+          "$CXX" -std=c++23 $APPLE_FLOAT_MACROS -Wno-reserved-module-identifier \
             -fmodule-file=std=pcm.cache/std.pcm \
             --precompile "$STD_COMPAT_CPPM" -o pcm.cache/std.compat.pcm
-          "$CXX" -std=c++23 -Wno-reserved-module-identifier \
+          "$CXX" -std=c++23 $APPLE_FLOAT_MACROS -Wno-reserved-module-identifier \
             -fmodule-file=std=pcm.cache/std.pcm \
             pcm.cache/std.compat.pcm -c -o std.compat.o
 
@@ -141,7 +171,7 @@ jobs:
               return 0;
           }
           EOF
-          "$CXX" -std=c++23 \
+          "$CXX" -std=c++23 $APPLE_FLOAT_MACROS \
             -fmodule-file=std=pcm.cache/std.pcm \
             -fmodule-file=std.compat=pcm.cache/std.compat.pcm \
             -c main.cpp -o main.o
@@ -157,9 +187,9 @@ jobs:
           mkdir -p pcm.cache
 
           # Build std
-          "$CXX" -std=c++23 -Wno-reserved-module-identifier \
+          "$CXX" -std=c++23 $APPLE_FLOAT_MACROS -Wno-reserved-module-identifier \
             --precompile "$STD_CPPM" -o pcm.cache/std.pcm
-          "$CXX" -std=c++23 -Wno-reserved-module-identifier \
+          "$CXX" -std=c++23 $APPLE_FLOAT_MACROS -Wno-reserved-module-identifier \
             pcm.cache/std.pcm -c -o std.o
 
           # User module: greeter
@@ -172,9 +202,9 @@ jobs:
               }
           }
           EOF
-          "$CXX" -std=c++23 -fmodule-file=std=pcm.cache/std.pcm \
+          "$CXX" -std=c++23 $APPLE_FLOAT_MACROS -fmodule-file=std=pcm.cache/std.pcm \
             --precompile greeter.cppm -o pcm.cache/greeter.pcm
-          "$CXX" -std=c++23 -fmodule-file=std=pcm.cache/std.pcm \
+          "$CXX" -std=c++23 $APPLE_FLOAT_MACROS -fmodule-file=std=pcm.cache/std.pcm \
             pcm.cache/greeter.pcm -c -o greeter.o
 
           # Main
@@ -186,7 +216,7 @@ jobs:
               return 0;
           }
           EOF
-          "$CXX" -std=c++23 \
+          "$CXX" -std=c++23 $APPLE_FLOAT_MACROS \
             -fmodule-file=std=pcm.cache/std.pcm \
             -fmodule-file=greeter=pcm.cache/greeter.pcm \
             -c main.cpp -o main.o
