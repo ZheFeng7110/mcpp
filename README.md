@@ -18,6 +18,14 @@
   <img src="https://github.com/user-attachments/assets/6c85896e-9a37-4f62-acfb-d37a4eae2363" alt="mcpp demo" width="720">
 </p>
 
+> **Note (2026.9.18.3):** this release adds `cenv_probe::verify` host-macro
+> stripping for the Windows host and forces `-fno-short-wchar` on freestanding
+> wchar realisation. `[c-abi]` packages (`openkal-musl` 0.15.0 and any future
+> C-library package) require this engine. Older engines silently misbuild them:
+> the c-abi probe sees host contamination (`_WIN32`, `__MINGW32__`,
+> `__MINGW64__`, `_WIN64`) on Windows and reads the wrong `__SIZEOF_WCHAR_T__`
+> on a freestanding target. Upgrade: `xlings install mcpp --force`.
+
 ## Highlights
 
 - **Modular build system** — C++ modules first: `import std` handled automatically, file-level incremental builds, automatic dependency analysis, nothing to configure
