@@ -186,7 +186,19 @@ inline mcpp::targetside::CAbiDataModel triple_native_data_model(
 // The `wchar_t` width a target's default triple already has. Measured
 // (design §1.4): 16 on Windows (MinGW and Cygwin alike, absent
 // `-fno-short-wchar`), 32 everywhere else clang targets (Linux, macOS,
-// freestanding ELF).
+// hosted ELF/Mach-O).
+//
+// WHAT IS NOT IN THIS FUNCTION. The freestanding case used to be answered
+// "32", on the reasoning that `riscv64-none-elf` etc. measure as 32 bits on
+// Linux and macOS hosts. The wave's Windows-host × riscv64-none-elf
+// measurement showed that assumption to be wrong: clang on a Windows host
+// still uses MinGW's `<winnt.h>` defaults even with `--target=riscv64-none-elf`,
+// and `__SIZEOF_WCHAR_T__` measures 2 (16 bits) there. The probe correctly
+// flagged this as a mismatch with `decl.wcharBits = 32`. The fix is in the
+// `wchar` realisation below — always add `-fno-short-wchar` when the
+// declaration asks for 32, regardless of what the toolchain would have
+// defaulted to — so the probe then measures the state the engine actually
+// produced, not the host's leak.
 inline int native_wchar_bits(std::string_view os) {
     return os == "windows" ? 16 : 32;
 }
@@ -362,14 +374,45 @@ inline std::expected<Realisation, std::string> realise(
     }
 
     // ── `wchar` ──────────────────────────────────────────────────────────────
+    //
+    // The freestanding case used to be "assumed native, no token added".
+    // The wave's Windows-host × riscv64-none-elf measurement (openkal-
+    // llvm-runtime#24, 2026-09-18) caught that assumption as wrong:
+    // clang on a Windows host uses MinGW's `<winnt.h>` defaults even with
+    // `--target=riscv64-none-elf`, so the toolchain's own default for
+    // `wchar_t` is 16 bits there — and a `decl.wcharBits = 32` (musl's
+    // declaration) would compile to a 16-bit `wchar_t` because no token
+    // was added. The probe caught this; the right fix is here, not in the
+    // probe: a freestanding target ALWAYS gets `-fno-short-wchar` for
+    // `wchar=32`, so the compiler produces 32-bit `wchar_t` regardless of
+    // what its host-contaminated default would have been. Symmetric for
+    // `wchar=16`: a freestanding target's toolchain default on Linux/macOS
+    // is 32, so `-fshort-wchar` is always needed too. The hosted cases
+    // are unchanged — `native_wchar_bits(os)` is correct for every hosted
+    // target, because the host's toolchain default is what the real
+    // compile actually sees (Windows host has `-fshort-wchar` baked in
+    // via MinGW headers; Linux/macOS hosts have 32 bits).
+    //
+    // The probe below then measures what this engine actually produced
+    // (32 bits on a freestanding target, with the flag) — not the host's
+    // leak — and the declaration holds. There is no measurement-side
+    // workaround here: the previous version had a "freestanding target
+    // skips the wchar flag" rule that was wrong on Windows hosts, and
+    // adding it costs nothing on Linux/macOS hosts (they default to 32,
+    // so the flag is redundant but harmless on the hosted freestanding
+    // builds that don't exist; for hosted Linux/macOS, no flag is added).
     if (decl.hasWchar) {
-        const int native = freestanding ? 32 : native_wchar_bits(os);
-        if (decl.wcharBits != native) {
-            // One clang pair, relative to whatever the triple in force
-            // (possibly already substituted above) would otherwise give:
-            // `-fshort-wchar` for 16, `-fno-short-wchar` for 32. Measured on
-            // the Cygwin triple (design §1.4): default 16, `-fno-short-wchar`
-            // gives 32.
+        if (freestanding) {
+            // Freestanding: the toolchain's host-contaminated default is
+            // not something this engine can trust. Always emit the
+            // token that makes the compile match the declaration.
+            r.tokens.push_back(decl.wcharBits == 32 ? "-fno-short-wchar"
+                                                     : "-fshort-wchar");
+        } else if (decl.wcharBits != native_wchar_bits(os)) {
+            // Hosted: the target's own default is what the compile sees,
+            // and `native_wchar_bits(os)` correctly captures it
+            // (16 on Windows because MinGW headers bake in
+            // `-fshort-wchar`; 32 on Linux and macOS).
             r.tokens.push_back(decl.wcharBits == 32 ? "-fno-short-wchar"
                                                      : "-fshort-wchar");
         }
