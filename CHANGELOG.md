@@ -5,6 +5,106 @@
 
 ## [Unreleased]
 
+### C 库层可以声明它呈现的 C 环境,引擎实现并校验:设计 2026-09-18(2026.9.18.1)
+
+三元组的 OS 段过去总是同时回答两件事:目标机器长什么样,以及源码面对的 C 环境是什么。
+一旦某个包接管了 C 库(`mcpp:c-abi=<impl>`),这两个问题就可能有不同答案——openkal-musl
+在 `x86_64-windows-gnu` 上生成 PE/Win64 代码,却是一个呈现 POSIX 环境的 musl 移植版,而
+`_WIN32` 在这种图里同时冒充了「机器是 Windows」与「C 运行时是 Windows CRT」两件事,后者
+是假的。这一版本让 C 库层把它实际呈现的环境说出来,由引擎实现并校验,不再由三元组或某个
+库自己猜。
+
+- **`[c-abi]` 块**:只有提供 `mcpp:c-abi=<impl>` 层的包可以声明,其余情况在清单解析阶段
+  即被拒绝。`presents`(`posix`/`windows`/`none`)、`data-model`
+  (`arch-default`/`lp64`/`llp64`/`ilp32`)、`wchar`(`16`/`32`)三个键没有默认值,
+  `builtins`(`iso`/`platform`)默认 `platform`;拼错的键或取值都是解析错误而不是静默
+  忽略。不声明该块的包,产出的命令行与这项能力之前逐字节相同。
+  (`modules/manifest/src/{targetside_model,toml,types}.cppm`,单测 `test_manifest.cpp`)
+- **实现(realisation)**:新模块 `mcpp.toolchain.cenv` 保存「请求 → 三元组与开关」的映射
+  ——通用知识,不含包名。Windows 上 `presents = "posix", data-model = "arch-default"`
+  采用 Cygwin 式语义,仅在编译行把 `--target=` 换成 `x86_64-pc-cygwin`;链接行保持图解析出
+  的三元组不变,因为两个三元组生成的机器码实测完全一致(PE、Win64 调用约定、SEH)。
+  无法满足的请求明确拒绝,点名目标、请求与缺什么。`[package] c-environment = "platform"`
+  让一个包的自身单元退出这项实现,继续按三元组自身的默认环境编译。
+  (`src/toolchain/cenv.cppm`,单测 `test_cenv.cpp`)
+- **`c-environment = "platform"` 对 `mcpp:kernel-abi=<impl>` 提供者是推导出来的,不需要
+  自己声明,经 PR 进行中 openkal-musl 尖峰实验的修订。** 这样的包定义上就是说平台自身 ABI
+  的边界,绝不会是想要图里呈现的 `[c-abi]` 环境的那个包——openkal-windows 在 POSIX 替换下
+  编译,`-fno-short-wchar` 给了它 32 位 `wchar_t`,而它调的 Win32 接口回传真正的 16 位
+  UTF-16,`wchar_t*` 循环于是把两个 UTF-16 码元读成一个码点,这是实测出来的失败,不是假设。
+  推导让 openkal-windows 0.8.0、openkal-macos 0.10.0、openkal-linux 0.13.0 等每一个已发布
+  实现都不需要新发版本、不需要跨仓库协调版本号就能把边界做对,这一类失败因此**无法被表达**。
+  包自身清单里显式写的 `c-environment` 仍然优先于推导——该键仍是设计 §5.3 另一类情形(不是
+  kernel-abi 边界、但自身确有平台绑定单元的普通包)唯一的表达手段。`mcpp.manifest.xpkg` 与
+  `mcpp.toml` 两条清单解析路径都实现了同一条推导。(`modules/manifest/src/{toml,xpkg}.cppm`,
+  单测 `test_manifest.cpp` 的 `CEnvironmentIsInferredForAKernelAbiProvider`(两条解析路径各一
+  个),e2e `tests/e2e/741_...sh`)
+- **升级到这个版本后,第一次构建会是一次冷构建——这是故意的,原因如下。** 全局构建缓存
+  (`~/.mcpp/build-cache/v1`)的键原先没有覆盖解析出的 [c-abi] 环境(经 openkal-musl 尖峰
+  实验发现):`mcpp.build.cache_key::fill_package_config` 只读包自己清单里声明的
+  `cflags`/`cxxflags`,而解析出的环境是引擎的广播,只写进 `PackageRoot::privateBuild`,
+  从不写回前者——两次解析出不同环境的构建因此拿到同一把键。原地升级 `mcpp` 而不清理缓存
+  目录,会把按**旧**环境编译的目标文件喂给按**新**环境构建的镜像,一个镜像混两种 C 环境且
+  没有任何诊断,这正是本设计要防止的那个不变量本身。键的推导已经修好(见下),但已经写下的
+  条目没法用它来判断自己还能不能信——所以 `kCacheEpoch` 从 2 提到了 3,`~/.mcpp/
+  build-cache/v1` 下已有的条目整体作废,不再逐条判断。这不是求稳的富余动作:键改对了以后,
+  恰恰是那些*不再*触发替换的包最危险——比如同一个 PR 里被推导进 `c-environment =
+  "platform"` 的 kernel-abi 包,它广播前后 `privateBuild.cflags` 都是空的,新键和旧键因此
+  照样相同,而旧键当初对应的目标文件,正是带着替换令牌编译出来的那一份。
+  `fill_package_config` 现在把 `privateBuild.cflags`/`cxxflags`/新增的 `asmflags`(广播后的
+  值)与包自身声明的标志一起折进键里,和它原本处理 include 目录的方式一致。
+  (`src/build/cache_key.cppm`,单测 `test_cache_key.cpp` 的
+  `TwoDifferentRealisedCEnvironmentsDoNotShareASlot` 与
+  `EveryPrivateBuildBroadcastFieldReachesTheKey`——后者是给这一类缺陷立的长期防线:
+  `privateBuild`(`UsageRequirements`)每加一个新的广播字段,都要在这个测试和
+  `fill_package_config` 里同时补上一行,否则历史会重演,`-D__openkal__` 和
+  `targetSideUsage` 自己的广播在这次修订之前就已经有过同样的缺口)
+- **`__CYGWIN__`/`__CYGWIN32__` 保持定义,经 openkal-musl 尖峰实验修订。** 最初的实现
+  取消定义它们(理由是图里没有真正的 Cygwin 用户态)。第三方可移植代码里需要知道**目标文件
+  格式**——不是 C 环境,也不是平台 API——的那部分,没有别的名字能指代「PE 格式 + 呈现
+  POSIX 的 C 环境」这一组合,只有 `__CYGWIN__`;这样的代码不像本生态自己的包那样可以打
+  补丁。这是一项留给 30 个成员那轮实测去判定的权衡,不是已经定论的事实:一个库伸手去够
+  `__CYGWIN__`,也可能伸手去够一个这里并不存在的真正 Cygwin 接口——如果定义它带来的新
+  失败比修好的还多,结论就会翻过来。(`src/toolchain/cenv.cppm`)
+- **声明被校验,不被信任**:新模块 `mcpp.toolchain.cenv_probe` 用最终参数编译一次纯预处理
+  探针(`-E -dM`,不执行、不需要目标可在本机运行),核对 `__SIZEOF_LONG__`、
+  `__SIZEOF_WCHAR_T__` 与环境身份宏是否与声明相符,不符即失败并同时打印声明值与实测值;
+  结果按配置缓存。(`src/toolchain/cenv_probe.cppm`,协调者复核后补的单测
+  `tests/unit/test_cenv_probe.cpp`——针对真实编译器直接调用
+  `cenv_probe::verify`,不经过 `cenv::realise`,专门核实测出的不符会被正确识别并渲染成
+  声明值/实测值两列;此前这一模块只在 e2e 里被间接跑过成功路径,不符路径完全没有测试覆盖)
+- **`c-abi` 环境放进共享 store 的那道口子,讲清楚失败模式是什么(而不是缺口表里一行字)。**
+  对照真正写入 store 的代码路径核实过:安装钩子确实能编译目标侧代码,而它运行在工具链解析
+  **之前**——`install_hook_env` 拿到的工具链字段一律为空,这是顺序上的硬约束,不是漏传。
+  钩子因此没有办法知道这次构建解析出的环境,而 store 也不记录装的是按哪种环境编译的,所以
+  一次环境不一致的构建会拿到宽度错配的目标文件,**没有任何东西核对它**。这与
+  `mcpp:c++-abi=<impl>` 那条 `requires` 检查已经接受下来的同一种限制同形,不是这个 PR
+  新引入的;真正补上需要两阶段安装,或者把同样的 `requires` 检查方式推广到
+  `c-abi`/`c-environment`——都不在这个 PR 范围内。(`docs/22` 及其 zh 镜像)
+- **`__openkal__`**:`kernel-abi` 解析为 `openkal` 时,引擎为目标侧全部单元定义它——取自层
+  的取值,不取自包名。只能用于决定是否调用 `kal_*`,不得用于选择头文件或推断平台
+  (`docs/24`)。
+- **闭包可见性**:`provides = ["platform-sdk"]` 是包对自己的陈述;构建报告新增一行列出
+  图中所有这样的包(没有则为空),`[build] platform-dependencies = "refuse"`
+  让它们的出现直接失败构建。(`src/build/prepare.cppm`,`docs/06`)
+- **指纹**:解析出的环境与 `__openkal__` 参与构建指纹,LP64 与 LLP64 两次构建绝不共享输出
+  目录。安装钩子的存储键尚未补上同一个缺口,已在 `docs/22` 记录为已知差距。
+- **实现同样到达汇编单元,经 openkal-musl 尖峰实验发现并修订。** 最初的广播只写入每个包的
+  `privateBuild.cflags`/`cxxflags`,`.S` 单元走独立组装的 `f.as`,只从 `packageCflags` 里
+  继承 `-D`/`-U`/`-I` 子集(`unit_asm_flags`,本就如此,为了不让 `-std=`/`-O` 这类对汇编
+  无意义的标志混进去)——`--target=`/`-fno-short-wchar` 因此从未到达汇编器,同一个包里
+  `.c` 单元看到 `_WIN32` 未定义而 `.S` 单元仍看到它已定义(openkal-musl 自己的
+  `okm_setjmp.S`、上游 libunwind 的 `assembly.h` 都按这个宏选目标文件格式分支与寄存器保存
+  集,后果是用 SysV 保存集写、按 Win64 头部量的 `jmp_buf` 悄悄错位)。新增
+  `UsageRequirements::asmflags`——`privateBuild` 内与 `cflags`/`cxxflags` 平行、但只供引擎
+  自己广播用的第三条通道(没有对应的 `[build] asmflags = [...]` 清单键)——把同一份令牌
+  原样送进 `packageAsmflags`,绕开 D/U/I 过滤。实测 clang 对 `-x assembler-with-cpp` 接受
+  这些令牌全集,故未作裁剪。(`src/modgraph/scanner.cppm`、`src/build/prepare.cppm`,e2e
+  `tests/e2e/741_...sh` 新增 `.S` 单元与其上的断言)
+- 文档:`docs/22`(`[c-abi]`、校验、指纹)、`docs/21`(声明的环境如何移动编译三元组而不
+  移动链接三元组)、`docs/24`(三组宏、`__openkal__` 的规则、平台单元)、`docs/06`
+  (`platform-sdk` 标记)及对应 zh 镜像。
+
 ### 目标侧由依赖图供给时,编译侧关掉对应的隐式搜索:#662(2026.9.17.3)
 
 链接侧早在 #511 就已经按 `plan.targetSide.cAbi.prebuilt()` 撤掉 `-nostdlib`,编译侧一直
