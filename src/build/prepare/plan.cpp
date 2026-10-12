@@ -904,20 +904,24 @@ static void step13_graph_and_schedule(PrepareState& state, BuildContext& ctx) {
         ctx.plan.memoryThresholdPercent = memoryThresholdPercent;
         // For ordinary and two-phase edges Ninja's resolved job count is the
         // hard ceiling. Detached GCC edges use compilerCap instead.
-        ctx.plan.memoryCompilerCap = decision.compilerCap > 0
-            ? decision.compilerCap
-            : (decision.ninjaJobs > 0 ? decision.ninjaJobs
-                                      : mcpp::platform::capacity::recommended_jobs(
-                                            mcpp::platform::capacity::host_capacity()));
+        // This cap belongs to the admission controller, not to Ninja's
+        // user-selected job count.  Keeping it machine-derived means the
+        // generated command line remains identical for `-j 1` and `-j 4`,
+        // while Ninja still enforces the requested parallelism for ordinary
+        // edges.
+        const auto capacity = mcpp::platform::capacity::host_capacity();
+        ctx.plan.memoryCompilerCap = std::max(1, capacity.logicalCores);
         // Keep the value stable across incremental invocations.  The raw
         // available-memory reading is intentionally noisy; embedding it in
         // build.ninja would change the command line on every build and make
-        // Ninja rebuild every detached module object.  A GiB bucket still
-        // gives admission control a conservative build-start baseline while
-        // avoiding that false invalidation.
+        // Ninja rebuild every detached module object.  A coarse bucket gives
+        // admission control a conservative build-start baseline while
+        // avoiding that false invalidation when the scheduler changes jobs.
         constexpr unsigned long long gib = 1024ULL * 1024ULL * 1024ULL;
-        const auto available = mcpp::platform::capacity::host_capacity().availableBytes;
-        ctx.plan.memoryBaselineBytes = (available / gib) * gib;
+        constexpr unsigned long long bucket = 4 * gib;
+        const auto available = capacity.availableBytes;
+        ctx.plan.memoryBaselineBytes = std::max(
+            gib, (available / bucket) * bucket);
         mcpp::log::verbose("build", std::format("schedule: {} — {}",
                                                 ctx.plan.scheduleTag, decision.reason));
 

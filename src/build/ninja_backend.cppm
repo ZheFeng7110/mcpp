@@ -2018,7 +2018,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
         if constexpr (mcpp::platform::is_windows) {
             const std::string payload = " $local_includes";
             if (memoryAdmission)
-                append(std::format("  command = {}{} -- $cxx{} $cxxflags $unit_cxxflags{} {}{}\n",
+                append(std::format("  command = {}{} -- \"$cxx\"{} $cxxflags $unit_cxxflags{} {}{}\n",
                                    admission_prefix(), admission_dep(), rsp_ref(payload),
                                    module_src_flags, mmd_flag, compile_tail));
             else
@@ -2047,7 +2047,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
     if constexpr (mcpp::platform::is_windows) {
         const std::string payload = " $local_includes";
         if (memoryAdmission)
-            append(std::format("  command = {}{} -- $cxx{} $cxxflags $unit_cxxflags {}{}\n",
+            append(std::format("  command = {}{} -- \"$cxx\"{} $cxxflags $unit_cxxflags {}{}\n",
                                admission_prefix(), admission_dep(), rsp_ref(payload),
                                mmd_flag, compile_tail));
         else
@@ -2075,7 +2075,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
         append("rule c_object\n");
         const std::string payload = " $local_includes";
         if (memoryAdmission)
-            append(std::format("  command = {} -- $cc{} $cflags $unit_cflags {}{}\n",
+            append(std::format("  command = {} -- \"$cc\"{} $cflags $unit_cflags {}{}\n",
                                admission_prefix(), rsp_ref(payload), c_mmd_flag,
                                compile_tail));
         else
