@@ -937,6 +937,19 @@ with two behaviours has to be.
 
 `bmi_schedule` decides when importers are unblocked.
 
+`memory_threshold_percent` is a machine setting in `~/.mcpp/config.toml`, not a
+project-manifest field. It defaults to `80` and limits the compiler pool using
+the available memory observed at build start. `MCPP_MEMORY_THRESHOLD_PERCENT`
+overrides it for one invocation. Ordinary C/C++ edges and both detached GCC and
+two-phase Clang module edges use the same admission check; unsupported memory
+metrics leave the configured job/compiler cap in force.
+
+```toml
+# ~/.mcpp/config.toml
+[build]
+memory_threshold_percent = 80
+```
+
 | value | |
 |---|---|
 | `"auto"` | **the default, and it currently means OFF** |

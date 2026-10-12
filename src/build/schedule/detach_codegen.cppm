@@ -83,6 +83,7 @@ export module mcpp.build.schedule.detach_codegen;
 import std;
 import mcpp.platform.process;
 import mcpp.platform.capacity;
+import mcpp.build.depfile;
 import mcpp.build.stage;
 
 export namespace mcpp::build::schedule::detach {
@@ -150,6 +151,17 @@ int supervise(const std::filesystem::path& slot,
 // compiler that reports success without producing its output is a failure this
 // must not pass on.
 int await_unit(const std::filesystem::path& slot, const std::filesystem::path& object);
+
+// Run an ordinary compiler edge while holding the same admission token used
+// by detached compilation. The command is argv-based so compiler arguments do
+// not acquire a second quoting language at the admission boundary.
+int run_admitted(const std::vector<std::string>& command,
+                 const std::filesystem::path& semaphore,
+                 int maxCompilers,
+                 unsigned long long memoryBaselineBytes,
+                 int memoryThresholdPercent,
+                 const std::filesystem::path& depFrom = {},
+                 const std::filesystem::path& depTo = {});
 
 }  // namespace mcpp::build::schedule::detach
 
@@ -687,6 +699,37 @@ int await_unit(const std::filesystem::path& slot, const std::filesystem::path& o
                      object.string());
         return 1;
     }
+    return 0;
+}
+
+int run_admitted(const std::vector<std::string>& command,
+                 const std::filesystem::path& semaphore,
+                 int maxCompilers,
+                 unsigned long long memoryBaselineBytes,
+                 int memoryThresholdPercent,
+                 const std::filesystem::path& depFrom,
+                 const std::filesystem::path& depTo) {
+    if (command.empty()) return 2;
+    const auto token = acquire_token(semaphore, maxCompilers,
+                                     memoryBaselineBytes, memoryThresholdPercent);
+    bool timedOut = false;
+    const int rc = mcpp::platform::process::run_exec_deadline(
+        command, {}, std::chrono::milliseconds(0), &timedOut);
+    if (!token.empty()) {
+        std::error_code ec;
+        std::filesystem::remove(token, ec);
+    }
+    if (rc != 0 || depFrom.empty() || depTo.empty()) return rc;
+
+    std::ifstream in(depFrom, std::ios::binary);
+    if (!in) return 1;
+    std::string raw{std::istreambuf_iterator<char>{in}, {}};
+    std::ofstream out(depTo, std::ios::binary | std::ios::trunc);
+    if (!out) return 1;
+    out << mcpp::build::depfile::first_record(raw);
+    if (!out) return 1;
+    std::error_code ec;
+    std::filesystem::remove(depFrom, ec);
     return 0;
 }
 

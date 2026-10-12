@@ -35,6 +35,7 @@ import mcpp.platform;                // is_windows — the PATH separator of `__
 import mcpp.platform.env;            // --offline → MCPP_OFFLINE
 import mcpp.platform.process;        // __action-stamp runs the checked command
 import mcpp.platform.fs;             // __action-stamp writes its stamps
+import mcpp.build.schedule.detach_codegen;
 import mcpp.build.progress;          // __action reports its start
 import mcpp.platform.runtime_search; // linker-wrapper path-injection opt-out
 import mcpp.ui;
@@ -1134,6 +1135,39 @@ int run(int argc, char** argv) {
         std::error_code ec;
         std::filesystem::remove(std::filesystem::path{raw}, ec);
         return 0;
+    }
+
+    if (std::string_view(argv[1]) == "compile-admit") {
+        std::string sem, capText, baselineText, thresholdText, depRaw, depOut;
+        int i = 2;
+        for (; i < argc && std::string_view(argv[i]) != "--"; ++i) {
+            const std::string_view a = argv[i];
+            if (i + 1 >= argc) return 2;
+            if (a == "--sem") sem = argv[++i];
+            else if (a == "--cap") capText = argv[++i];
+            else if (a == "--mem-baseline") baselineText = argv[++i];
+            else if (a == "--mem-threshold") thresholdText = argv[++i];
+            else if (a == "--dep-raw") depRaw = argv[++i];
+            else if (a == "--dep-out") depOut = argv[++i];
+            else {
+                std::println(stderr, "error: compile-admit: unknown option '{}'", a);
+                return 2;
+            }
+        }
+        if (i + 1 >= argc || sem.empty()) {
+            std::println(stderr, "error: compile-admit requires --sem and -- <compiler argv...>");
+            return 2;
+        }
+        int cap = 0, threshold = 80;
+        unsigned long long baseline = 0;
+        std::from_chars(capText.data(), capText.data() + capText.size(), cap);
+        std::from_chars(baselineText.data(), baselineText.data() + baselineText.size(), baseline);
+        std::from_chars(thresholdText.data(), thresholdText.data() + thresholdText.size(), threshold);
+        std::vector<std::string> command;
+        for (++i; i < argc; ++i) command.emplace_back(argv[i]);
+        return mcpp::build::schedule::detach::run_admitted(
+            command, std::filesystem::path{sem}, cap, baseline, threshold,
+            std::filesystem::path{depRaw}, std::filesystem::path{depOut});
     }
 
     if (std::string_view(argv[1]) == "__action-stamp"

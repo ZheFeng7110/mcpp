@@ -878,6 +878,18 @@ bmi_schedule = "off"     # auto (default, = off) | on | off
 
 `bmi_schedule` 决定 importer 何时被解除阻塞。
 
+`memory_threshold_percent` 是 `~/.mcpp/config.toml` 中的本机设置，不是
+工程 manifest 字段。默认值为 `80`，它依据构建开始时观测到的可用内存限制
+编译器池；单次调用可以用 `MCPP_MEMORY_THRESHOLD_PERCENT` 覆盖。普通
+C/C++ 编译边、GCC 分离式模块边和 Clang 两阶段模块边使用同一条准入检查；
+不受支持的内存指标不会取消已经配置的 jobs/编译器上限。
+
+```toml
+# ~/.mcpp/config.toml
+[build]
+memory_threshold_percent = 80
+```
+
 | 取值 | |
 |---|---|
 | `"auto"` | **默认值，目前意味着关闭** |

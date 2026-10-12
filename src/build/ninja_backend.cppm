@@ -1839,6 +1839,21 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
         append(std::format("  rspfile_content ={}{}\n",
                            msvcDeps ? " " + std::string(kUtf8ByteOrderMark) : "", payload));
     };
+    // Keep ordinary compile edges inside the same admission controller as the
+    // detached GCC path. The compiler command remains argv-based; only the
+    // existing shell-free depfile filter is moved into the wrapper.
+    const bool memoryAdmission = plan.memoryCompilerCap > 0
+                              && plan.memoryBaselineBytes != 0;
+    auto admission_prefix = [&]() {
+        return std::format("$mcpp compile-admit --sem .mcpp-sched --cap {}"
+                           " --mem-baseline {} --mem-threshold {}",
+                           plan.memoryCompilerCap, plan.memoryBaselineBytes,
+                           plan.memoryThresholdPercent);
+    };
+    auto admission_dep = [&]() {
+        return needsGnuModuleFilter
+            ? std::string(" --dep-raw $out.d.raw --dep-out $out.d") : std::string{};
+    };
 
     // Tell the driver, every time, that this TU is a module interface.
     //
@@ -1957,10 +1972,16 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
         append("rule cxx_precompile\n");
         if constexpr (mcpp::platform::is_windows) {
             const std::string payload = " $local_includes";
-            append(std::format(
-                "  command = {}$cxx{} $cxxflags $unit_cxxflags{}{} {}$in {}$out\n",
-                win_depfile_filter, rsp_ref(payload), traits.bmiOnlyFlags,
-                module_src_flags, mmd_flag, dial.outputObjPrefix));
+            if (memoryAdmission)
+                append(std::format(
+                    "  command = {} -- $cxx{} $cxxflags $unit_cxxflags{}{} {}$in {}$out\n",
+                    admission_prefix(), rsp_ref(payload), traits.bmiOnlyFlags,
+                    module_src_flags, mmd_flag, dial.outputObjPrefix));
+            else
+                append(std::format(
+                    "  command = {}$cxx{} $cxxflags $unit_cxxflags{}{} {}$in {}$out\n",
+                    win_depfile_filter, rsp_ref(payload), traits.bmiOnlyFlags,
+                    module_src_flags, mmd_flag, dial.outputObjPrefix));
             append_rspfile(payload);
             append_cxx_deps();
         } else {
@@ -1968,15 +1989,22 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
             // same reason: ninja's `restat` compares the output's MTIME, and a
             // compiler that rewrites a byte-identical BMI still moves it. What
             // suppresses the cascade is putting the old file back.
-            append(std::format(
-                "  command = "
-                "if [ -f \"$out\" ]; then cp -p \"$out\" \"$out.bak\"; fi && "
-                "$cxx $local_includes $cxxflags $unit_cxxflags{}{} {}$in {}$out && "
-                "if [ -f \"$out.bak\" ] && $mcpp bmi-equal \"$out\" \"$out.bak\"; then "
-                  "mv \"$out.bak\" \"$out\"; "
-                "else rm -f \"$out.bak\"; fi\n",
-                traits.bmiOnlyFlags, module_src_flags, mmd_flag,
-                dial.outputObjPrefix));
+            if (memoryAdmission)
+                append(std::format("  command = {}{} -- $cxx $local_includes"
+                                   " $cxxflags $unit_cxxflags{}{} {}$in {}$out\n",
+                                   admission_prefix(), admission_dep(),
+                                   traits.bmiOnlyFlags, module_src_flags, mmd_flag,
+                                   dial.outputObjPrefix));
+            else
+                append(std::format(
+                    "  command = "
+                    "if [ -f \"$out\" ]; then cp -p \"$out\" \"$out.bak\"; fi && "
+                    "$cxx $local_includes $cxxflags $unit_cxxflags{}{} {}$in {}$out && "
+                    "if [ -f \"$out.bak\" ] && $mcpp bmi-equal \"$out\" \"$out.bak\"; then "
+                      "mv \"$out.bak\" \"$out\"; "
+                    "else rm -f \"$out.bak\"; fi\n",
+                    traits.bmiOnlyFlags, module_src_flags, mmd_flag,
+                    dial.outputObjPrefix));
             append_cxx_deps();
         }
         append("  description = BMI $out\n");
@@ -1989,15 +2017,26 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
         append("rule cxx_module_object\n");
         if constexpr (mcpp::platform::is_windows) {
             const std::string payload = " $local_includes";
-            append(std::format("  command = {}$cxx{} $cxxflags $unit_cxxflags{} {}{}\n",
-                               win_depfile_filter, rsp_ref(payload), module_src_flags,
-                               mmd_flag, compile_tail));
+            if (memoryAdmission)
+                append(std::format("  command = {}{} -- $cxx{} $cxxflags $unit_cxxflags{} {}{}\n",
+                                   admission_prefix(), admission_dep(), rsp_ref(payload),
+                                   module_src_flags, mmd_flag, compile_tail));
+            else
+                append(std::format("  command = {}$cxx{} $cxxflags $unit_cxxflags{} {}{}\n",
+                                   win_depfile_filter, rsp_ref(payload), module_src_flags,
+                                   mmd_flag, compile_tail));
             append_rspfile(payload);
             append_cxx_deps();
         } else {
-            append(std::format(
-                "  command = $cxx $local_includes $cxxflags $unit_cxxflags{} {}{}{}\n",
-                module_src_flags, mmd_flag, compile_tail, mmd_filter));
+            if (memoryAdmission)
+                append(std::format("  command = {}{} -- $cxx $local_includes"
+                                   " $cxxflags $unit_cxxflags{} {}{}\n",
+                                   admission_prefix(), admission_dep(),
+                                   module_src_flags, mmd_flag, compile_tail));
+            else
+                append(std::format(
+                    "  command = $cxx $local_includes $cxxflags $unit_cxxflags{} {}{}{}\n",
+                    module_src_flags, mmd_flag, compile_tail, mmd_filter));
             append_cxx_deps();
         }
         append("  description = OBJ $out\n");
@@ -2007,14 +2046,24 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
     append("rule cxx_object\n");
     if constexpr (mcpp::platform::is_windows) {
         const std::string payload = " $local_includes";
-        append(std::format("  command = {}$cxx{} $cxxflags $unit_cxxflags {}{}\n",
-                           win_depfile_filter, rsp_ref(payload), mmd_flag,
-                           compile_tail));
+        if (memoryAdmission)
+            append(std::format("  command = {}{} -- $cxx{} $cxxflags $unit_cxxflags {}{}\n",
+                               admission_prefix(), admission_dep(), rsp_ref(payload),
+                               mmd_flag, compile_tail));
+        else
+            append(std::format("  command = {}$cxx{} $cxxflags $unit_cxxflags {}{}\n",
+                               win_depfile_filter, rsp_ref(payload), mmd_flag, compile_tail));
         append_rspfile(payload);
     } else {
-        append(std::format(
-            "  command = $cxx $local_includes $cxxflags $unit_cxxflags {}{}{}\n",
-            mmd_flag, compile_tail, mmd_filter));
+        if (memoryAdmission)
+            append(std::format("  command = {}{} -- $cxx $local_includes"
+                               " $cxxflags $unit_cxxflags {}{}\n",
+                               admission_prefix(), admission_dep(),
+                               mmd_flag, compile_tail));
+        else
+            append(std::format(
+                "  command = $cxx $local_includes $cxxflags $unit_cxxflags {}{}{}\n",
+                mmd_flag, compile_tail, mmd_filter));
     }
     append("  description = OBJ $out\n");
     append_cxx_deps();
@@ -2025,8 +2074,13 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
     if (need_c_rule) {
         append("rule c_object\n");
         const std::string payload = " $local_includes";
-        append(std::format("  command = $cc{} $cflags $unit_cflags {}{}\n",
-                           rsp_ref(payload), c_mmd_flag, compile_tail));
+        if (memoryAdmission)
+            append(std::format("  command = {} -- $cc{} $cflags $unit_cflags {}{}\n",
+                               admission_prefix(), rsp_ref(payload), c_mmd_flag,
+                               compile_tail));
+        else
+            append(std::format("  command = $cc{} $cflags $unit_cflags {}{}\n",
+                               rsp_ref(payload), c_mmd_flag, compile_tail));
         append_rspfile(payload);
         append("  description = CC $out\n");
         append_cxx_deps();
