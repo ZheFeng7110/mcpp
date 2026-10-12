@@ -909,7 +909,15 @@ static void step13_graph_and_schedule(PrepareState& state, BuildContext& ctx) {
             : (decision.ninjaJobs > 0 ? decision.ninjaJobs
                                       : mcpp::platform::capacity::recommended_jobs(
                                             mcpp::platform::capacity::host_capacity()));
-        ctx.plan.memoryBaselineBytes = mcpp::platform::capacity::host_capacity().availableBytes;
+        // Keep the value stable across incremental invocations.  The raw
+        // available-memory reading is intentionally noisy; embedding it in
+        // build.ninja would change the command line on every build and make
+        // Ninja rebuild every detached module object.  A GiB bucket still
+        // gives admission control a conservative build-start baseline while
+        // avoiding that false invalidation.
+        constexpr unsigned long long gib = 1024ULL * 1024ULL * 1024ULL;
+        const auto available = mcpp::platform::capacity::host_capacity().availableBytes;
+        ctx.plan.memoryBaselineBytes = (available / gib) * gib;
         mcpp::log::verbose("build", std::format("schedule: {} — {}",
                                                 ctx.plan.scheduleTag, decision.reason));
 
