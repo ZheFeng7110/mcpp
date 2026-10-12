@@ -1907,6 +1907,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
         append("rule cxx_module_bmi\n");
         append("  command = $mcpp bmi-compile --bmi $bmi_out --slot $slot"
                " --self $mcpp --sem $sched_sem --cap $sched_cap"
+               " --mem-baseline $sched_mem_baseline --mem-threshold $sched_mem_threshold"
                " --command-file $out.cmd --dep-from $scan_dep --dep-to $out.d\n");
         append(std::format(
             "  rspfile = $out.cmd\n"
@@ -2931,6 +2932,8 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
                     e += "  scan_dep = " + escape_ninja_path(ddi) + ".dep\n";
                     e += "  sched_sem = .mcpp-sched\n";
                     e += std::format("  sched_cap = {}\n", plan.scheduleCompilerCap);
+                    e += std::format("  sched_mem_baseline = {}\n", plan.memoryBaselineBytes);
+                    e += std::format("  sched_mem_threshold = {}\n", plan.memoryThresholdPercent);
                     if (auto inc = local_include_flags(cu, dial); !inc.empty())
                         e += "  local_includes =" + inc + "\n";
                     if (auto fl = join_compile_flags(cu.packageCxxflags); !fl.empty())

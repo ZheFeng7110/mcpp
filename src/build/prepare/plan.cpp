@@ -864,6 +864,13 @@ static void step13_graph_and_schedule(PrepareState& state, BuildContext& ctx) {
     if (auto c = state.get_cfg(/*requireBootstrap=*/false))
         globalDefaultJobs = static_cast<int>((*c)->defaultJobs);
     ctx.globalDefaultJobs = globalDefaultJobs;
+    int memoryThresholdPercent = 80;
+    if (auto c = state.get_cfg(/*requireBootstrap=*/false)) {
+        memoryThresholdPercent = static_cast<int>((*c)->memoryThresholdPercent);
+        if (memoryThresholdPercent < 1 || memoryThresholdPercent > 100)
+            memoryThresholdPercent = 80;
+    }
+    ctx.memoryThresholdPercent = memoryThresholdPercent;
 
     // Resolve the module-edge schedule ONCE, here, where both the toolchain and
     // the manifest are in hand. The backend writes the graph in this shape, the
@@ -894,6 +901,15 @@ static void step13_graph_and_schedule(PrepareState& state, BuildContext& ctx) {
         ctx.plan.scheduleTag         = std::string(mcpp::build::schedule::to_string(decision.strategy));
         ctx.plan.scheduleNinjaJobs   = decision.ninjaJobs;
         ctx.plan.scheduleCompilerCap = decision.compilerCap;
+        ctx.plan.memoryThresholdPercent = memoryThresholdPercent;
+        // For ordinary and two-phase edges Ninja's resolved job count is the
+        // hard ceiling. Detached GCC edges use compilerCap instead.
+        ctx.plan.memoryCompilerCap = decision.compilerCap > 0
+            ? decision.compilerCap
+            : (decision.ninjaJobs > 0 ? decision.ninjaJobs
+                                      : mcpp::platform::capacity::recommended_jobs(
+                                            mcpp::platform::capacity::host_capacity()));
+        ctx.plan.memoryBaselineBytes = mcpp::platform::capacity::host_capacity().availableBytes;
         mcpp::log::verbose("build", std::format("schedule: {} — {}",
                                                 ctx.plan.scheduleTag, decision.reason));
 

@@ -82,6 +82,7 @@ export module mcpp.build.schedule.detach_codegen;
 
 import std;
 import mcpp.platform.process;
+import mcpp.platform.capacity;
 import mcpp.build.stage;
 
 export namespace mcpp::build::schedule::detach {
@@ -98,6 +99,8 @@ struct CompileRequest {
     // Directory of concurrency tokens. Empty disables the cap (hazard 2).
     std::filesystem::path semaphore;
     int                   maxCompilers{0};
+    unsigned long long    memoryBaselineBytes{0};
+    int                   memoryThresholdPercent{80};
     // The compiler invocation, as ONE shell command line.
     //
     // Not a token list: the backend has already joined and quoted the flags for
@@ -195,13 +198,34 @@ void write_rc(const std::filesystem::path& slot, int rc) {
 // The wait is bounded anyway. If a token is somehow still unreleasable, the
 // honest outcome is a failure that names the directory, not a build that stops
 // producing output and never returns.
-std::filesystem::path acquire_token(const std::filesystem::path& dir, int cap) {
+std::filesystem::path acquire_token(const std::filesystem::path& dir, int cap,
+                                    unsigned long long baselineBytes,
+                                    int thresholdPercent) {
     if (dir.empty() || cap <= 0) return {};
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
     const auto started = std::chrono::steady_clock::now();
     constexpr auto kLimit = std::chrono::hours(2);
     for (;;) {
+        const auto snapshot = mcpp::platform::capacity::memory_snapshot();
+        // If metrics are unavailable, retain the existing jobs/token safety
+        // rather than turning a platform limitation into an unbounded build.
+        // A supported reading must pass the admission check before a token is
+        // created; the token remains held until the supervisor exits.
+        bool anyToken = false;
+        if (std::filesystem::exists(dir, ec)) {
+            for (auto it = std::filesystem::directory_iterator(dir, ec);
+                 !ec && it != std::filesystem::directory_iterator{}; it.increment(ec)) {
+                anyToken = true;
+                break;
+            }
+        }
+        if (anyToken && snapshot.supported && baselineBytes != 0
+            && !mcpp::platform::capacity::memory_allows(
+                snapshot, baselineBytes, thresholdPercent)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+        }
         for (int i = 0; i < cap; ++i) {
             const auto tok = dir / std::to_string(i);
             if (std::filesystem::create_directory(tok, ec) && !ec) return tok;
@@ -502,7 +526,9 @@ int compile_release_at_bmi(const CompileRequest& req) {
         }
     }
 
-    const auto token = acquire_token(req.semaphore, req.maxCompilers);
+    const auto token = acquire_token(req.semaphore, req.maxCompilers,
+                                     req.memoryBaselineBytes,
+                                     req.memoryThresholdPercent);
 
     // The supervisor reads the SAME argv file rather than receiving the command
     // on its own command line: one representation, no re-quoting, and no limit
