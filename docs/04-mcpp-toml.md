@@ -941,8 +941,11 @@ with two behaviours has to be.
 project-manifest field. It defaults to `80` and limits the compiler pool using
 the available memory observed at build start. `MCPP_MEMORY_THRESHOLD_PERCENT`
 overrides it for one invocation. Ordinary C/C++ edges and both detached GCC and
-two-phase Clang module edges use the same admission check; unsupported memory
-metrics leave the configured job/compiler cap in force.
+two-phase Clang module edges use the same admission check. Ninja's jobs setting controls ordinary and
+two-phase edge parallelism; detached GCC compilation retains its compiler count
+cap. Under memory pressure, a shared single fallback slot still admits one
+compiler. Unsupported memory metrics leave the configured job/compiler cap in
+force.
 
 ```toml
 # ~/.mcpp/config.toml

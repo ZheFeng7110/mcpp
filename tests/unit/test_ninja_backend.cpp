@@ -2972,6 +2972,14 @@ TEST(NinjaBackend, PeExportsPatternsAndAConsumerReachTheDefEdge) {
     std::filesystem::remove_all(plan.outputDir, ec);
 }
 
+TEST(NinjaBackend, OrdinaryMemoryAdmissionHasNoCountingCap) {
+    auto plan = minimal_plan();
+    plan.memoryBaselineBytes = 4ULL * 1024 * 1024 * 1024;
+    const auto ninja = emit_ninja_string(plan);
+    EXPECT_NE(ninja.find("compile-admit --sem .mcpp-sched --mem-baseline"), std::string::npos);
+    EXPECT_EQ(ninja.find("compile-admit --sem .mcpp-sched --cap"), std::string::npos);
+}
+
 TEST(NinjaBackend, AdmittedTwoPhaseBmiPreservesRestat) {
     if constexpr (mcpp::platform::is_windows)
         GTEST_SKIP() << "POSIX BMI restat contract";
@@ -2980,9 +2988,9 @@ TEST(NinjaBackend, AdmittedTwoPhaseBmiPreservesRestat) {
     plan.toolchain.version = "23.1.3";
     plan.scanDepsPath = "/selected/bin/clang-scan-deps";
     plan.scheduleTag = "two-phase";
-    plan.memoryCompilerCap = 8;
     plan.memoryBaselineBytes = 4ULL * 1024 * 1024 * 1024;
     const auto ninja = emit_ninja_string(plan);
     ASSERT_NE(ninja.find("rule cxx_precompile\n"), std::string::npos);
     EXPECT_NE(ninja.find("--bmi-restat \"$out\" -- $cxx"), std::string::npos);
+    EXPECT_EQ(ninja.find("compile-admit --sem .mcpp-sched --cap"), std::string::npos);
 }

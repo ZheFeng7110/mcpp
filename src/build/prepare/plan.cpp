@@ -904,13 +904,7 @@ static void step13_graph_and_schedule(PrepareState& state, BuildContext& ctx) {
         ctx.plan.memoryThresholdPercent = memoryThresholdPercent;
         // For ordinary and two-phase edges Ninja's resolved job count is the
         // hard ceiling. Detached GCC edges use compilerCap instead.
-        // This cap belongs to the admission controller, not to Ninja's
-        // user-selected job count.  Keeping it machine-derived means the
-        // generated command line remains identical for `-j 1` and `-j 4`,
-        // while Ninja still enforces the requested parallelism for ordinary
-        // edges.
         const auto capacity = mcpp::platform::capacity::host_capacity();
-        ctx.plan.memoryCompilerCap = std::max(1, capacity.logicalCores);
         // Keep the value stable across incremental invocations.  The raw
         // available-memory reading is intentionally noisy; embedding it in
         // build.ninja would change the command line on every build and make

@@ -453,7 +453,6 @@ struct BuildPlan {
     // Runtime memory admission policy. These values are machine facts and are
     // deliberately not part of the build fingerprint.
     int                             memoryThresholdPercent = 80;
-    int                             memoryCompilerCap = 0;
     unsigned long long              memoryBaselineBytes = 0;
     // One immutable snapshot selected before workspace member substitution.
     // Build/run/test and cache fast paths consume this value; none may re-read

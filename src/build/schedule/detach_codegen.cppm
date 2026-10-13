@@ -152,9 +152,9 @@ int supervise(const std::filesystem::path& slot,
 // must not pass on.
 int await_unit(const std::filesystem::path& slot, const std::filesystem::path& object);
 
-// Run an ordinary compiler edge while holding the same admission token used
-// by detached compilation. The command is argv-based so compiler arguments do
-// not acquire a second quoting language at the admission boundary.
+// Run an ordinary compiler edge through memory admission. A nonpositive cap
+// skips counting slots; under pressure a single shared slot guarantees progress.
+// The command is argv-based so compiler arguments do not acquire a second quoting language at the admission boundary.
 int run_admitted(const std::vector<std::string>& command,
                  const std::filesystem::path& semaphore,
                  int maxCompilers,
@@ -214,34 +214,36 @@ void write_rc(const std::filesystem::path& slot, int rc) {
 std::filesystem::path acquire_token(const std::filesystem::path& dir, int cap,
                                     unsigned long long baselineBytes,
                                     int thresholdPercent) {
-    if (dir.empty() || cap <= 0) return {};
+    if (dir.empty()) return {};
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
     const auto started = std::chrono::steady_clock::now();
     constexpr auto kLimit = std::chrono::hours(2);
     for (;;) {
         const auto snapshot = mcpp::platform::capacity::memory_snapshot();
-        // If metrics are unavailable, retain the existing jobs/token safety
-        // rather than turning a platform limitation into an unbounded build.
-        // A supported reading must pass the admission check before a token is
-        // created; the token remains held until the supervisor exits.
-        bool anyToken = false;
-        if (std::filesystem::exists(dir, ec)) {
+        const bool denied = snapshot.supported && baselineBytes != 0
+            && !mcpp::platform::capacity::memory_allows(
+                snapshot, baselineBytes, thresholdPercent);
+        if (cap <= 0) {
+            // Ninja alone bounds ordinary edges. Only memory denial uses a
+            // shared fallback slot, allowing one compiler to make progress even
+            // when external processes keep available memory below the reserve.
+            if (!denied) return {};
+            const auto tok = dir / "0";
+            if (std::filesystem::create_directory(tok, ec) && !ec) return tok;
+        } else {
+            bool anyToken = false;
             for (auto it = std::filesystem::directory_iterator(dir, ec);
                  !ec && it != std::filesystem::directory_iterator{}; it.increment(ec)) {
                 anyToken = true;
                 break;
             }
-        }
-        if (anyToken && snapshot.supported && baselineBytes != 0
-            && !mcpp::platform::capacity::memory_allows(
-                snapshot, baselineBytes, thresholdPercent)) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            continue;
-        }
-        for (int i = 0; i < cap; ++i) {
-            const auto tok = dir / std::to_string(i);
-            if (std::filesystem::create_directory(tok, ec) && !ec) return tok;
+            if (!denied || !anyToken) {
+                for (int i = 0; i < cap; ++i) {
+                    const auto tok = dir / std::to_string(i);
+                    if (std::filesystem::create_directory(tok, ec) && !ec) return tok;
+                }
+            }
         }
         if (std::chrono::steady_clock::now() - started > kLimit) {
             // Proceeds WITHOUT the cap rather than failing: the semaphore bounds
@@ -251,10 +253,10 @@ std::filesystem::path acquire_token(const std::filesystem::path& dir, int cap,
                          "mcpp: no compiler slot became free in 2h — all {} tokens in {} "
                          "are held by processes that are gone. Continuing without the "
                          "concurrency cap; remove that directory to restore it.",
-                         cap, dir.string());
+                         std::max(1, cap), dir.string());
             return {};
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        std::this_thread::sleep_for(std::chrono::milliseconds(denied ? 50 : 5));
     }
 }
 

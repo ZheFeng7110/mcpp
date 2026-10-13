@@ -31,6 +31,46 @@ class CompileAdmit(unittest.TestCase):
         return subprocess.run(self.argv(script, *args, **kwargs),
                               capture_output=True, text=True, timeout=10)
 
+    def test_allowed_memory_does_not_acquire_counting_slots(self):
+        (self.sem / "0").mkdir(parents=True)
+        result = self.run_compile("pass")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(list(self.sem.iterdir()), [self.sem / "0"])
+
+    def test_pressure_admits_one_and_releases_fallback(self):
+        ready = self.root / "ready"
+        release = self.root / "release"
+        done = self.root / "done"
+        script = ("import pathlib,sys,time; "
+                  "pathlib.Path(sys.argv[1]).touch(); deadline=time.monotonic()+10; "
+                  "\nwhile not pathlib.Path(sys.argv[2]).exists() and time.monotonic()<deadline: time.sleep(.01)")
+        first = subprocess.Popen(self.argv(script, ready, release, baseline=10**18))
+        second = None
+        try:
+            deadline = time.monotonic() + 10
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertTrue(ready.exists(), "pressure must still admit the first edge")
+            if not (self.sem / "0").exists():
+                self.skipTest("memory metrics unavailable on this host")
+            second = subprocess.Popen(self.argv(
+                "import pathlib,sys; pathlib.Path(sys.argv[1]).touch()",
+                done, baseline=10**18))
+            time.sleep(.2)
+            self.assertIsNone(second.poll())
+            self.assertFalse(done.exists(), "only one pressure fallback may run")
+            release.touch()
+            self.assertEqual(first.wait(timeout=10), 0)
+            self.assertEqual(second.wait(timeout=10), 0)
+            self.assertTrue(done.exists())
+            self.assertFalse((self.sem / "0").exists())
+        finally:
+            release.touch()
+            for proc in (first, second):
+                if proc is not None and proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=10)
+
     @unittest.skipIf(os.name == "nt", "POSIX BMI restat contract")
     def test_bmi_restore_and_failure_cleanup(self):
         bmi = self.root / "interface.pcm"

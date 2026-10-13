@@ -1842,12 +1842,11 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
     // Keep ordinary compile edges inside the same admission controller as the
     // detached GCC path. The compiler command remains argv-based; only the
     // existing shell-free depfile filter is moved into the wrapper.
-    const bool memoryAdmission = plan.memoryCompilerCap > 0
-                              && plan.memoryBaselineBytes != 0;
+    const bool memoryAdmission = plan.memoryBaselineBytes != 0;
     auto admission_prefix = [&]() {
-        return std::format("$mcpp compile-admit --sem .mcpp-sched --cap {}"
+        return std::format("$mcpp compile-admit --sem .mcpp-sched"
                            " --mem-baseline {} --mem-threshold {}",
-                           plan.memoryCompilerCap, plan.memoryBaselineBytes,
+                           plan.memoryBaselineBytes,
                            plan.memoryThresholdPercent);
     };
     auto admission_dep = [&]() {
@@ -4203,7 +4202,7 @@ namespace {
 
 // RECLAIM THE STALE CONCURRENCY TOKENS, ONCE PER BUILD DIRECTORY PER COMMAND.
 //
-// detach-codegen bounds real compiler concurrency with a semaphore of
+// Detached compiler caps and the memory-pressure fallback use a semaphore of
 // directories under `<build dir>/.mcpp-sched`, released by the supervisor
 // holding each token. A supervisor that never runs its cleanup (Ctrl-C on the
 // build, the OOM killer, a reboot) leaves its directory behind, and nothing
@@ -4270,7 +4269,7 @@ std::expected<BuildResult, BuildError> NinjaBackend::build(const BuildPlan& plan
         return std::unexpected(BuildError{std::format("cannot create output dir '{}': {}",
                                                       plan.outputDir.string(), ec.message()),
                                           plan.outputDir});
-    if (!opts.dryRun && plan.scheduleTag == "detach-codegen")
+    if (!opts.dryRun)
         reclaim_stale_schedule_tokens(plan.outputDir);
 
     auto ninja_path = plan.outputDir / "build.ninja";

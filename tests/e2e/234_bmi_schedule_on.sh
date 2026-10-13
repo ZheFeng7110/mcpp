@@ -89,9 +89,7 @@ import schedon.mid;
 int main() { std::println("{}", mid_value()); return mid_value() == 8 ? 0 : 1; }
 EOF
 
-# detach-codegen is the GCC strategy. On a machine whose default toolchain
-# resolves to clang the decision is TwoPhase and there is no semaphore at all,
-# so the second contract has nothing to test — say so rather than pass hollowly.
+# Both split strategies use the shared memory-pressure fallback directory.
 say_skip_reason() { echo "SKIP: $1"; exit 0; }
 
 echo "== 1. builds with bmi_schedule = \"on\" =="
@@ -129,12 +127,6 @@ echo "== 2. the graph declares its shape =="
 grep -q '^# mcpp:graph=' "$BUILD_DIR/build.ninja" || {
   echo "FAIL: build.ninja carries no '# mcpp:graph=' line"; exit 1; }
 echo "  $(grep -m1 '^# mcpp:graph=' "$BUILD_DIR/build.ninja")"
-
-if [ "$strategy" != detach ]; then
-  echo "== 3. skipped: no semaphore under the $strategy strategy =="
-  echo "234 bmi_schedule OK ($strategy)"
-  exit 0
-fi
 
 echo "== 3. an incremental build still works =="
 touch src/core.cppm
@@ -193,4 +185,4 @@ BIN=$(ls -t target/*/*/bin/schedon 2>/dev/null | head -1)
 out=$("$BIN")
 [ "$out" = "8" ] || { echo "FAIL: binary printed '$out' after the stale-token build"; exit 1; }
 
-echo "234 bmi_schedule OK (detach-codegen, tokens reclaimed)"
+echo "234 bmi_schedule OK ($strategy, tokens reclaimed)"
