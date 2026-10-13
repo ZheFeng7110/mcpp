@@ -319,6 +319,12 @@ namespace {
 // U+FEFF in UTF-8. The response files of the MSVC tools begin with it (#693).
 constexpr std::string_view kUtf8ByteOrderMark = "\xEF\xBB\xBF";
 
+// The token directory every admission wrapper shares: the detached-compiler
+// edges spell it as the `$sched_sem` edge variable, the ordinary compile rules
+// interpolate it straight into the command, and the stale-token reclaim below
+// removes it. One constant, so the spellings cannot drift apart.
+constexpr std::string_view kSchedSemaphoreDir = ".mcpp-sched";
+
 // Whether the plan's compiler names an imported module's BMI as MSVC does
 // (`/reference <name>=<path>`), and so reads an argument file by MSVC's rules.
 bool msvc_module_spelling(const BuildPlan& plan) {
@@ -1848,8 +1854,8 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
     // existing shell-free depfile filter is moved into the wrapper.
     const bool memoryAdmission = plan.memoryBaselineBytes != 0;
     auto admission_prefix = [&]() {
-        return std::format("$mcpp compile-admit --sem .mcpp-sched"
-                           " --mem-threshold {}", plan.memoryThresholdPercent);
+        return std::format("$mcpp compile-admit --sem {} --mem-threshold {}",
+                           kSchedSemaphoreDir, plan.memoryThresholdPercent);
     };
     auto admission_dep = [&]() {
         return needsGnuModuleFilter
@@ -2985,7 +2991,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
                     e += "  obj_out = " + obj + "\n";
                     e += "  slot = " + slot + "\n";
                     e += "  scan_dep = " + escape_ninja_path(ddi) + ".dep\n";
-                    e += "  sched_sem = .mcpp-sched\n";
+                    e += std::format("  sched_sem = {}\n", kSchedSemaphoreDir);
                     e += std::format("  sched_cap = {}\n", plan.scheduleCompilerCap);
                     e += std::format("  sched_mem_threshold = {}\n", plan.memoryThresholdPercent);
                     if (auto inc = local_include_flags(cu, dial); !inc.empty())
@@ -4224,7 +4230,7 @@ void reclaim_stale_schedule_tokens(const std::filesystem::path& outputDir) {
     std::lock_guard lock(m);
     if (!reclaimed.insert(outputDir.lexically_normal().generic_string()).second) return;
     std::error_code ec;
-    std::filesystem::remove_all(outputDir / ".mcpp-sched", ec);
+    std::filesystem::remove_all(outputDir / kSchedSemaphoreDir, ec);
 }
 
 } // namespace
