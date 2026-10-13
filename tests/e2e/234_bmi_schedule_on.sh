@@ -111,7 +111,7 @@ case "$sched_line" in
 this test covers the split strategies" ;;
 esac
 
-BIN=$(ls -t target/*/*/bin/schedon 2>/dev/null | head -1)
+BIN=$(bash "$_root/.github/tools/newest_artifact.sh" target schedon)
 [ -n "$BIN" ] || { echo "FAIL: no binary produced"; exit 1; }
 out=$("$BIN")
 [ "$out" = "8" ] || { echo "FAIL: binary printed '$out', expected 8"; exit 1; }
@@ -158,8 +158,14 @@ printf '\nexport int core_extra() { return 1; }\n' >> src/core.cppm
 # `set -e` has to come off for exactly this command: with errexit on, a failing
 # build aborts the script before `rc=$?` runs, which is what pushed the previous
 # version into the `if !` form that then could not read the status at all.
+# Use the suite's process-tree timeout fallback on macOS, where neither GNU
+# timeout nor gtimeout is installed. python3 is a declared capability above.
+TIMEOUT_CMD=(python3 "$_root/tests/e2e/_timeout.py")
+if command -v timeout >/dev/null 2>&1; then TIMEOUT_CMD=(timeout)
+elif command -v gtimeout >/dev/null 2>&1; then TIMEOUT_CMD=(gtimeout)
+fi
 set +e
-timeout 600 "$MCPP" build --release > stale.log 2>&1
+"${TIMEOUT_CMD[@]}" 600 "$MCPP" build --release > stale.log 2>&1
 rc=$?
 set -e
 if [ "$rc" != 0 ]; then
@@ -181,7 +187,7 @@ left=$(ls "$SEM" 2>/dev/null | wc -l)
   exit 1; }
 echo "  reclaimed: $planted -> $left"
 
-BIN=$(ls -t target/*/*/bin/schedon 2>/dev/null | head -1)
+BIN=$(bash "$_root/.github/tools/newest_artifact.sh" target schedon)
 out=$("$BIN")
 [ "$out" = "8" ] || { echo "FAIL: binary printed '$out' after the stale-token build"; exit 1; }
 

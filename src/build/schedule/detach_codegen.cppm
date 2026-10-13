@@ -253,7 +253,7 @@ std::filesystem::path acquire_token(const std::filesystem::path& dir, int cap,
                          "mcpp: no compiler slot became free in 2h — all {} tokens in {} "
                          "are held by processes that are gone. Continuing without the "
                          "concurrency cap; remove that directory to restore it.",
-                         std::max(1, cap), dir.string());
+                         (std::max)(1, cap), dir.string());
             return {};
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(denied ? 50 : 5));
