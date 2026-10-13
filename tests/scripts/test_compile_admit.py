@@ -50,10 +50,19 @@ class CompileAdmit(unittest.TestCase):
         ready_literal = repr(str(ready))
         release_literal = repr(str(release))
         done_literal = repr(str(done))
+        # The program is ONE LINE on purpose. `compile-admit` starts the child
+        # through cmd.exe on Windows (`run_exec`'s documented shell path), and a
+        # literal newline ends the command there: only the first line would run,
+        # the child would touch `ready` and exit immediately, releasing the very
+        # token this test needs it to hold. Whether that surfaced as a failure
+        # or as the "metrics unavailable" skip was then a ~10ms race. The wait
+        # loop therefore lives in an exec'd string, whose `\n` is an escape and
+        # not a command separator.
         script = (f"import pathlib,time; ready=pathlib.Path({ready_literal}); "
                   f"release=pathlib.Path({release_literal}); ready.touch(); "
                   "deadline=time.monotonic()+10; "
-                  "\nwhile not release.exists() and time.monotonic()<deadline: time.sleep(.01)")
+                  "exec('while not release.exists() and time.monotonic()<deadline:"
+                  " time.sleep(.01)')")
         first = subprocess.Popen(self.argv(script, baseline=10**18))
         second = None
         try:
@@ -61,6 +70,10 @@ class CompileAdmit(unittest.TestCase):
             while not ready.exists() and time.monotonic() < deadline:
                 time.sleep(.01)
             self.assertTrue(ready.exists(), "pressure must still admit the first edge")
+            # The holding edge must still be INSIDE the wrapper. Without this,
+            # a child that exits at once reads as "memory metrics unavailable"
+            # below and the test silently stops testing admission.
+            self.assertIsNone(first.poll(), "the holding edge exited before the gate was read")
             if not (self.sem / "0").exists():
                 self.skipTest("memory metrics unavailable on this host")
             second = subprocess.Popen(self.argv(
