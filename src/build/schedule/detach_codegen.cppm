@@ -219,6 +219,7 @@ std::filesystem::path acquire_token(const std::filesystem::path& dir, int cap,
     std::filesystem::create_directories(dir, ec);
     const auto started = std::chrono::steady_clock::now();
     constexpr auto kLimit = std::chrono::hours(2);
+    const auto deadline = started + kLimit;
     bool wasDenied = false;
     for (;;) {
         const auto snapshot = mcpp::platform::capacity::memory_snapshot();
@@ -226,6 +227,23 @@ std::filesystem::path acquire_token(const std::filesystem::path& dir, int cap,
             && !mcpp::platform::capacity::memory_allows(
                 snapshot, baselineBytes, thresholdPercent, wasDenied);
         if (denied) wasDenied = true;
+        // Check before every admission attempt. Memory denial is a wait just
+        // like a full semaphore: it must not bypass the bounded-wait escape.
+        if (std::chrono::steady_clock::now() >= deadline) {
+            if (denied) {
+                std::println(std::cerr,
+                             "mcpp: timed out waiting for memory admission in {} after 2h; "
+                             "continuing without the concurrency cap",
+                             dir.string());
+            } else {
+                std::println(std::cerr,
+                             "mcpp: no compiler slot became free in 2h — all {} tokens in {} "
+                             "are held by processes that are gone. Continuing without the "
+                             "concurrency cap; remove that directory to restore it.",
+                             (std::max)(1, cap), dir.string());
+            }
+            return {};
+        }
         if (cap <= 0) {
             // Ninja alone bounds ordinary edges. Only memory denial uses a
             // shared fallback slot, allowing one compiler to make progress even
@@ -246,17 +264,6 @@ std::filesystem::path acquire_token(const std::filesystem::path& dir, int cap,
                     if (std::filesystem::create_directory(tok, ec) && !ec) return tok;
                 }
             }
-        }
-        if (std::chrono::steady_clock::now() - started > kLimit) {
-            // Proceeds WITHOUT the cap rather than failing: the semaphore bounds
-            // memory pressure, it is not a correctness property, so an unbounded
-            // compile is a worse build and a failed one is no build at all.
-            std::println(std::cerr,
-                         "mcpp: no compiler slot became free in 2h — all {} tokens in {} "
-                         "are held by processes that are gone. Continuing without the "
-                         "concurrency cap; remove that directory to restore it.",
-                         (std::max)(1, cap), dir.string());
-            return {};
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(denied ? 50 : 5));
     }
