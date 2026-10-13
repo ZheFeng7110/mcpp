@@ -41,7 +41,7 @@ constexpr std::string_view kCoroutineUseFailure =
 // the line, so it is read from where it sits.
 constexpr std::string_view kCoroutineUseFailureUnderTheAdmissionWrapper =
     "[1/1] D:/a/_temp/mcpp-built/mcpp.exe compile-admit --sem .mcpp-sched --cap 4 "
-    "--mem-baseline 12884901888 --mem-threshold 80 -- "
+    "--mem-threshold 80 -- "
     "\"C:/Users/runneradmin/.mcpp/registry/data/xpkgs/xim-x-llvm/23.1.3/bin/clang++.exe\" "
     "@obj/main.o.rsp -std=c++20 -fms-runtime-lib=dll "
     "\"-fprebuilt-module-path=D:\\a\\_temp\\coro\\pcm.cache\" -O0 -g "

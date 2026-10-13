@@ -2976,7 +2976,9 @@ TEST(NinjaBackend, OrdinaryMemoryAdmissionHasNoCountingCap) {
     auto plan = minimal_plan();
     plan.memoryBaselineBytes = 4ULL * 1024 * 1024 * 1024;
     const auto ninja = emit_ninja_string(plan);
-    EXPECT_NE(ninja.find("compile-admit --sem .mcpp-sched --mem-baseline"), std::string::npos);
+    EXPECT_NE(ninja.find("compile-admit --sem .mcpp-sched --mem-threshold"), std::string::npos);
+    EXPECT_EQ(ninja.find("compile-admit --sem .mcpp-sched --mem-baseline"), std::string::npos);
+    EXPECT_NE(ninja.find("mcpp_mem_baseline = 4294967296"), std::string::npos);
     EXPECT_EQ(ninja.find("compile-admit --sem .mcpp-sched --cap"), std::string::npos);
 }
 

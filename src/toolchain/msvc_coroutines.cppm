@@ -182,7 +182,7 @@ std::optional<FailedCommand> failed_command_in(std::string_view output) {
         // that line verbatim on failure:
         //
         //     <mcpp> compile-admit --sem .mcpp-sched --cap N \
-        //         --mem-baseline B --mem-threshold P -- "<clang++>" --target=...
+        //         --mem-threshold P -- "<clang++>" --target=...
         //
         // The compiler is still on the line, one wrapper in front of it, so
         // the driver is looked for wherever it sits. Everything read from the

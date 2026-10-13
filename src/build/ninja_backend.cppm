@@ -1406,6 +1406,10 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
                                     plan.accelOverridden,
                                     plan.packFormat, plan.requestTag) + "\n");
     append("ninja_required_version = 1.11\n\n");
+    // Runtime memory admission is deliberately an environment input rather
+    // than part of any edge command. Ninja's command hash must not rebuild the
+    // graph when the startup observation moves between baseline buckets.
+    append(std::format("mcpp_mem_baseline = {}\n\n", plan.memoryBaselineBytes));
 
     // All compile/link flags are computed once via flags.cppm.
     auto flags = compute_flags(plan);
@@ -1845,9 +1849,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
     const bool memoryAdmission = plan.memoryBaselineBytes != 0;
     auto admission_prefix = [&]() {
         return std::format("$mcpp compile-admit --sem .mcpp-sched"
-                           " --mem-baseline {} --mem-threshold {}",
-                           plan.memoryBaselineBytes,
-                           plan.memoryThresholdPercent);
+                           " --mem-threshold {}", plan.memoryThresholdPercent);
     };
     auto admission_dep = [&]() {
         return needsGnuModuleFilter
@@ -1921,7 +1923,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
         append("rule cxx_module_bmi\n");
         append("  command = $mcpp bmi-compile --bmi $bmi_out --slot $slot"
                " --self $mcpp --sem $sched_sem --cap $sched_cap"
-               " --mem-baseline $sched_mem_baseline --mem-threshold $sched_mem_threshold"
+               " --mem-threshold $sched_mem_threshold"
                " --command-file $out.cmd --dep-from $scan_dep --dep-to $out.d\n");
         append(std::format(
             "  rspfile = $out.cmd\n"
@@ -2985,7 +2987,6 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
                     e += "  scan_dep = " + escape_ninja_path(ddi) + ".dep\n";
                     e += "  sched_sem = .mcpp-sched\n";
                     e += std::format("  sched_cap = {}\n", plan.scheduleCompilerCap);
-                    e += std::format("  sched_mem_baseline = {}\n", plan.memoryBaselineBytes);
                     e += std::format("  sched_mem_threshold = {}\n", plan.memoryThresholdPercent);
                     if (auto inc = local_include_flags(cu, dial); !inc.empty())
                         e += "  local_includes =" + inc + "\n";
@@ -4602,6 +4603,7 @@ std::expected<BuildResult, BuildError> NinjaBackend::build(const BuildPlan& plan
             nenv.emplace_back(runtimeEnv->first, runtimeEnv->second);
     for (auto& ev : plan.toolchain.envOverrides)
         nenv.emplace_back(ev.key, ev.value);
+    nenv.emplace_back("MCPP_MEM_BASELINE", std::to_string(plan.memoryBaselineBytes));
 
     // THE STAGED CACHE IS PLACED BY A PASS OF ITS OWN, before the graph that
     // reads it. ninja 1.12.1 loads a dyndep file whose producer is up to date

@@ -1162,7 +1162,12 @@ int run(int argc, char** argv) {
         int cap = 0, threshold = 80;
         unsigned long long baseline = 0;
         std::from_chars(capText.data(), capText.data() + capText.size(), cap);
-        std::from_chars(baselineText.data(), baselineText.data() + baselineText.size(), baseline);
+        if (!baselineText.empty()) {
+            std::from_chars(baselineText.data(), baselineText.data() + baselineText.size(), baseline);
+        } else if (const char* env = std::getenv("MCPP_MEM_BASELINE"); env && *env) {
+            const auto text = std::string_view(env);
+            std::from_chars(text.data(), text.data() + text.size(), baseline);
+        }
         std::from_chars(thresholdText.data(), thresholdText.data() + thresholdText.size(), threshold);
         std::vector<std::string> command;
         for (++i; i < argc; ++i) command.emplace_back(argv[i]);

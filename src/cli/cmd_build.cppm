@@ -1585,6 +1585,10 @@ export int cmd_bmi_compile(const mcpplibs::cmdline::ParsedArgs& parsed) {
         std::from_chars(cap.data(), cap.data() + cap.size(), req.maxCompilers);
     if (const auto baseline = opt_value(parsed, "mem-baseline"); !baseline.empty())
         std::from_chars(baseline.data(), baseline.data() + baseline.size(), req.memoryBaselineBytes);
+    else if (const char* env = std::getenv("MCPP_MEM_BASELINE"); env && *env) {
+        const auto text = std::string_view(env);
+        std::from_chars(text.data(), text.data() + text.size(), req.memoryBaselineBytes);
+    }
     if (const auto threshold = opt_value(parsed, "mem-threshold"); !threshold.empty())
         std::from_chars(threshold.data(), threshold.data() + threshold.size(), req.memoryThresholdPercent);
     req.commandFile = file_path("command-file");
