@@ -92,10 +92,9 @@ TEST(MemoryAdmission, StopsAtConfiguredConsumption) {
 }
 
 TEST(MemoryAdmission, HysteresisRequiresRecoveryMargin) {
-    MemorySnapshot now{.availableBytes = 1 * GiB, .supported = true};
-    EXPECT_FALSE(memory_allows(now, 10 * GiB, 80, false));
-    now.availableBytes = 3 * GiB;
-    EXPECT_TRUE(memory_allows(now, 10 * GiB, 80, true));
+    MemorySnapshot now{.availableBytes = 2 * GiB + 1, .supported = true};
+    EXPECT_TRUE(memory_allows(now, 10 * GiB, 80, false));
+    EXPECT_FALSE(memory_allows(now, 10 * GiB, 80, true));
 }
 
 TEST(MemoryAdmission, UnsupportedReadIsNotPermission) {

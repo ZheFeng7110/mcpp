@@ -219,11 +219,13 @@ std::filesystem::path acquire_token(const std::filesystem::path& dir, int cap,
     std::filesystem::create_directories(dir, ec);
     const auto started = std::chrono::steady_clock::now();
     constexpr auto kLimit = std::chrono::hours(2);
+    bool wasDenied = false;
     for (;;) {
         const auto snapshot = mcpp::platform::capacity::memory_snapshot();
         const bool denied = snapshot.supported && baselineBytes != 0
             && !mcpp::platform::capacity::memory_allows(
-                snapshot, baselineBytes, thresholdPercent);
+                snapshot, baselineBytes, thresholdPercent, wasDenied);
+        if (denied) wasDenied = true;
         if (cap <= 0) {
             // Ninja alone bounds ordinary edges. Only memory denial uses a
             // shared fallback slot, allowing one compiler to make progress even
