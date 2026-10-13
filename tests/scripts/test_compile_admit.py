@@ -81,6 +81,37 @@ class CompileAdmit(unittest.TestCase):
                     proc.kill()
                     proc.wait(timeout=10)
 
+    def test_malformed_numeric_option_is_named(self):
+        # An omitted value keeps its default; a MALFORMED one must not be
+        # silently indistinguishable from an omitted one.
+        cases = (
+            (["compile-admit", "--sem", str(self.sem), "--cap", "x",
+              "--", sys.executable, "-c", "pass"], "--cap"),
+            (["compile-admit", "--sem", str(self.sem), "--mem-baseline", "x",
+              "--", sys.executable, "-c", "pass"], "--mem-baseline"),
+            (["compile-admit", "--sem", str(self.sem), "--mem-threshold", "x",
+              "--", sys.executable, "-c", "pass"], "--mem-threshold"),
+            (["bmi-compile", "--cap", "x"], "--cap"),
+        )
+        for argv, flag in cases:
+            with self.subTest(argv=argv):
+                result = subprocess.run([MCPP, *argv], capture_output=True,
+                                        text=True, timeout=10)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(flag, result.stderr)
+
+    def test_missing_scanner_depfile_is_named(self):
+        # The compile succeeded, so the exit 1 is the wrapper's; it must name
+        # the file it could not read rather than look like a compiler failure.
+        missing = self.root / "no-such.d"
+        result = subprocess.run(
+            [MCPP, "compile-admit", "--sem", str(self.sem), "--mem-baseline", "0",
+             "--dep-raw", str(missing), "--dep-out", str(self.root / "out.d"),
+             "--", sys.executable, "-c", "pass"],
+            capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(str(missing), result.stderr)
+
     @unittest.skipIf(os.name == "nt", "POSIX BMI restat contract")
     def test_bmi_restore_and_failure_cleanup(self):
         bmi = self.root / "interface.pcm"

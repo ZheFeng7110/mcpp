@@ -77,6 +77,7 @@ module;
 #include <unistd.h>
 extern char** environ;
 #endif
+#include <cerrno>
 
 export module mcpp.build.schedule.detach_codegen;
 
@@ -768,13 +769,32 @@ int run_admitted(const std::vector<std::string>& command,
     }
     if (rc != 0 || depFrom.empty() || depTo.empty()) return rc;
 
+    // The compiler succeeded, so a failure from here on is this wrapper's, not
+    // a compiler failure. Name the file: an exit 1 with no message is read as
+    // a compiler failure and points at no culprit.
+    const auto reason = [] { return std::error_code{errno, std::generic_category()}.message(); };
     std::ifstream in(depFrom, std::ios::binary);
-    if (!in) return 1;
+    if (!in) {
+        std::println(std::cerr, "mcpp: cannot read scanner depfile {}: {}",
+                     depFrom.string(), reason());
+        return 1;
+    }
     std::string raw{std::istreambuf_iterator<char>{in}, {}};
+    if (in.bad()) {
+        std::println(std::cerr, "mcpp: cannot read scanner depfile {}: {}",
+                     depFrom.string(), reason());
+        return 1;
+    }
     std::ofstream out(depTo, std::ios::binary | std::ios::trunc);
-    if (!out) return 1;
+    if (!out) {
+        std::println(std::cerr, "mcpp: cannot write depfile {}: {}", depTo.string(), reason());
+        return 1;
+    }
     out << mcpp::build::depfile::first_record(raw);
-    if (!out) return 1;
+    if (!out) {
+        std::println(std::cerr, "mcpp: cannot write depfile {}: {}", depTo.string(), reason());
+        return 1;
+    }
     std::filesystem::remove(depFrom, ec);
     return 0;
 }

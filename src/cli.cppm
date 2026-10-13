@@ -1004,9 +1004,9 @@ int run(int argc, char** argv) {
             .option(cl::Option("slot").takes_value().value_name("PATH").help("where .log/.rc are kept"))
             .option(cl::Option("self").takes_value().value_name("PATH").help("path to mcpp, re-invoked as supervisor"))
             .option(cl::Option("sem").takes_value().value_name("DIR").help("concurrency token directory"))
-             .option(cl::Option("cap").takes_value().value_name("N").help("max concurrent compilers"))
-             .option(cl::Option("mem-baseline").takes_value().value_name("BYTES").help("memory baseline"))
-             .option(cl::Option("mem-threshold").takes_value().value_name("PERCENT").help("memory threshold"))
+            .option(cl::Option("cap").takes_value().value_name("N").help("max concurrent compilers"))
+            .option(cl::Option("mem-baseline").takes_value().value_name("BYTES").help("memory baseline"))
+            .option(cl::Option("mem-threshold").takes_value().value_name("PERCENT").help("memory threshold"))
             .option(cl::Option("command-file").takes_value().value_name("PATH").help("file holding the compiler command line"))
             .option(cl::Option("dep-from").takes_value().value_name("PATH").help("scanner depfile to adopt"))
             .option(cl::Option("dep-to").takes_value().value_name("PATH").help("where ninja expects this edge's depfile"))
@@ -1159,16 +1159,37 @@ int run(int argc, char** argv) {
             std::println(stderr, "error: compile-admit requires --sem and -- <compiler argv...>");
             return 2;
         }
+        // An omitted value keeps its default; a MALFORMED one must not be
+        // silently indistinguishable from an omitted one. from_chars leaves
+        // the destination untouched on failure (and reports an empty range),
+        // so every rejection has to be checked and named here.
+        auto parse_number = [](std::string_view text, auto& out) -> bool {
+            if (text.empty()) return true;
+            const auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), out);
+            return ec == std::errc{} && end == text.data() + text.size();
+        };
         int cap = 0, threshold = 80;
         unsigned long long baseline = 0;
-        std::from_chars(capText.data(), capText.data() + capText.size(), cap);
-        if (!baselineText.empty()) {
-            std::from_chars(baselineText.data(), baselineText.data() + baselineText.size(), baseline);
-        } else if (const char* env = std::getenv("MCPP_MEM_BASELINE"); env && *env) {
-            const auto text = std::string_view(env);
-            std::from_chars(text.data(), text.data() + text.size(), baseline);
+        if (!parse_number(capText, cap)) {
+            std::println(stderr, "error: compile-admit: invalid --cap '{}'", capText);
+            return 2;
         }
-        std::from_chars(thresholdText.data(), thresholdText.data() + thresholdText.size(), threshold);
+        if (!baselineText.empty()) {
+            if (!parse_number(baselineText, baseline)) {
+                std::println(stderr, "error: compile-admit: invalid --mem-baseline '{}'",
+                             baselineText);
+                return 2;
+            }
+        } else if (const char* env = std::getenv("MCPP_MEM_BASELINE"); env && *env) {
+            if (!parse_number(std::string_view{env}, baseline)) {
+                std::println(stderr, "error: compile-admit: invalid MCPP_MEM_BASELINE '{}'", env);
+                return 2;
+            }
+        }
+        if (!parse_number(thresholdText, threshold)) {
+            std::println(stderr, "error: compile-admit: invalid --mem-threshold '{}'", thresholdText);
+            return 2;
+        }
         std::vector<std::string> command;
         for (++i; i < argc; ++i) command.emplace_back(argv[i]);
         return mcpp::build::schedule::detach::run_admitted(
