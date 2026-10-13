@@ -41,10 +41,20 @@ class CompileAdmit(unittest.TestCase):
         ready = self.root / "ready"
         release = self.root / "release"
         done = self.root / "done"
-        script = ("import pathlib,sys,time; "
-                  "pathlib.Path(sys.argv[1]).touch(); deadline=time.monotonic()+10; "
-                  "\nwhile not pathlib.Path(sys.argv[2]).exists() and time.monotonic()<deadline: time.sleep(.01)")
-        first = subprocess.Popen(self.argv(script, ready, release, baseline=10**18))
+        # Keep the fixture paths in the Python source rather than passing them
+        # after `-c`. On Windows compile-admit crosses a cmd.exe/CreateProcess
+        # boundary; relying on a second round of positional-argument quoting
+        # made this admission test fail before it exercised admission (the
+        # child saw no sys.argv[1]). repr() is a Python literal and preserves
+        # Windows backslashes and any punctuation in the temporary path.
+        ready_literal = repr(str(ready))
+        release_literal = repr(str(release))
+        done_literal = repr(str(done))
+        script = (f"import pathlib,time; ready=pathlib.Path({ready_literal}); "
+                  f"release=pathlib.Path({release_literal}); ready.touch(); "
+                  "deadline=time.monotonic()+10; "
+                  "\nwhile not release.exists() and time.monotonic()<deadline: time.sleep(.01)")
+        first = subprocess.Popen(self.argv(script, baseline=10**18))
         second = None
         try:
             deadline = time.monotonic() + 10
@@ -54,8 +64,8 @@ class CompileAdmit(unittest.TestCase):
             if not (self.sem / "0").exists():
                 self.skipTest("memory metrics unavailable on this host")
             second = subprocess.Popen(self.argv(
-                "import pathlib,sys; pathlib.Path(sys.argv[1]).touch()",
-                done, baseline=10**18))
+                f"import pathlib; pathlib.Path({done_literal}).touch()",
+                baseline=10**18))
             time.sleep(.2)
             self.assertIsNone(second.poll())
             self.assertFalse(done.exists(), "only one pressure fallback may run")
