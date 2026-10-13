@@ -1138,7 +1138,7 @@ int run(int argc, char** argv) {
     }
 
     if (std::string_view(argv[1]) == "compile-admit") {
-        std::string sem, capText, baselineText, thresholdText, depRaw, depOut;
+        std::string sem, capText, baselineText, thresholdText, depRaw, depOut, bmiRestat;
         int i = 2;
         for (; i < argc && std::string_view(argv[i]) != "--"; ++i) {
             const std::string_view a = argv[i];
@@ -1149,6 +1149,7 @@ int run(int argc, char** argv) {
             else if (a == "--mem-threshold") thresholdText = argv[++i];
             else if (a == "--dep-raw") depRaw = argv[++i];
             else if (a == "--dep-out") depOut = argv[++i];
+            else if (a == "--bmi-restat") bmiRestat = argv[++i];
             else {
                 std::println(stderr, "error: compile-admit: unknown option '{}'", a);
                 return 2;
@@ -1167,7 +1168,8 @@ int run(int argc, char** argv) {
         for (++i; i < argc; ++i) command.emplace_back(argv[i]);
         return mcpp::build::schedule::detach::run_admitted(
             command, std::filesystem::path{sem}, cap, baseline, threshold,
-            std::filesystem::path{depRaw}, std::filesystem::path{depOut});
+            std::filesystem::path{depRaw}, std::filesystem::path{depOut},
+            std::filesystem::path{bmiRestat});
     }
 
     if (std::string_view(argv[1]) == "__action-stamp"

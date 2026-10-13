@@ -161,7 +161,8 @@ int run_admitted(const std::vector<std::string>& command,
                  unsigned long long memoryBaselineBytes,
                  int memoryThresholdPercent,
                  const std::filesystem::path& depFrom = {},
-                 const std::filesystem::path& depTo = {});
+                 const std::filesystem::path& depTo = {},
+                 const std::filesystem::path& bmiRestat = {});
 
 }  // namespace mcpp::build::schedule::detach
 
@@ -708,16 +709,51 @@ int run_admitted(const std::vector<std::string>& command,
                  unsigned long long memoryBaselineBytes,
                  int memoryThresholdPercent,
                  const std::filesystem::path& depFrom,
-                 const std::filesystem::path& depTo) {
+                 const std::filesystem::path& depTo,
+                 const std::filesystem::path& bmiRestat) {
     if (command.empty()) return 2;
     const auto token = acquire_token(semaphore, maxCompilers,
                                      memoryBaselineBytes, memoryThresholdPercent);
+    std::error_code ec;
+    auto backup = bmiRestat;
+    backup += ".bak";
+    bool backedUp = false;
+    if (!bmiRestat.empty() && file_exists(bmiRestat)) {
+        const auto oldTime = std::filesystem::last_write_time(bmiRestat, ec);
+        if (!ec) {
+            backedUp = std::filesystem::copy_file(
+                bmiRestat, backup, std::filesystem::copy_options::overwrite_existing, ec);
+            if (backedUp) {
+                std::filesystem::last_write_time(backup, oldTime, ec);
+                backedUp = !ec;
+            }
+        }
+        if (!backedUp) {
+            std::println(std::cerr, "mcpp: cannot back up BMI {}: {}",
+                         bmiRestat.string(), ec.message());
+            if (!token.empty()) std::filesystem::remove(token, ec);
+            std::filesystem::remove(backup, ec);
+            return 1;
+        }
+    }
     bool timedOut = false;
     const int rc = mcpp::platform::process::run_exec_deadline(
         command, {}, std::chrono::milliseconds(0), &timedOut);
     if (!token.empty()) {
         std::error_code ec;
         std::filesystem::remove(token, ec);
+    }
+    if (backedUp) {
+        if (rc == 0 && mcpp::build::stage::bmi_equivalent(bmiRestat, backup)) {
+            std::filesystem::rename(backup, bmiRestat, ec);
+            if (ec) {
+                std::println(std::cerr, "mcpp: cannot restore BMI {}: {}",
+                             bmiRestat.string(), ec.message());
+                return 1;
+            }
+        } else {
+            std::filesystem::remove(backup, ec);
+        }
     }
     if (rc != 0 || depFrom.empty() || depTo.empty()) return rc;
 
@@ -728,7 +764,6 @@ int run_admitted(const std::vector<std::string>& command,
     if (!out) return 1;
     out << mcpp::build::depfile::first_record(raw);
     if (!out) return 1;
-    std::error_code ec;
     std::filesystem::remove(depFrom, ec);
     return 0;
 }

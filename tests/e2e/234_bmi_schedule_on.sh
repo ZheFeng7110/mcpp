@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# requires: python3
 # `bmi_schedule = "on"` end to end, and the token leak that used to hang it.
 source "$(dirname "${BASH_SOURCE[0]}")/_toolchain_env.sh"
 #
@@ -42,6 +43,9 @@ fi
 case "$MCPP" in /*) ;; *) MCPP="$_root/$MCPP" ;; esac
 [ -x "$MCPP" ] || { echo "FAIL: MCPP=$MCPP is not executable"; exit 1; }
 export MCPP
+
+# Exercise the admission wrapper independently of the selected toolchain.
+python3 "$_root/tests/scripts/test_compile_admit.py"
 
 TMP=$(mktemp -d)
 trap "rm -rf $TMP" EXIT

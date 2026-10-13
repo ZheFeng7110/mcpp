@@ -1990,7 +1990,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
             // compiler that rewrites a byte-identical BMI still moves it. What
             // suppresses the cascade is putting the old file back.
             if (memoryAdmission)
-                append(std::format("  command = {}{} -- $cxx $local_includes"
+                append(std::format("  command = {}{} --bmi-restat \"$out\" -- $cxx $local_includes"
                                    " $cxxflags $unit_cxxflags{}{} {}$in {}$out\n",
                                    admission_prefix(), admission_dep(),
                                    traits.bmiOnlyFlags, module_src_flags, mmd_flag,
