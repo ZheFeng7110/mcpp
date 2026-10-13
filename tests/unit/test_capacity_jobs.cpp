@@ -101,3 +101,14 @@ TEST(MemoryAdmission, HysteresisRequiresRecoveryMargin) {
 TEST(MemoryAdmission, UnsupportedReadIsNotPermission) {
     EXPECT_FALSE(memory_allows(MemorySnapshot{}, 10 * GiB, 80));
 }
+
+TEST(MemoryAdmission, BaselineRoundsUpToTheNextBucket) {
+    using mcpp::platform::capacity::memory_baseline;
+    EXPECT_EQ(memory_baseline(0), GiB);
+    EXPECT_EQ(memory_baseline(1), 4 * GiB);
+    EXPECT_EQ(memory_baseline(3 * GiB), 4 * GiB);
+    EXPECT_EQ(memory_baseline(4 * GiB), 4 * GiB);
+    EXPECT_EQ(memory_baseline(4 * GiB + 1), 8 * GiB);
+    EXPECT_EQ(memory_baseline(7 * GiB), 8 * GiB);
+    EXPECT_EQ(memory_baseline(~0ULL), ~0ULL);
+}

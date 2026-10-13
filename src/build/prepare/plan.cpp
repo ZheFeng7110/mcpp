@@ -905,17 +905,10 @@ static void step13_graph_and_schedule(PrepareState& state, BuildContext& ctx) {
         // For ordinary and two-phase edges Ninja's resolved job count is the
         // hard ceiling. Detached GCC edges use compilerCap instead.
         const auto capacity = mcpp::platform::capacity::host_capacity();
-        // Keep the value stable across incremental invocations.  The raw
-        // available-memory reading is intentionally noisy; embedding it in
-        // build.ninja would change the command line on every build and make
-        // Ninja rebuild every detached module object.  A coarse bucket gives
-        // admission control a conservative build-start baseline while
-        // avoiding that false invalidation when the scheduler changes jobs.
-        constexpr unsigned long long gib = 1024ULL * 1024ULL * 1024ULL;
-        constexpr unsigned long long bucket = 4 * gib;
-        const auto available = capacity.availableBytes;
-        ctx.plan.memoryBaselineBytes = std::max(
-            gib, (available / bucket) * bucket);
+        // Round up to a stable bucket: the admission reserve must not be
+        // smaller than the configured fraction of observed available memory.
+        ctx.plan.memoryBaselineBytes =
+            mcpp::platform::capacity::memory_baseline(capacity.availableBytes);
         mcpp::log::verbose("build", std::format("schedule: {} — {}",
                                                 ctx.plan.scheduleTag, decision.reason));
 

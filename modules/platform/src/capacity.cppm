@@ -71,6 +71,9 @@ HostCapacity host_capacity();
 // memory.
 MemorySnapshot memory_snapshot();
 
+// Round observed available memory up to a 4 GiB bucket (1 GiB if unknown).
+unsigned long long memory_baseline(unsigned long long availableBytes);
+
 // Whether a new compiler may be admitted. The baseline is the available
 // physical memory observed when the build started. `thresholdPercent` is the
 // proportion of that baseline which may be consumed. `hysteresisPercent` is
@@ -335,6 +338,18 @@ int recommended_jobs(const HostCapacity& cap, unsigned long long perJobBytes,
     if (jobs < 1) jobs = 1;
     if (ceiling > 0 && jobs > ceiling) jobs = ceiling;
     return jobs;
+}
+
+unsigned long long memory_baseline(unsigned long long availableBytes) {
+    constexpr unsigned long long gib = 1024ULL * 1024ULL * 1024ULL;
+    constexpr unsigned long long bucket = 4 * gib;
+    if (availableBytes == 0) return gib;
+    const auto remainder = availableBytes % bucket;
+    if (remainder == 0) return availableBytes;
+    const auto increment = bucket - remainder;
+    // Saturate rather than wrap if an observation is near the integer limit.
+    constexpr auto maximum = ~0ULL;
+    return availableBytes > maximum - increment ? maximum : availableBytes + increment;
 }
 
 bool memory_allows(const MemorySnapshot& now, unsigned long long baselineBytes,
