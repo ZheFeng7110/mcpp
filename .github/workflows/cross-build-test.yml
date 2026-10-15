@@ -270,10 +270,13 @@ jobs:
       - name: Install wine
         timeout-minutes: 20
         run: |
+          # PASSED TO DPKG ON EVERY UNPACK BELOW; see the cold path's note for
+          # the run that paid for it.
+          DPKG_OVERWRITE='-o Dpkg::Options::=--force-overwrite'
           sudo dpkg --add-architecture i386 || true
           if ls ~/wine-debs/*.deb >/dev/null 2>&1; then
             sudo dpkg -i ~/wine-debs/*.deb 2>/dev/null \
-              || { sudo apt-get update -qq; sudo apt-get install -f -y; }
+              || { sudo apt-get update -qq; sudo apt-get install -f -y $DPKG_OVERWRITE; }
           else
             # The runner image carries third-party apt lists (Google Chrome
             # among them) that this job does not use, and a transient
@@ -293,7 +296,25 @@ jobs:
               || sudo apt-get install -y --download-only wine
             mkdir -p ~/wine-debs
             cp /var/cache/apt/archives/*.deb ~/wine-debs/ 2>/dev/null || true
-            sudo apt-get install -y wine64 wine || sudo apt-get install -y wine
+            # OVERWRITE THE SHARED DOC FILES. The install died here on
+            # 2026-10-15 (run 38695300904) in dpkg's unpack, still before a
+            # single byte was compiled:
+            #
+            #     dpkg: error processing archive
+            #      .../libxml2_2.9.14+dfsg-1.3ubuntu3.10_i386.deb (--unpack):
+            #      trying to overwrite shared
+            #      '/usr/share/doc/libxml2/changelog.Debian.gz', which is
+            #      different from other instances of package libxml2:i386
+            #
+            # libpng16-16t64, libx11-6 and libfreetype6, all alike. Multi-Arch:
+            # same instances must share every file bit-for-bit, and the i386 and
+            # amd64 debs in Ubuntu's archive embed changelogs that differ
+            # (Launchpad #1574351 and its kin). That is a property of the
+            # archive, not of this runner: the step's own retry below it failed
+            # with the identical error, so a rerun re-rolls nothing. The
+            # changelogs are not what this job reads; wine is.
+            sudo apt-get install -y $DPKG_OVERWRITE wine64 wine \
+              || sudo apt-get install -y $DPKG_OVERWRITE wine
           fi
           wine --version
 
